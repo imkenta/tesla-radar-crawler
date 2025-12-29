@@ -38,12 +38,14 @@ async function run() {
         console.error('❌ Swap Failed:', error.message);
         process.exit(1);
     } else {
-        console.log('✅ Swap Complete. Production data updated.');
+        const successMsg = `同步完成，共抓取 ${count} 筆資料`;
+        console.log(`✅ ${successMsg}. Production data updated.`);
         
         // Update main metadata status
         await supabase.from('sync_metadata').upsert({
             key: 'plates_full_sync',
             status: 'COMPLETED',
+            status_message: successMsg,
             last_run_at: new Date().toISOString()
         }, { onConflict: 'key' });
     }

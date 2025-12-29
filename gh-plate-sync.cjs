@@ -277,37 +277,40 @@ async function parsePageInfo(page) {
     return page.evaluate(() => {
         const text = document.body.innerText;
         
-        // Check for 'No Data' messages first
+        // 1. Check for 'No Data' messages first
         if (text.includes('查無資料') || text.includes('尚無可供選號') || text.includes('對不起')) {
             return { current: 1, total: 1, count: 0, noData: true };
         }
 
-        // Expanded logic for Page parsing
-        // Case 1: "1 / 2 頁"
-        let pageMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*頁/);
-        
-        // Case 2: "第 1 頁，共 2 頁" or "第 1 頁 / 共 2 頁"
-        if (!pageMatch) {
-             const currentM = text.match(/第\s*(\d+)\s*頁/);
-             const totalM = text.match(/共\s*(\d+)\s*頁/);
-             if (currentM && totalM) {
-                 pageMatch = [null, currentM[1], totalM[1]];
-             }
-        }
-        
-        // Match "共 100 筆" or "總數: 100 面"
+        // 2. Match total count (more robust)
         const countMatch = text.match(/共\s*(\d+)\s*筆/) || text.match(/總數[:：]\s*(\d+)\s*面/);
+        const count = countMatch ? parseInt(countMatch[1]) : 0;
 
-        // Fallback if regex fails but data exists (assume 1 page)
-        const current = pageMatch ? parseInt(pageMatch[1]) : 1;
-        const total = pageMatch ? parseInt(pageMatch[2]) : 1;
+        // 3. Match pagination (specific to MVDIS "頁次：1 / 2")
+        let current = 1;
+        let total = 1;
+        
+        // Try various common patterns
+        const pageMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*頁/) || text.match(/第\s*(\d+)\s*頁[，,]\s*共\s*(\d+)\s*頁/);
+        
+        if (pageMatch) {
+            current = parseInt(pageMatch[1]);
+            total = parseInt(pageMatch[2]);
+        }
+
+        // 4. Safety Check: If total is 1 but count looks like there should be more,
+        // or if we can see the "status_next_page" button
+        const hasNextButton = !!document.querySelector('input[name="status_next_page"]');
+        if (total === 1 && hasNextButton) {
+            total = 2; // Force at least one more loop if button exists
+        }
 
         return {
             current: current,
             total: total,
-            count: countMatch ? parseInt(countMatch[1]) : 0,
+            count: count,
             noData: false,
-            // debugText: text.substring(0, 500) // Optional for debugging
+            hasNextButton: hasNextButton
         };
     });
 }
@@ -552,14 +555,13 @@ async function processStation(page, deptId, station) {
             
                             console.log(`    [Page ${info.current}/${info.total}] Found ${plates.length} plates (Exp Total: ${info.count})`);
             
-                            if (info.current < info.total) {                                const nextBtn = await page.$('input[name="status_next_page"]');
+                            if (info.current < info.total || info.hasNextButton) {                                const nextBtn = await page.$('input[name="status_next_page"]');
                                 if (nextBtn) {
                                     await nextBtn.click();
                                     // Pagination is critical. Keep conservative sleep.
                                     await randomSleep(1500, 3000);
                                 } else {
-                                    console.warn(`    [Warn] Text says page ${info.current}/${info.total}, but Next button not found.`);
-                                    hasNext = false; // Safety break
+                                    hasNext = false; 
                                 }
                             } else {
                                 hasNext = false;
