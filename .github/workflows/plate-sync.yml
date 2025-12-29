@@ -5,6 +5,11 @@ on:
     - cron: '0,30 * * * *' # Run every 30 minutes (Parallel architecture enables high frequency)
   workflow_dispatch: {}
 
+# Prevent multiple workflow runs from overlapping and corrupting the staging table
+concurrency:
+  group: plate-sync-workflow
+  cancel-in-progress: false
+
 jobs:
   sync-plates:
     runs-on: ubuntu-latest

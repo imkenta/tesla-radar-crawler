@@ -71,7 +71,7 @@ class RateLimiter {
     }
 }
 
-const geminiLimiter = new RateLimiter(8, 60000);
+const geminiLimiter = new RateLimiter(25, 60000);
 
 // --- Config ---
 const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
@@ -227,12 +227,12 @@ const humanType = async (page, selector, text) => {
     await page.waitForSelector(selector);
     const element = await page.$(selector);
     await element.click();
-    await randomSleep(200, 400);
+    await randomSleep(100, 300);
     
     for (const char of text) {
-        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 150) + 50 });
+        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 100) + 30 });
     }
-    await randomSleep(300, 600);
+    await randomSleep(200, 500);
 };
 
 async function solveCaptcha(page) {
@@ -282,16 +282,32 @@ async function parsePageInfo(page) {
             return { current: 1, total: 1, count: 0, noData: true };
         }
 
-        // Match "1/2 頁" or "1 / 2 頁"
-        const pageMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*頁/);
+        // Expanded logic for Page parsing
+        // Case 1: "1 / 2 頁"
+        let pageMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*頁/);
+        
+        // Case 2: "第 1 頁，共 2 頁" or "第 1 頁 / 共 2 頁"
+        if (!pageMatch) {
+             const currentM = text.match(/第\s*(\d+)\s*頁/);
+             const totalM = text.match(/共\s*(\d+)\s*頁/);
+             if (currentM && totalM) {
+                 pageMatch = [null, currentM[1], totalM[1]];
+             }
+        }
+        
         // Match "共 100 筆" or "總數: 100 面"
         const countMatch = text.match(/共\s*(\d+)\s*筆/) || text.match(/總數[:：]\s*(\d+)\s*面/);
 
+        // Fallback if regex fails but data exists (assume 1 page)
+        const current = pageMatch ? parseInt(pageMatch[1]) : 1;
+        const total = pageMatch ? parseInt(pageMatch[2]) : 1;
+
         return {
-            current: pageMatch ? parseInt(pageMatch[1]) : 1,
-            total: pageMatch ? parseInt(pageMatch[2]) : 1,
+            current: current,
+            total: total,
             count: countMatch ? parseInt(countMatch[1]) : 0,
-            noData: false
+            noData: false,
+            // debugText: text.substring(0, 500) // Optional for debugging
         };
     });
 }
@@ -329,14 +345,15 @@ async function performSwap() {
 
 async function processStation(page, deptId, station) {
     const startTime = Date.now();
-    console.log(`\n--- Processing Station: ${station.name} (${station.id}) ---
+    console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---
 `);
 
-    // Clean up staging for this station only
+    // Clean up staging for this station & dept only to prevent accidental overlap deletion
     const { error: delError } = await supabase
         .from('available_plates_staging')
         .delete()
-        .eq('station_id', station.id);
+        .eq('station_id', station.id)
+        .eq('region_id', deptId);
         
     if (delError) console.error(`    [DB] Failed to clear old staging data: ${delError.message}`);
     
@@ -368,7 +385,7 @@ async function processStation(page, deptId, station) {
                 navSuccess = true;
             } catch (e) {
                 console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
-                if (navAttempts < 3) await randomSleep(5000, 10000);
+                if (navAttempts < 3) await randomSleep(2000, 5000);
                 else throw e; // Fatal after 3 retries
             }
         }
@@ -436,7 +453,7 @@ async function processStation(page, deptId, station) {
                     } catch (e) {
                         console.warn('    [Warn] Refresh click failed, continuing...');
                     }
-                    await randomSleep(3000, 5000);
+                    await randomSleep(1000, 3000);
                 }
 
                 try {
@@ -498,7 +515,7 @@ async function processStation(page, deptId, station) {
             
             // If failed, cool down before next main attempt
             if (!success && attempts < maxQueryAttempts) {
-                 await randomSleep(15000, 25000);
+                 await randomSleep(5000, 10000);
             }
         }
 
@@ -539,7 +556,7 @@ async function processStation(page, deptId, station) {
                                 if (nextBtn) {
                                     await nextBtn.click();
                                     // Pagination is critical. Keep conservative sleep.
-                                    await randomSleep(2500, 4000);
+                                    await randomSleep(1500, 3000);
                                 } else {
                                     console.warn(`    [Warn] Text says page ${info.current}/${info.total}, but Next button not found.`);
                                     hasNext = false; // Safety break
@@ -585,7 +602,7 @@ async function processStation(page, deptId, station) {
             stats.addError(station.name, "Max attempts reached or navigation failed.");
         }
 
-        await randomSleep(2000, 4000);
+        await randomSleep(1000, 2000);
     }
 
     const endTime = Date.now();
@@ -651,9 +668,8 @@ async function processStation(page, deptId, station) {
         const syncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
         await reportStatus('RUNNING', null, syncKey);
         
-        // In Shard mode, we DO NOT clear the whole table. 
-        // We clear specific station data inside processStation.
-        if (!TARGET_SHARD) {
+        // ONLY clear if explicitly NOT in shard mode
+        if (TARGET_SHARD === null) {
             await clearStaging();
         }
 
@@ -664,15 +680,15 @@ async function processStation(page, deptId, station) {
             for (const station of stations) {
                 await processStation(page, deptId, station);
                 console.log('☕ Quota protection break (2-4s)...');
-                await randomSleep(2000, 4000);
+                await randomSleep(1000, 2000);
             }
             console.log('☕☕ Dept finished. Short break...');
-            await randomSleep(2000, 3000);
+            await randomSleep(1500, 2500);
         }
 
         // Only perform swap if running in full mode (legacy). 
         // In Shard mode, swap is handled by a separate Finalizer Job.
-        if (!TARGET_SHARD) {
+        if (TARGET_SHARD === null) {
             await performSwap();
         } else {
             console.log('✨ Shard sync complete. Waiting for Finalizer to swap.');
