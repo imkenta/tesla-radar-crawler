@@ -299,8 +299,8 @@ async function parsePageInfo(page) {
         }
 
         // 4. Safety Check: If total is 1 but count looks like there should be more,
-        // or if we can see the "status_next_page" button
-        const hasNextButton = !!document.querySelector('input[name="status_next_page"]');
+        // or if we can see the "status_next_page" or "#next" button
+        const hasNextButton = !!document.querySelector('input[name="status_next_page"]') || !!document.querySelector('#next');
         if (total === 1 && hasNextButton) {
             total = 2; // Force at least one more loop if button exists
         }
@@ -555,7 +555,9 @@ async function processStation(page, deptId, station) {
             
                             console.log(`    [Page ${info.current}/${info.total}] Found ${plates.length} plates (Exp Total: ${info.count})`);
             
-                            if (info.current < info.total || info.hasNextButton) {                                const nextBtn = await page.$('input[name="status_next_page"]');
+                            if (info.current < info.total || info.hasNextButton) {                                let nextBtn = await page.$('input[name="status_next_page"]');
+                                if (!nextBtn) nextBtn = await page.$('#next'); // Try alternative selector
+
                                 if (nextBtn) {
                                     await nextBtn.click();
                                     // Pagination is critical. Keep conservative sleep.
