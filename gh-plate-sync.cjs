@@ -420,9 +420,23 @@ async function processStation(page, deptId, station) {
             
             if (attempts > 1) {
                 console.log(`    [Retry ${attempts}/${maxQueryAttempts}] Refreshing CAPTCHA & Cooling down...`);
-                const refreshBtn = await page.$('#pickimg + a');
-                if (refreshBtn) await refreshBtn.click();
-                else await page.click('a[onclick*="pickimg"]');
+                try {
+                    // Try preferred selector first
+                    const refreshBtn = await page.$('#pickimg + a');
+                    if (refreshBtn) {
+                        await refreshBtn.click();
+                    } else {
+                        // Try fallback selector
+                        const fallbackBtn = await page.$('a[onclick*="pickimg"]');
+                        if (fallbackBtn) {
+                            await fallbackBtn.click();
+                        } else {
+                            console.warn('    [Warn] CAPTCHA refresh button not found in DOM.');
+                        }
+                    }
+                } catch (clickErr) {
+                    console.warn(`    [Warn] CAPTCHA refresh click failed: ${clickErr.message}`);
+                }
                 // Exponential backoff: Sleep longer on retry
                 await randomSleep(15000, 25000);
             }
