@@ -411,39 +411,59 @@ async function processStation(page, deptId, station) {
         let success = false;
         let collectedPlates = [];
         
-        // Special handling for Taipei Area (40) which is prone to timeouts
+        // Special handling for Taipei Area (40)
         const maxQueryAttempts = (station.id === '40') ? 10 : 3;
         const resultWaitTimeout = (station.id === '40') ? 30000 : 10000;
 
         while (attempts < maxQueryAttempts && !success) {
             attempts++;
             
-            if (attempts > 1) {
-                console.log(`    [Retry ${attempts}/${maxQueryAttempts}] Refreshing CAPTCHA & Cooling down...`);
-                try {
-                    // Try preferred selector first
-                    const refreshBtn = await page.$('#pickimg + a');
-                    if (refreshBtn) {
-                        await refreshBtn.click();
-                    } else {
-                        // Try fallback selector
-                        const fallbackBtn = await page.$('a[onclick*="pickimg"]');
-                        if (fallbackBtn) {
-                            await fallbackBtn.click();
-                        } else {
-                            console.warn('    [Warn] CAPTCHA refresh button not found in DOM.');
-                        }
+            // Step 1: Solve Captcha (Inner Loop)
+            // We try to get a valid 4-char code up to 5 times before giving up on this attempt.
+            let code = null;
+            let captchaAttempts = 0;
+            
+            while (!code && captchaAttempts < 5) {
+                captchaAttempts++;
+                
+                // Refresh if not first try
+                if (captchaAttempts > 1 || attempts > 1) {
+                    console.log(`    [Captcha Retry ${captchaAttempts}/5] Refreshing image...`);
+                    try {
+                        const refreshBtn = await page.$('#pickimg + a');
+                        if (refreshBtn) await refreshBtn.click();
+                        else await page.click('a[onclick*="pickimg"]');
+                    } catch (e) {
+                        console.warn('    [Warn] Refresh click failed, continuing...');
                     }
-                } catch (clickErr) {
-                    console.warn(`    [Warn] CAPTCHA refresh click failed: ${clickErr.message}`);
+                    await randomSleep(3000, 5000);
                 }
-                // Exponential backoff: Sleep longer on retry
-                await randomSleep(15000, 25000);
+
+                try {
+                    const rawCode = await solveCaptcha(page);
+                    
+                    // Check logic: Must be 4 chars
+                    if (rawCode && rawCode.length === 4) {
+                        code = rawCode;
+                    } else {
+                        console.log(`    [AI] Invalid length (${rawCode ? rawCode.length : 0}). Retrying...`);
+                    }
+                } catch (aiError) {
+                    // Handle API Overloaded (503) or other AI errors
+                    console.warn(`    [AI] Error: ${aiError.message}`);
+                    if (aiError.message.includes('503') || aiError.message.includes('Overloaded')) {
+                        console.log('    [AI] Model overloaded. Sleeping 30s...');
+                        await sleep(30000); 
+                    }
+                }
             }
 
-            const code = await solveCaptcha(page);
-            if (!code || code.length !== 4) continue;
+            if (!code) {
+                console.error('    [Fail] Failed to get valid CAPTCHA after 5 tries. Restarting station flow...');
+                continue; // Consumes 1 main attempt
+            }
 
+            // Step 2: Submit Form
             await humanType(page, '#validateStr', code);
             
             let alertMsg = null;
@@ -465,6 +485,7 @@ async function processStation(page, deptId, station) {
                 
                 if (alertMsg) {
                     console.log(`    [Fail] Alert: ${alertMsg}`);
+                    // Alert means wrong captcha. This consumes 1 main attempt.
                 } else {
                     success = true;
                 }
@@ -474,6 +495,11 @@ async function processStation(page, deptId, station) {
             }
             
             page.off('dialog', dialogHandler);
+            
+            // If failed, cool down before next main attempt
+            if (!success && attempts < maxQueryAttempts) {
+                 await randomSleep(15000, 25000);
+            }
         }
 
         if (success) {
