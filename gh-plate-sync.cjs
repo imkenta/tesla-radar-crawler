@@ -358,18 +358,18 @@ async function processStation(page, deptId, station) {
         // Robust Navigation with Retries & Longer Timeout
         let navSuccess = false;
         let navAttempts = 0;
-        while (navAttempts < 2 && !navSuccess) {
+        while (navAttempts < 3 && !navSuccess) {
             navAttempts++;
             try {
                 const navStart = Date.now();
-                await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 120000 });
+                await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 180000 });
                 lastLatency = Date.now() - navStart;
                 if (process.env.NODE_ENV === 'development') console.log(`    [Network] Latency: ${lastLatency}ms`);
                 navSuccess = true;
             } catch (e) {
                 console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
-                if (navAttempts < 2) await randomSleep(3000, 5000);
-                else throw e; // Fatal after 2 retries
+                if (navAttempts < 3) await randomSleep(5000, 10000);
+                else throw e; // Fatal after 3 retries
             }
         }
         await adaptiveSleep(800, 1500, lastLatency);
@@ -381,7 +381,7 @@ async function processStation(page, deptId, station) {
         await adaptiveSleep(800, 1200, lastLatency);
 
         try {
-            await page.waitForSelector('#selWindowNo option[value="01"]', { timeout: 5000 });
+            await page.waitForSelector('#selWindowNo option[value="01"]', { timeout: 10000 });
             await page.select('#selWindowNo', '01');
         } catch (e) {
             await page.evaluate(() => {
@@ -410,17 +410,21 @@ async function processStation(page, deptId, station) {
         let attempts = 0;
         let success = false;
         let collectedPlates = [];
+        
+        // Special handling for Taipei Area (40) which is prone to timeouts
+        const maxQueryAttempts = (station.id === '40') ? 10 : 3;
+        const resultWaitTimeout = (station.id === '40') ? 30000 : 10000;
 
-        while (attempts < 3 && !success) {
+        while (attempts < maxQueryAttempts && !success) {
             attempts++;
             
             if (attempts > 1) {
-                console.log('    [Retry] Refreshing CAPTCHA & Cooling down...');
+                console.log(`    [Retry ${attempts}/${maxQueryAttempts}] Refreshing CAPTCHA & Cooling down...`);
                 const refreshBtn = await page.$('#pickimg + a');
                 if (refreshBtn) await refreshBtn.click();
                 else await page.click('a[onclick*="pickimg"]');
-                // Exponential backoff: Sleep longer on retry (10-15s)
-                await randomSleep(10000, 15000);
+                // Exponential backoff: Sleep longer on retry
+                await randomSleep(15000, 25000);
             }
 
             const code = await solveCaptcha(page);
@@ -441,10 +445,9 @@ async function processStation(page, deptId, station) {
             try {
                 await page.waitForFunction(
                     () => document.querySelector('.number_cell') || document.body.innerText.includes('查無資料'),
-                    { timeout: 10000 }
+                    { timeout: resultWaitTimeout }
                 );
                 lastLatency = Date.now() - queryStart;
-                // console.log(`    [Network] Query Latency: ${lastLatency}ms`);
                 
                 if (alertMsg) {
                     console.log(`    [Fail] Alert: ${alertMsg}`);
@@ -453,7 +456,7 @@ async function processStation(page, deptId, station) {
                 }
             } catch (e) {
                 if (alertMsg) console.log(`    [Fail] Alert: ${alertMsg}`);
-                else console.log('    [Fail] Result timeout.');
+                else console.log(`    [Fail] Result timeout after ${resultWaitTimeout}ms.`);
             }
             
             page.off('dialog', dialogHandler);
