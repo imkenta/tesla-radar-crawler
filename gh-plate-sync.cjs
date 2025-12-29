@@ -71,7 +71,7 @@ class RateLimiter {
     }
 }
 
-const geminiLimiter = new RateLimiter(12, 60000);
+const geminiLimiter = new RateLimiter(8, 60000);
 
 // --- Config ---
 const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
