@@ -1,0 +1,7 @@
+node_modules
+.env
+.DS_Store
+logs/
+temp/
+debug_snapshots/
+eng.traineddata

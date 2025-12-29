@@ -1,0 +1,21 @@
+{
+  "name": "tesla-radar-crawler",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "Standalone crawler for Tesla Studio data synchronization.",
+  "main": "gh-plate-sync.cjs",
+  "scripts": {
+    "start": "node gh-plate-sync.cjs",
+    "sync": "node gh-plate-sync.cjs",
+    "ocr": "node gh-plate-sync-ocr.cjs"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.89.0",
+    "dotenv": "^17.2.3",
+    "puppeteer": "^24.34.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "tesseract.js": "^7.0.0"
+  }
+}

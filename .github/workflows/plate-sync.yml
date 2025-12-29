@@ -1,0 +1,89 @@
+name: Daily Plate Sync
+
+on:
+  schedule:
+    - cron: '0,30 * * * *' # Run every 30 minutes (Parallel architecture enables high frequency)
+  workflow_dispatch: {}
+
+jobs:
+  sync-plates:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [NORTH, CENTRAL, SOUTH]
+      fail-fast: false # Let other shards finish even if one fails
+    
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.shard }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install and Configure Cloudflare WARP
+        run: |
+          # Import GPG key and add repository
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          # Install WARP
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+
+          # Register and Connect
+          # Note: New warp-cli requires accepting TOS explicitly in some versions, but usually registration implies it.
+          # We use a loop to ensure registration succeeds.
+          sudo warp-cli --accept-tos registration new || true
+          
+          # Connect
+          sudo warp-cli --accept-tos connect
+          
+          # Wait for connection to stabilize
+          echo "Waiting for WARP connection..."
+          sleep 10
+          
+          # Verify connection status
+          sudo warp-cli --accept-tos status || true
+
+      - name: Check IP
+        run: |
+          echo "Checking IP..."
+          curl -s --max-time 10 ifconfig.me || echo "Failed to get IP"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Crawler Shard ${{ matrix.shard }}
+        run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # PROXY_URL removed to force using system network (WARP)
+
+  finalize-sync:
+    needs: sync-plates
+    runs-on: ubuntu-latest
+    if: success() # Only run if all shards succeeded
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Trigger Atomic Swap
+        run: node trigger_swap.cjs
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
