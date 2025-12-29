@@ -411,9 +411,9 @@ async function processStation(page, deptId, station) {
         let success = false;
         let collectedPlates = [];
         
-        // Special handling for Taipei Area (40)
-        const maxQueryAttempts = (station.id === '40') ? 10 : 3;
-        const resultWaitTimeout = (station.id === '40') ? 30000 : 10000;
+        // Standardized robust settings for ALL stations
+        const maxQueryAttempts = 10;
+        const resultWaitTimeout = 30000;
 
         while (attempts < maxQueryAttempts && !success) {
             attempts++;
