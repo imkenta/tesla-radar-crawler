@@ -130,6 +130,18 @@ async function loadStationData() {
     console.log(`📊 Stations to process: ${totalStations}`);
 }
 
+// --- Helper: Region Classifier ---
+function getRegion(stationId) {
+    const id = parseInt(stationId);
+    if ((id >= 20 && id <= 49) && id !== 44 && id !== 45 && id !== 46 && id !== 25 && id !== 26) return 'North';
+    if ([20, 21, 30, 31, 33, 40, 41, 42, 43, 25].includes(id)) return 'North';
+    if ([50, 51, 52, 53, 54, 60, 61, 62, 63, 64, 65].includes(id)) return 'Central';
+    if ([70, 71, 72, 73, 74, 75, 76, 80, 81, 82, 83, 84, 85].includes(id)) return 'South';
+    if ([44, 45, 46].includes(id)) return 'East';
+    if ([26, 84].includes(id)) return 'Island';
+    return 'Other';
+}
+
 // --- Stats Collector ---
 class SyncStats {
     constructor(runId) {
@@ -143,12 +155,17 @@ class SyncStats {
         this.captchaAttempts = 0;
         this.captchaSuccess = 0;
         this.errors = [];
+        this.stationDetails = []; // Store detailed stats per station
     }
 
     addError(station, error) {
         const msg = `${station}: ${error}`;
         this.errors.push(msg);
         console.error(`    [Stats] Error added: ${msg}`);
+    }
+
+    addStationStat(stat) {
+        this.stationDetails.push(stat);
     }
 
     async save() {
@@ -173,6 +190,7 @@ class SyncStats {
             captcha_attempts: this.captchaAttempts,
             captcha_success: this.captchaSuccess,
             error_summary: this.errors.join('\n').substring(0, 2000),
+            station_stats: this.stationDetails, // Save detailed stats
             runtime_sec: runtime
         }, { onConflict: 'run_id' });
 
