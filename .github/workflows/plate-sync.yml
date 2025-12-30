@@ -1,4 +1,4 @@
-name: Daily Plate Sync (Live)
+name: Daily Plate Sync (Live) v2.1
 
 on:
   schedule:
