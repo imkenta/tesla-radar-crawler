@@ -2,7 +2,7 @@ name: Daily Plate Sync (Live)
 
 on:
   schedule:
-    - cron: '0,30 * * * *' # Run every 30 minutes (Parallel architecture enables high frequency)
+    - cron: '7,37 * * * *' # Run every 30 minutes (Offset by 7 mins to avoid congestion)
   workflow_dispatch: {}
 
 # Prevent multiple workflow runs from overlapping and corrupting the staging table
