@@ -350,6 +350,11 @@ async function processStation(page, deptId, station) {
     const startTime = Date.now();
     console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---
 `);
+    
+    // Metrics variables
+    let platesFound = 0;
+    let retries = 0;
+    let status = 'SUCCESS';
 
     // Clean up staging for this station & dept only to prevent accidental overlap deletion
     const { error: delError } = await supabase
@@ -437,6 +442,7 @@ async function processStation(page, deptId, station) {
 
         while (attempts < maxQueryAttempts && !success) {
             attempts++;
+            if (attempts > 1) retries++; // Count retries
             
             // Step 1: Solve Captcha (Inner Loop)
             // We try to get a valid 4-char code up to 5 times before giving up on this attempt.
@@ -597,21 +603,35 @@ async function processStation(page, deptId, station) {
                 } else {
                     console.log(`    [DB] Staged ${finalPlates.length} plates (Total: ${collectedPlates.length}).`);
                     stats.totalPlates += finalPlates.length;
+                    platesFound += finalPlates.length;
                 }
             }
-            stats.stationsSuccess++;
         } else {
             console.error(`    [Fail] Station ${station.name} abandoned after retries.`);
             stats.stationsFailed++;
             stats.addError(station.name, "Max attempts reached or navigation failed.");
+            status = 'FAILED';
         }
 
         await randomSleep(1000, 2000);
     }
-
+    
+    // Calculate and save station metrics
     const endTime = Date.now();
-    const duration = ((endTime - startTime) / 1000).toFixed(2);
-    console.log(`⏱️  Station ${station.name} finished in ${duration}s`);
+    const duration = ((endTime - startTime) / 1000); // Keep as number for JSON
+    console.log(`⏱️  Station ${station.name} finished in ${duration.toFixed(2)}s`);
+    
+    if (status !== 'FAILED') stats.stationsSuccess++;
+
+    stats.addStationStat({
+        id: station.id,
+        name: station.name,
+        region: getRegion(station.id),
+        duration_sec: duration,
+        plates_found: platesFound,
+        retries: retries,
+        status: status
+    });
 }
 
 // --- Execution Entry ---
