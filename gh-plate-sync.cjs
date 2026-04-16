@@ -441,21 +441,12 @@ async function processStation(page, deptId, station) {
     let retries = 0;
     let status = 'SUCCESS';
 
-    const { error: delError } = await supabase
-        .from('available_plates_staging')
-        .delete()
-        .eq('station_id', station.id)
-        .eq('region_id', deptId);
-        
-    if (delError) console.error(`    [DB] Failed to clear old staging data: ${delError.message}`);
+    // 清理舊資料
+    await supabase.from('available_plates_staging').delete().eq('station_id', station.id).eq('region_id', deptId);
     
     const plateTypes = ['g'];
     if (!station.no_rental) plateTypes.push('h');
 
-    const isHighRisk = HIGH_RISK_STATIONS.includes(station.id);
-    let lastLatency = isHighRisk ? 5000 : 2000; 
-
-    // --- OPTIMIZATION FLAG ---
     let isFirstQueryInStation = true;
 
     for (const pType of plateTypes) {
@@ -466,71 +457,43 @@ async function processStation(page, deptId, station) {
         let success = false;
         let collectedPlates = [];
         const maxQueryAttempts = 10;
-        const resultWaitTimeout = 30000;
 
         while (attempts < maxQueryAttempts && !success) {
             attempts++;
             if (attempts > 1) retries++;
 
-            // Use Full Navigation if it's the first query or a retry after failure
+            // 1. 導覽與填表
             if (isFirstQueryInStation || attempts > 1) {
-                console.log(`    [Attempt ${attempts}/${maxQueryAttempts}] Initializing full form...`);
-                let navSuccess = false;
-                let navAttempts = 0;
-                while (navAttempts < 3 && !navSuccess) {
-                    navAttempts++;
-                    try {
-                        await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-                        await page.evaluate(() => {
-                            if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
-                            const closeBtn = Array.from(document.querySelectorAll('a, button, input'))
-                                .find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
-                            if (closeBtn) closeBtn.click();
-                        });
-                        await sleep(1000);
-                        navSuccess = true;
-                    } catch (e) {
-                        console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
-                        await randomSleep(2000, 5000);
-                    }
-                }
-
-                if (!navSuccess) throw new Error("Critical navigation failure");
-
-                // Fill Form
-                await selectWithEvent(page, '#selDeptCode', deptId); await sleep(1500);
-                await selectWithEvent(page, '#selStationCode', station.id); await sleep(1500);
-                await selectWithEvent(page, '#selWindowNo', '01'); await sleep(1000);
+                console.log(`    [Attempt ${attempts}] Full Nav...`);
+                await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+                await page.evaluate(() => {
+                    if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
+                    const btn = Array.from(document.querySelectorAll('a, button, input')).find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
+                    if (btn) btn.click();
+                });
+                await sleep(1000);
+                await selectWithEvent(page, '#selDeptCode', deptId); await sleep(1200);
+                await selectWithEvent(page, '#selStationCode', station.id); await sleep(1200);
+                await selectWithEvent(page, '#selWindowNo', '01'); await sleep(800);
                 await selectWithEvent(page, '#selCarType', 'C');
-                await selectWithEvent(page, '#selEnergyType', 'E'); await sleep(1500);
-                await selectWithEvent(page, '#selPlateType', pType); await sleep(1000);
+                await selectWithEvent(page, '#selEnergyType', 'E'); await sleep(1200);
+                await selectWithEvent(page, '#selPlateType', pType); await sleep(800);
                 await page.evaluate(() => {
                     const radios = document.getElementsByName('plateVer');
-                    if (radios.length > 0) {
-                        const target = Array.from(radios).find(r => r.value === '2') || radios[0];
-                        target.click();
-                    }
+                    if (radios.length > 0) (Array.from(radios).find(r => r.value === '2') || radios[0]).click();
                 });
             } else {
-                // --- OPTIMIZED SHORTCUT ---
-                console.log('    [Action] Using Shortcut: "Re-query" with kept data...');
-                try {
-                    await page.evaluate(() => {
-                        const reQueryBtn = document.querySelector('a[onclick*="doReturnWithData"]');
-                        if (reQueryBtn) reQueryBtn.click();
-                    });
-                    await page.waitForSelector('#selPlateType', { timeout: 15000 });
-                    await selectWithEvent(page, '#selPlateType', pType);
-                    await sleep(1000);
-                } catch (e) {
-                    console.log('    [Warn] Shortcut failed, restarting station flow...');
-                    isFirstQueryInStation = true; // Force full nav next time
-                    attempts--; // Don't count this as a main attempt
-                    continue;
-                }
+                console.log('    [Action] Quick Re-query...');
+                await page.evaluate(() => {
+                    const btn = document.querySelector('a[onclick*="doReturnWithData"]');
+                    if (btn) btn.click();
+                });
+                await page.waitForSelector('#selPlateType', { timeout: 10000 });
+                await selectWithEvent(page, '#selPlateType', pType);
+                await sleep(1000);
             }
 
-            // Step 7: Solve Captcha
+            // 2. 驗證碼辨識
             let code = null;
             let captchaAttempts = 0;
             while (!code && captchaAttempts < 5) {
@@ -540,96 +503,92 @@ async function processStation(page, deptId, station) {
                     if (btn) btn.click();
                 });
                 await waitForImage(page, '#pickimg');
-                await sleep(1500);
-
-                try {
-                    const rawCode = await solveCaptcha(page);
-                    if (rawCode && rawCode.length === 4) code = rawCode;
-                } catch (e) {}
+                await sleep(1000);
+                const rawCode = await solveCaptcha(page);
+                if (rawCode && rawCode.length === 4) code = rawCode;
             }
 
             if (!code) continue;
 
-            // Submit with Sync
+            // 3. 提交表單
             await page.focus('#validateStr');
-            await page.type('#validateStr', code, { delay: 100 });
+            await page.type('#validateStr', code, { delay: 50 });
             await page.evaluate((c) => {
-                if (typeof dwr !== 'undefined' && dwr.util) dwr.util.setValue('validateStr', c);
                 const win = document.querySelector('#selWindowNo');
                 const loc = document.querySelector('#location');
                 const meth = document.querySelector('#method');
                 if (win && loc) loc.value = win.options[win.selectedIndex]?.text || '';
                 if (meth) meth.value = 'qryPickNo';
+                if (typeof dwr !== 'undefined' && dwr.util) dwr.util.setValue('validateStr', c);
             }, code);
-            await sleep(1500);
+            await sleep(1000);
 
             let alertMsg = null;
             const dialogHandler = async d => { alertMsg = d.message(); await d.dismiss(); };
             page.on('dialog', dialogHandler);
+            
+            const trigger = await doSubmit(page);
+            console.log(`    [Form] Submit triggered (${trigger}), waiting for results...`);
 
-            const queryStart = Date.now();
-            const submitResult = await doSubmit(page);
-            console.log(`    [Form] Submit triggered via: ${submitResult}`);
+            // 4. 暴力偵測結果 (每 2 秒檢查一次，最多 15 次 = 30秒)
+            for (let i = 0; i < 15; i++) {
+                await sleep(2000);
+                const pageInfo = await page.evaluate(() => {
+                    const h1 = document.querySelector('h1')?.innerText || '';
+                    const body = document.body.innerText;
+                    return {
+                        isResult: h1.includes('--') || document.querySelector('.number_cell') !== null,
+                        isNoData: body.includes('截至目前為止') || body.includes('查無資料'),
+                        isError: body.includes('驗證數字輸入錯誤') || body.includes('請輸入驗證數字')
+                    };
+                });
 
-            try {
-                await page.waitForFunction(
-                    () => {
-                        const h1 = document.querySelector('h1')?.innerText || '';
-                        return h1.includes('--') || document.querySelector('.number_cell') || document.body.innerText.includes('查無資料');
-                    },
-                    { timeout: resultWaitTimeout }
-                );
-                success = true;
-            } catch (e) {
-                console.log(`    [Fail] Result wait timeout, final check...`);
-                const finalCheck = await page.evaluate(() => document.querySelector('.number_cell') !== null);
-                if (finalCheck) success = true;
-                else {
-                    const timestamp = Date.now();
-                    await page.screenshot({ path: `logs/debug_fail_${timestamp}.png` });
+                if (alertMsg || pageInfo.isError) {
+                    console.log(`    [Fail] Captcha Error detected.`);
+                    break; 
                 }
+                if (pageInfo.isResult || pageInfo.isNoData) {
+                    console.log(`    [Success] Results rendered (IsResult: ${pageInfo.isResult}, NoData: ${pageInfo.isNoData})`);
+                    success = true;
+                    break;
+                }
+                process.stdout.write('.'); // 打印進度點
             }
+
             page.off('dialog', dialogHandler);
-            if (!success && attempts < maxQueryAttempts) await randomSleep(5000, 10000);
+            if (!success) console.log('\n    [Wait] No confirmed state found, retrying...');
         }
 
         if (success) {
-            isFirstQueryInStation = false; // Successfully reached result page
+            isFirstQueryInStation = false;
             let hasNext = true;
             while (hasNext) {
                 const info = await parsePageInfo(page);
                 if (info.noData) { hasNext = false; continue; }
                 const plates = await page.evaluate(() => {
-                    const cells = document.querySelectorAll('.number_cell');
-                    return Array.from(cells).map(el => ({
+                    return Array.from(document.querySelectorAll('.number_cell')).map(el => ({
                         no: el.querySelector('.number')?.innerText.trim(),
                         price: el.querySelector('.price')?.innerText.split('元')[0].replace(/,/g, '').trim()
                     })).filter(x => x.no);
                 });
                 if (plates.length > 0) collectedPlates.push(...plates);
                 if (info.current < info.total) {
-                    let nextBtn = await page.$('input[name="status_next_page"]') || await page.$('#next');
-                    if (nextBtn) { await nextBtn.click(); await randomSleep(1500, 3000); }
+                    const nextBtn = await page.$('input[name="status_next_page"]') || await page.$('#next');
+                    if (nextBtn) { await nextBtn.click(); await sleep(3000); }
                     else hasNext = false;
                 } else hasNext = false;
             }
             if (collectedPlates.length > 0) {
                 const uniquePlates = Array.from(new Map(collectedPlates.map(p => [p.no, p])).values());
-                await supabase.from('available_plates_staging').insert(
-                    uniquePlates.map(p => ({
-                        station_id: station.id, station_name: station.name, region_id: deptId,
-                        plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
-                        updated_at: new Date().toISOString(), status: 'AVAILABLE'
-                    }))
-                );
+                await supabase.from('available_plates_staging').insert(uniquePlates.map(p => ({
+                    station_id: station.id, station_name: station.name, region_id: deptId,
+                    plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
+                    updated_at: new Date().toISOString(), status: 'AVAILABLE'
+                })));
                 console.log(`    [DB] Staged ${uniquePlates.length} plates.`);
                 stats.totalPlates += uniquePlates.length;
                 platesFound += uniquePlates.length;
             }
-        } else {
-            console.error(`    [Fail] Station ${station.name} (${typeName}) failed.`);
-            stats.stationsFailed++;
-            status = 'FAILED';
         }
     }
     const duration = ((Date.now() - startTime) / 1000);
@@ -637,6 +596,7 @@ async function processStation(page, deptId, station) {
     if (status !== 'FAILED') stats.stationsSuccess++;
     stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: platesFound, retries: retries, status: status });
 }
+
 
 
 
