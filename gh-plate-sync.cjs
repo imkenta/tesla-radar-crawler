@@ -332,7 +332,7 @@ async function doSubmit(page) {
 
 async function parsePageInfo(page) {
     return page.evaluate(() => {
-        const text = document.body.innerText;
+        const text = document.body?.innerText || "";
         
         // 1. Check for 'No Data' messages first
         if (text.includes('查無資料') || text.includes('尚無可供選號') || text.includes('對不起')) {
@@ -535,7 +535,7 @@ async function processStation(page, deptId, station) {
                 await sleep(2000);
                 const pageInfo = await page.evaluate(() => {
                     const h1 = document.querySelector('h1')?.innerText || '';
-                    const body = document.body.innerText;
+                    const body = document.body?.innerText || "";
                     return {
                         isResult: h1.includes('--') || document.querySelector('.number_cell') !== null,
                         isNoData: body.includes('截至目前為止') || body.includes('查無資料'),
