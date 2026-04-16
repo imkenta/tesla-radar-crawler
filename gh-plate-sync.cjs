@@ -262,16 +262,26 @@ async function solveCaptcha(page) {
         const captchaEl = await page.$('#pickimg');
         if (!captchaEl) throw new Error('CAPTCHA image not found');
 
-        const imageBuffer = await captchaEl.screenshot({ encoding: 'base64' });
+        // Quality optimization: Double the scale for better OCR accuracy
+        const imageBuffer = await captchaEl.screenshot({ 
+            encoding: 'base64',
+            type: 'jpeg',
+            quality: 100,
+            omitBackground: true
+        });
 
-        const prompt = "Output only the 4 characters in this image. No markdown, no spaces.";
+        // Refined prompt for better character isolation
+        const prompt = "This image contains a 4-character CAPTCHA with Latin letters (A-Z) and numbers (0-9). IDENTIFY and OUTPUT ONLY the 4 characters. DO NOT include any spaces, punctuation, Chinese characters, or explanation.";
+        
         const result = await model.generateContent([
             prompt,
             { inlineData: { data: imageBuffer, mimeType: "image/jpeg" } }
         ]);
         const response = await result.response;
-        const text = response.text().trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-        console.log(`    [AI] Predicted: ${text}`);
+        const rawText = response.text();
+        const text = rawText.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        
+        console.log(`    [AI] Predicted: ${text} (Raw: ${rawText.substring(0, 50).replace(/\n/g, ' ')})`);
         
         if (text && text.length === 4) {
             stats.captchaSuccess++;
@@ -284,11 +294,40 @@ async function solveCaptcha(page) {
 }
 
 async function doSubmit(page) {
-    return page.evaluate(() => {
-        if (typeof window.doSubmit === 'function') {
-            window.doSubmit();
+    const buttonData = await page.evaluate(() => {
+        const selectors = [
+            'a[onclick*="doSubmit"]',
+            'input[onclick*="doSubmit"]',
+            'button[onclick*="doSubmit"]',
+            'input[type="button"][value*="確"]',
+            '.std_btn'
+        ];
+        
+        for (const sel of selectors) {
+            const el = Array.from(document.querySelectorAll(sel)).find(e => {
+                const r = e.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && window.getComputedStyle(e).display !== 'none';
+            });
+            
+            if (el) {
+                el.scrollIntoView();
+                const rect = el.getBoundingClientRect();
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, tag: el.tagName, sel: sel };
+            }
         }
+        return null;
     });
+
+    if (buttonData) {
+        await page.mouse.move(buttonData.x, buttonData.y, { steps: 5 });
+        await sleep(200);
+        await page.mouse.click(buttonData.x, buttonData.y);
+        return `PHYSICAL_CLICK_${buttonData.tag}`;
+    } else if (typeof window.doSubmit === 'function') {
+        await page.evaluate(() => window.doSubmit());
+        return "CALLED_SCRIPT_FALLBACK";
+    }
+    return "NOT_FOUND";
 }
 
 async function parsePageInfo(page) {
@@ -364,17 +403,28 @@ async function performSwap() {
     }
 }
 
+// Helper to select and dispatch events
+const selectWithEvent = async (page, selector, value) => {
+    await page.waitForSelector(selector);
+    await page.select(selector, value);
+    await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (el) {
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            if (el.onchange) el.onchange();
+        }
+    }, selector);
+};
+
 async function processStation(page, deptId, station) {
     const startTime = Date.now();
-    console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---
-`);
+    console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---\n`);
     
-    // Metrics variables
     let platesFound = 0;
     let retries = 0;
     let status = 'SUCCESS';
 
-    // Clean up staging for this station & dept only to prevent accidental overlap deletion
     const { error: delError } = await supabase
         .from('available_plates_staging')
         .delete()
@@ -386,271 +436,184 @@ async function processStation(page, deptId, station) {
     const plateTypes = ['g'];
     if (!station.no_rental) plateTypes.push('h');
 
-    // Throttling for high risk stations:
-    // If station is in high risk list, start with high latency to force slow mode
-    // and prevent adaptive speedup from kicking in too early.
     const isHighRisk = HIGH_RISK_STATIONS.includes(station.id);
     let lastLatency = isHighRisk ? 5000 : 2000; 
-
     if (isHighRisk) console.log(`    ⚠️ High Risk Station detected. Enabling throttling mode.`);
 
     for (const pType of plateTypes) {
         const typeName = pType === 'g' ? 'Private (g)' : 'Rental (h)';
         console.log(`  > Querying: ${typeName}`);
 
-        // Robust Navigation with Retries & Longer Timeout
-        let navSuccess = false;
-        let navAttempts = 0;
-        while (navAttempts < 3 && !navSuccess) {
-            navAttempts++;
-            try {
-                const navStart = Date.now();
-                await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 180000 });
-                lastLatency = Date.now() - navStart;
-                if (process.env.NODE_ENV === 'development') console.log(`    [Network] Latency: ${lastLatency}ms`);
-                navSuccess = true;
-            } catch (e) {
-                console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
-                if (navAttempts < 3) await randomSleep(2000, 5000);
-                else throw e; // Fatal after 3 retries
-            }
-        }
-        await adaptiveSleep(800, 1500, lastLatency);
-
-        await page.select('#selDeptCode', deptId);
-        await adaptiveSleep(800, 1200, lastLatency);
-
-        await page.select('#selStationCode', station.id);
-        await adaptiveSleep(800, 1200, lastLatency);
-
-        try {
-            await page.waitForSelector('#selWindowNo option[value="01"]', { timeout: 10000 });
-            await page.select('#selWindowNo', '01');
-        } catch (e) {
-            await page.evaluate(() => {
-                const opts = document.querySelectorAll('#selWindowNo option');
-                if (opts.length > 1) opts[1].selected = true;
-            });
-        }
-        await adaptiveSleep(600, 1000, lastLatency);
-
-        await page.select('#selCarType', 'C');
-        await adaptiveSleep(400, 800, lastLatency);
-        await page.select('#selEnergyType', 'E');
-        await adaptiveSleep(800, 1500, lastLatency);
-
-        const typeExists = await page.evaluate((val) => {
-            return !!document.querySelector(`#selPlateType option[value="${val}"]`);
-        }, pType);
-
-        if (!typeExists) {
-            console.log(`    [Skip] Plate type ${pType} not available.`);
-            continue;
-        }
-        await page.select('#selPlateType', pType);
-        await adaptiveSleep(600, 1000, lastLatency);
-
         let attempts = 0;
         let success = false;
         let collectedPlates = [];
-        
-        // Standardized robust settings for ALL stations
         const maxQueryAttempts = 10;
         const resultWaitTimeout = 30000;
 
         while (attempts < maxQueryAttempts && !success) {
             attempts++;
-            if (attempts > 1) retries++; // Count retries
-            
-            // Step 1: Solve Captcha (Inner Loop)
-            // We try to get a valid 4-char code up to 5 times before giving up on this attempt.
+            if (attempts > 1) retries++;
+
+            console.log(`    [Attempt ${attempts}/${maxQueryAttempts}] Navigating and filling form...`);
+            let navSuccess = false;
+            let navAttempts = 0;
+            while (navAttempts < 3 && !navSuccess) {
+                navAttempts++;
+                try {
+                    const navStart = Date.now();
+                    await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+                    lastLatency = Date.now() - navStart;
+                    
+                    await page.evaluate(() => {
+                        if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
+                        const closeBtn = Array.from(document.querySelectorAll('a, button, input'))
+                            .find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
+                        if (closeBtn) closeBtn.click();
+                    });
+                    await sleep(1000);
+                    navSuccess = true;
+                } catch (e) {
+                    console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
+                    await randomSleep(2000, 5000);
+                }
+            }
+
+            if (!navSuccess) throw new Error("Critical navigation failure");
+            await adaptiveSleep(1000, 2000, lastLatency);
+
+            // Fill Form
+            console.log('    [Form] Selecting Fields Strictly...');
+            await selectWithEvent(page, '#selDeptCode', deptId);
+            await sleep(1500);
+            await selectWithEvent(page, '#selStationCode', station.id);
+            await sleep(1500);
+            await selectWithEvent(page, '#selWindowNo', '01');
+            await sleep(1000);
+            await selectWithEvent(page, '#selCarType', 'C');
+            await selectWithEvent(page, '#selEnergyType', 'E');
+            await sleep(1500);
+            await selectWithEvent(page, '#selPlateType', pType);
+            await sleep(1000);
+
+            // Radio Plate Style
+            await page.evaluate(() => {
+                const radios = document.getElementsByName('plateVer');
+                if (radios.length > 0) {
+                    const target = Array.from(radios).find(r => r.value === '2') || radios[0];
+                    target.click();
+                }
+            });
+            await sleep(1000);
+
+            // Solve Captcha
             let code = null;
             let captchaAttempts = 0;
-            
             while (!code && captchaAttempts < 5) {
                 captchaAttempts++;
-                
-                // Refresh if not first try
-                if (captchaAttempts > 1 || attempts > 1) {
-                    console.log(`    [Captcha Retry ${captchaAttempts}/5] Refreshing image...`);
-                    try {
-                        const refreshBtn = await page.$('#pickimg + a');
-                        if (refreshBtn) await refreshBtn.click();
-                        else await page.click('a[onclick*="pickimg"]');
-                    } catch (e) {
-                        console.warn('    [Warn] Refresh click failed, continuing...');
-                    }
-                    await randomSleep(1000, 3000);
-                }
-
                 try {
                     const rawCode = await solveCaptcha(page);
-                    
-                    // Check logic: Must be 4 chars
-                    if (rawCode && rawCode.length === 4) {
-                        code = rawCode;
-                    } else {
-                        console.log(`    [AI] Invalid length (${rawCode ? rawCode.length : 0}). Retrying...`);
+                    if (rawCode && rawCode.length === 4) code = rawCode;
+                    else {
+                        const refreshBtn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');
+                        if (refreshBtn) await refreshBtn.click();
+                        await waitForImage(page, '#pickimg');
+                        await sleep(1000);
                     }
-                } catch (aiError) {
-                    // Handle API Overloaded (503) or other AI errors
-                    console.warn(`    [AI] Error: ${aiError.message}`);
-                    if (aiError.message.includes('503') || aiError.message.includes('Overloaded')) {
-                        console.log('    [AI] Model overloaded. Sleeping 30s...');
-                        await sleep(30000); 
-                    }
-                }
+                } catch (e) {}
             }
 
-            if (!code) {
-                console.error('    [Fail] Failed to get valid CAPTCHA after 5 tries. Restarting station flow...');
-                continue; // Consumes 1 main attempt
-            }
+            if (!code) continue;
 
-            // Step 2: Submit Form
-            await humanType(page, '#validateStr', code);
-            
+            // Submit with Sync
+            await page.focus('#validateStr');
+            await page.type('#validateStr', code, { delay: 100 });
+            await page.evaluate((c) => {
+                if (typeof dwr !== 'undefined' && dwr.util) dwr.util.setValue('validateStr', c);
+                const win = document.querySelector('#selWindowNo');
+                const loc = document.querySelector('#location');
+                const meth = document.querySelector('#method');
+                if (win && loc) loc.value = win.options[win.selectedIndex]?.text || '';
+                if (meth) meth.value = 'qryPickNo';
+            }, code);
+            await sleep(1500);
+
             let alertMsg = null;
-            const dialogHandler = async dialog => {
-                alertMsg = dialog.message();
-                await dialog.dismiss();
-            };
+            const dialogHandler = async d => { alertMsg = d.message(); await d.dismiss(); };
             page.on('dialog', dialogHandler);
 
             const queryStart = Date.now();
-            await doSubmit(page);
+            const submitResult = await doSubmit(page);
+            console.log(`    [Form] Submit triggered via: ${submitResult}`);
 
             try {
                 await page.waitForFunction(
-                    () => document.querySelector('.number_cell') || document.body.innerText.includes('查無資料'),
+                    () => {
+                        const h1 = document.querySelector('h1')?.innerText || '';
+                        return h1.includes('--') || document.querySelector('.number_cell') || document.body.innerText.includes('查無資料');
+                    },
                     { timeout: resultWaitTimeout }
                 );
-                lastLatency = Date.now() - queryStart;
-                
-                if (alertMsg) {
-                    console.log(`    [Fail] Alert: ${alertMsg}`);
-                    // Alert means wrong captcha. This consumes 1 main attempt.
-                } else {
-                    success = true;
-                }
+                success = true;
             } catch (e) {
-                if (alertMsg) console.log(`    [Fail] Alert: ${alertMsg}`);
-                else console.log(`    [Fail] Result timeout after ${resultWaitTimeout}ms.`);
+                console.log(`    [Fail] Result wait timeout, final check...`);
+                const finalCheck = await page.evaluate(() => document.querySelector('.number_cell') !== null);
+                if (finalCheck) success = true;
+                else {
+                    const timestamp = Date.now();
+                    const fullHtml = await page.content();
+                    fs.writeFileSync(`logs/debug_fail_${timestamp}.html`, fullHtml);
+                    await page.screenshot({ path: `logs/debug_fail_${timestamp}.png` });
+                }
             }
-            
             page.off('dialog', dialogHandler);
-            
-            // If failed, cool down before next main attempt
-            if (!success && attempts < maxQueryAttempts) {
-                 await randomSleep(5000, 10000);
-            }
+            if (!success && attempts < maxQueryAttempts) await randomSleep(5000, 10000);
         }
 
         if (success) {
-                        let hasNext = true;
-                        
-                        while (hasNext) {
-                            // Parse Pagination Info from Text (More robust than checking button existence)
-                            const info = await parsePageInfo(page);
-            
-                            if (info.noData) {
-                                console.log(`    [Skip] No plates available at this station.`);
-                                hasNext = false;
-                                continue;
-                            }
-            
-                            // Wait a bit for table to render
-                            await sleep(500);
-            
-                            // Collect Plates safely
-                            const plates = await page.evaluate(() => {
-                                const cells = document.querySelectorAll('.number_cell');
-                                if (!cells || cells.length === 0) return [];
-                                
-                                return Array.from(cells).map(el => ({
-                                    no: el.querySelector('.number')?.innerText.trim(),
-                                    price: el.querySelector('.price')?.innerText.split('元')[0].replace(/,/g, '').trim()
-                                })).filter(x => x.no);
-                            });
-                            
-                            if (plates.length > 0) {
-                                collectedPlates.push(...plates);
-                            }
-            
-                            console.log(`    [Page ${info.current}/${info.total}] Found ${plates.length} plates (Exp Total: ${info.count})`);
-            
-                            if (info.current < info.total || info.hasNextButton) {                                let nextBtn = await page.$('input[name="status_next_page"]');
-                                if (!nextBtn) nextBtn = await page.$('#next'); // Try alternative selector
-
-                                if (nextBtn) {
-                                    await nextBtn.click();
-                                    // Pagination is critical. Keep conservative sleep.
-                                    await randomSleep(1500, 3000);
-                                } else {
-                                    hasNext = false; 
-                                }
-                            } else {
-                                hasNext = false;
-                            }
-                        }
-            if (collectedPlates.length > 0) {
-                const now = new Date().toISOString();
-                const uniquePlatesMap = new Map();
-                collectedPlates.forEach(p => {
-                    if (p.no) uniquePlatesMap.set(p.no, p);
+            let hasNext = true;
+            while (hasNext) {
+                const info = await parsePageInfo(page);
+                if (info.noData) { hasNext = false; continue; }
+                await sleep(500);
+                const plates = await page.evaluate(() => {
+                    const cells = document.querySelectorAll('.number_cell');
+                    return Array.from(cells).map(el => ({
+                        no: el.querySelector('.number')?.innerText.trim(),
+                        price: el.querySelector('.price')?.innerText.split('元')[0].replace(/,/g, '').trim()
+                    })).filter(x => x.no);
                 });
-                const finalPlates = Array.from(uniquePlatesMap.values());
-
-                const { error } = await supabase.from('available_plates_staging').insert(
-                    finalPlates.map(p => ({
-                        station_id: station.id,
-                        station_name: station.name,
-                        region_id: deptId,
-                        plate_type: pType,
-                        window_id: '01',
-                        plate_no: p.no,
-                        price: parseInt(p.price) || 0,
-                        updated_at: now,
-                        status: 'AVAILABLE'
+                if (plates.length > 0) collectedPlates.push(...plates);
+                if (info.current < info.total) {
+                    let nextBtn = await page.$('input[name="status_next_page"]') || await page.$('#next');
+                    if (nextBtn) { await nextBtn.click(); await randomSleep(1500, 3000); }
+                    else hasNext = false;
+                } else hasNext = false;
+            }
+            if (collectedPlates.length > 0) {
+                const uniquePlates = Array.from(new Map(collectedPlates.map(p => [p.no, p])).values());
+                await supabase.from('available_plates_staging').insert(
+                    uniquePlates.map(p => ({
+                        station_id: station.id, station_name: station.name, region_id: deptId,
+                        plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
+                        updated_at: new Date().toISOString(), status: 'AVAILABLE'
                     }))
                 );
-                
-                if (error) {
-                    console.error('    [DB] Upsert Error:', error.message);
-                    stats.addError(station.name, `DB Staging Error: ${error.message}`);
-                } else {
-                    console.log(`    [DB] Staged ${finalPlates.length} plates (Total: ${collectedPlates.length}).`);
-                    stats.totalPlates += finalPlates.length;
-                    platesFound += finalPlates.length;
-                }
+                console.log(`    [DB] Staged ${uniquePlates.length} plates.`);
+                stats.totalPlates += uniquePlates.length;
+                platesFound += uniquePlates.length;
             }
         } else {
-            console.error(`    [Fail] Station ${station.name} abandoned after retries.`);
+            console.error(`    [Fail] Station ${station.name} failed.`);
             stats.stationsFailed++;
-            stats.addError(station.name, "Max attempts reached or navigation failed.");
             status = 'FAILED';
         }
-
-        await randomSleep(1000, 2000);
     }
-    
-    // Calculate and save station metrics
-    const endTime = Date.now();
-    const duration = ((endTime - startTime) / 1000); // Keep as number for JSON
+    const duration = ((Date.now() - startTime) / 1000);
     console.log(`⏱️  Station ${station.name} finished in ${duration.toFixed(2)}s`);
-    
     if (status !== 'FAILED') stats.stationsSuccess++;
-
-    stats.addStationStat({
-        id: station.id,
-        name: station.name,
-        region: getRegion(station.id),
-        duration_sec: duration,
-        plates_found: platesFound,
-        retries: retries,
-        status: status
-    });
+    stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: platesFound, retries: retries, status: status });
 }
+
 
 // --- Execution Entry ---
 
