@@ -417,6 +417,22 @@ const selectWithEvent = async (page, selector, value) => {
     }, selector);
 };
 
+const waitForImage = async (page, selector, timeout = 10000) => {
+    try {
+        await page.waitForFunction(
+            (sel) => {
+                const img = document.querySelector(sel);
+                return img && img.complete && img.naturalWidth > 0;
+            },
+            { timeout },
+            selector
+        );
+        return true;
+    } catch (e) {
+        return false;
+    }
+};
+
 async function processStation(page, deptId, station) {
     const startTime = Date.now();
     console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---\n`);
@@ -438,7 +454,9 @@ async function processStation(page, deptId, station) {
 
     const isHighRisk = HIGH_RISK_STATIONS.includes(station.id);
     let lastLatency = isHighRisk ? 5000 : 2000; 
-    if (isHighRisk) console.log(`    ⚠️ High Risk Station detected. Enabling throttling mode.`);
+
+    // --- OPTIMIZATION FLAG ---
+    let isFirstQueryInStation = true;
 
     for (const pType of plateTypes) {
         const typeName = pType === 'g' ? 'Private (g)' : 'Rental (h)';
@@ -454,71 +472,79 @@ async function processStation(page, deptId, station) {
             attempts++;
             if (attempts > 1) retries++;
 
-            console.log(`    [Attempt ${attempts}/${maxQueryAttempts}] Navigating and filling form...`);
-            let navSuccess = false;
-            let navAttempts = 0;
-            while (navAttempts < 3 && !navSuccess) {
-                navAttempts++;
+            // Use Full Navigation if it's the first query or a retry after failure
+            if (isFirstQueryInStation || attempts > 1) {
+                console.log(`    [Attempt ${attempts}/${maxQueryAttempts}] Initializing full form...`);
+                let navSuccess = false;
+                let navAttempts = 0;
+                while (navAttempts < 3 && !navSuccess) {
+                    navAttempts++;
+                    try {
+                        await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+                        await page.evaluate(() => {
+                            if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
+                            const closeBtn = Array.from(document.querySelectorAll('a, button, input'))
+                                .find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
+                            if (closeBtn) closeBtn.click();
+                        });
+                        await sleep(1000);
+                        navSuccess = true;
+                    } catch (e) {
+                        console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
+                        await randomSleep(2000, 5000);
+                    }
+                }
+
+                if (!navSuccess) throw new Error("Critical navigation failure");
+
+                // Fill Form
+                await selectWithEvent(page, '#selDeptCode', deptId); await sleep(1500);
+                await selectWithEvent(page, '#selStationCode', station.id); await sleep(1500);
+                await selectWithEvent(page, '#selWindowNo', '01'); await sleep(1000);
+                await selectWithEvent(page, '#selCarType', 'C');
+                await selectWithEvent(page, '#selEnergyType', 'E'); await sleep(1500);
+                await selectWithEvent(page, '#selPlateType', pType); await sleep(1000);
+                await page.evaluate(() => {
+                    const radios = document.getElementsByName('plateVer');
+                    if (radios.length > 0) {
+                        const target = Array.from(radios).find(r => r.value === '2') || radios[0];
+                        target.click();
+                    }
+                });
+            } else {
+                // --- OPTIMIZED SHORTCUT ---
+                console.log('    [Action] Using Shortcut: "Re-query" with kept data...');
                 try {
-                    const navStart = Date.now();
-                    await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-                    lastLatency = Date.now() - navStart;
-                    
                     await page.evaluate(() => {
-                        if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
-                        const closeBtn = Array.from(document.querySelectorAll('a, button, input'))
-                            .find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
-                        if (closeBtn) closeBtn.click();
+                        const reQueryBtn = document.querySelector('a[onclick*="doReturnWithData"]');
+                        if (reQueryBtn) reQueryBtn.click();
                     });
+                    await page.waitForSelector('#selPlateType', { timeout: 15000 });
+                    await selectWithEvent(page, '#selPlateType', pType);
                     await sleep(1000);
-                    navSuccess = true;
                 } catch (e) {
-                    console.warn(`    [Network] Navigation attempt ${navAttempts} failed: ${e.message}`);
-                    await randomSleep(2000, 5000);
+                    console.log('    [Warn] Shortcut failed, restarting station flow...');
+                    isFirstQueryInStation = true; // Force full nav next time
+                    attempts--; // Don't count this as a main attempt
+                    continue;
                 }
             }
 
-            if (!navSuccess) throw new Error("Critical navigation failure");
-            await adaptiveSleep(1000, 2000, lastLatency);
-
-            // Fill Form
-            console.log('    [Form] Selecting Fields Strictly...');
-            await selectWithEvent(page, '#selDeptCode', deptId);
-            await sleep(1500);
-            await selectWithEvent(page, '#selStationCode', station.id);
-            await sleep(1500);
-            await selectWithEvent(page, '#selWindowNo', '01');
-            await sleep(1000);
-            await selectWithEvent(page, '#selCarType', 'C');
-            await selectWithEvent(page, '#selEnergyType', 'E');
-            await sleep(1500);
-            await selectWithEvent(page, '#selPlateType', pType);
-            await sleep(1000);
-
-            // Radio Plate Style
-            await page.evaluate(() => {
-                const radios = document.getElementsByName('plateVer');
-                if (radios.length > 0) {
-                    const target = Array.from(radios).find(r => r.value === '2') || radios[0];
-                    target.click();
-                }
-            });
-            await sleep(1000);
-
-            // Solve Captcha
+            // Step 7: Solve Captcha
             let code = null;
             let captchaAttempts = 0;
             while (!code && captchaAttempts < 5) {
                 captchaAttempts++;
+                await page.evaluate(() => {
+                    const btn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');
+                    if (btn) btn.click();
+                });
+                await waitForImage(page, '#pickimg');
+                await sleep(1500);
+
                 try {
                     const rawCode = await solveCaptcha(page);
                     if (rawCode && rawCode.length === 4) code = rawCode;
-                    else {
-                        const refreshBtn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');
-                        if (refreshBtn) await refreshBtn.click();
-                        await waitForImage(page, '#pickimg');
-                        await sleep(1000);
-                    }
                 } catch (e) {}
             }
 
@@ -560,8 +586,6 @@ async function processStation(page, deptId, station) {
                 if (finalCheck) success = true;
                 else {
                     const timestamp = Date.now();
-                    const fullHtml = await page.content();
-                    fs.writeFileSync(`logs/debug_fail_${timestamp}.html`, fullHtml);
                     await page.screenshot({ path: `logs/debug_fail_${timestamp}.png` });
                 }
             }
@@ -570,11 +594,11 @@ async function processStation(page, deptId, station) {
         }
 
         if (success) {
+            isFirstQueryInStation = false; // Successfully reached result page
             let hasNext = true;
             while (hasNext) {
                 const info = await parsePageInfo(page);
                 if (info.noData) { hasNext = false; continue; }
-                await sleep(500);
                 const plates = await page.evaluate(() => {
                     const cells = document.querySelectorAll('.number_cell');
                     return Array.from(cells).map(el => ({
@@ -603,7 +627,7 @@ async function processStation(page, deptId, station) {
                 platesFound += uniquePlates.length;
             }
         } else {
-            console.error(`    [Fail] Station ${station.name} failed.`);
+            console.error(`    [Fail] Station ${station.name} (${typeName}) failed.`);
             stats.stationsFailed++;
             status = 'FAILED';
         }
@@ -613,6 +637,7 @@ async function processStation(page, deptId, station) {
     if (status !== 'FAILED') stats.stationsSuccess++;
     stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: platesFound, retries: retries, status: status });
 }
+
 
 
 // --- Execution Entry ---
