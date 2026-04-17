@@ -11,13 +11,33 @@ if (!url || !key) {
 
 const supabase = createClient(url, key);
 
+async function safeQuery(operation, maxRetries = 5) {
+    let retries = maxRetries;
+    while (retries > 0) {
+        try {
+            const result = await operation();
+            if (!result.error) return result;
+            console.log(`    [Retry] Supabase error: ${result.error.message}. Retries left: ${retries - 1}`);
+        } catch (e) {
+            console.log(`    [Retry] Fetch exception: ${e.message}. Retries left: ${retries - 1}`);
+        }
+        retries--;
+        if (retries > 0) {
+            const waitTime = (maxRetries + 1 - retries) * 5000;
+            console.log(`    [Retry] Waiting ${waitTime/1000}s...`);
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+    }
+    return { error: { message: 'Max retries reached' } };
+}
+
 async function run() {
     console.log('🔄 Triggering Final Swap...');
     
     // Safety Check: Ensure Staging is not empty
-    const { count, error: countError } = await supabase
+    const { data, count, error: countError } = await safeQuery(() => supabase
         .from('available_plates_staging')
-        .select('*', { count: 'exact', head: true });
+        .select('*', { count: 'exact', head: true }));
 
     if (countError) {
         console.error('❌ Failed to check staging count:', countError.message);
@@ -32,7 +52,7 @@ async function run() {
 
     console.log(`✅ Staging has ${count} records. Proceeding with swap...`);
 
-    const { error } = await supabase.rpc('swap_plates_data');
+    const { error } = await safeQuery(() => supabase.rpc('swap_plates_data'));
     
     if (error) {
         console.error('❌ Swap Failed:', error.message);
@@ -42,12 +62,12 @@ async function run() {
         console.log(`✅ ${successMsg}. Production data updated.`);
         
         // Update main metadata status
-        await supabase.from('sync_metadata').upsert({
+        await safeQuery(() => supabase.from('sync_metadata').upsert({
             key: 'plates_full_sync',
             status: 'COMPLETED',
             status_message: successMsg,
             last_run_at: new Date().toISOString()
-        }, { onConflict: 'key' });
+        }, { onConflict: 'key' }));
     }
 }
 

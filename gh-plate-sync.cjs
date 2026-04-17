@@ -165,11 +165,36 @@ let totalStations = 0;
 
 async function loadStationData() {
     console.log('📥 Loading station configuration from DB...');
-    const { data, error } = await supabase
-        .from('system_configs')
-        .select('value')
-        .eq('key', 'mvdis_stations')
-        .single();
+    let data = null;
+    let error = null;
+    let retries = 5;
+    
+    while (retries > 0) {
+        try {
+            const result = await supabase
+                .from('system_configs')
+                .select('value')
+                .eq('key', 'mvdis_stations')
+                .single();
+            data = result.data;
+            error = result.error;
+            
+            if (!error && data) break;
+            
+            if (error) {
+                console.log(`    [Retry] Supabase error: ${error.message}. Retries left: ${retries - 1}`);
+            }
+        } catch (e) {
+            console.log(`    [Retry] Fetch exception: ${e.message}. Retries left: ${retries - 1}`);
+        }
+        
+        retries--;
+        if (retries > 0) {
+            const waitTime = (6 - retries) * 5000; // Exponential-ish backoff: 5s, 10s, 15s, 20s
+            console.log(`    [Retry] Waiting ${waitTime/1000}s before next attempt...`);
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+    }
 
     if (error) throw new Error(`Failed to load station config: ${error.message}`);
     if (!data) throw new Error('Station config not found in DB');
@@ -652,11 +677,24 @@ async function processStation(page, deptId, station) {
             }
             if (collectedPlates.length > 0) {
                 const uniquePlates = Array.from(new Map(collectedPlates.map(p => [p.no, p])).values());
-                await supabase.from('available_plates_staging').insert(uniquePlates.map(p => ({
-                    station_id: station.id, station_name: station.name, region_id: deptId,
-                    plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
-                    updated_at: new Date().toISOString(), status: 'AVAILABLE'
-                })));
+                
+                let insertRetries = 3;
+                while (insertRetries > 0) {
+                    try {
+                        const { error } = await supabase.from('available_plates_staging').insert(uniquePlates.map(p => ({
+                            station_id: station.id, station_name: station.name, region_id: deptId,
+                            plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
+                            updated_at: new Date().toISOString(), status: 'AVAILABLE'
+                        })));
+                        if (!error) break;
+                        console.log(`    [Retry] DB Insert error: ${error.message}. Retries left: ${insertRetries - 1}`);
+                    } catch (e) {
+                        console.log(`    [Retry] DB Insert fetch exception: ${e.message}. Retries left: ${insertRetries - 1}`);
+                    }
+                    insertRetries--;
+                    if (insertRetries > 0) await new Promise(r => setTimeout(r, 3000));
+                }
+                
                 console.log(`    [DB] Staged ${uniquePlates.length} plates.`);
                 stats.totalPlates += uniquePlates.length;
                 platesFound += uniquePlates.length;
@@ -676,6 +714,9 @@ async function processStation(page, deptId, station) {
 
 (async () => {
     const totalStartTime = Date.now();
+    console.log('⏳ Waiting 5s for network to stabilize...');
+    await new Promise(r => setTimeout(r, 5000));
+    
     try {
         await loadStationData();
     } catch (err) {
