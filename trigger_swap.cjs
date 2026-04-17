@@ -12,11 +12,12 @@ if (!url || !key) {
 let supabase = null;
 function initSupabase() {
     if (!supabase) {
+        const fetch = require('node-fetch');
         supabase = createClient(url, key, {
             auth: { persistSession: false },
             global: {
-                fetch: (...args) => fetch(...args).catch(err => {
-                    console.error(`[FetchError] ${err.name}: ${err.message}`);
+                fetch: (url, options) => fetch(url, options).catch(err => {
+                    console.error(`[FetchError] ${err.name}: ${err.message} (Target: ${url})`);
                     throw err;
                 })
             }

@@ -38,12 +38,13 @@ jobs:
           # Register
           sudo warp-cli --accept-tos registration new || true
           
-          # Exclude Supabase from WARP (Crucial for stability)
-          # Get IP of Supabase host
+          # Ultimate Stability: Resolve and Hardcode Supabase IP in /etc/hosts
           SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
-          echo "Supabase Domain: $SUB_DOMAIN"
           SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
           if [ ! -z "$SUB_IP" ]; then
+            echo "Hardcoding Supabase IP: $SUB_IP for $SUB_DOMAIN in /etc/hosts"
+            echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
+            
             echo "Excluding Supabase IP: $SUB_IP from WARP"
             sudo warp-cli --accept-tos add-excluded-route $SUB_IP/32 || true
           fi

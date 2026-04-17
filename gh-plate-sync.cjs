@@ -161,12 +161,14 @@ let supabase = null;
 
 function initSupabase() {
     if (!supabase) {
+        // Use node-fetch for better stability in GitHub Actions + WARP
+        const fetch = require('node-fetch');
         supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
             auth: { persistSession: false },
             global: {
-                fetch: (...args) => {
-                    return fetch(...args).catch(err => {
-                        console.error(`[FetchError] ${err.name}: ${err.message}`);
+                fetch: (url, options) => {
+                    return fetch(url, options).catch(err => {
+                        console.error(`[FetchError] ${err.name}: ${err.message} (Target: ${url})`);
                         throw err;
                     });
                 }
