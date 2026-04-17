@@ -9,7 +9,21 @@ if (!url || !key) {
     process.exit(1);
 }
 
-const supabase = createClient(url, key);
+let supabase = null;
+function initSupabase() {
+    if (!supabase) {
+        supabase = createClient(url, key, {
+            auth: { persistSession: false },
+            global: {
+                fetch: (...args) => fetch(...args).catch(err => {
+                    console.error(`[FetchError] ${err.name}: ${err.message}`);
+                    throw err;
+                })
+            }
+        });
+    }
+    return supabase;
+}
 
 async function safeQuery(operation, maxRetries = 5) {
     let retries = maxRetries;
@@ -19,7 +33,7 @@ async function safeQuery(operation, maxRetries = 5) {
             if (!result.error) return result;
             console.log(`    [Retry] Supabase error: ${result.error.message}. Retries left: ${retries - 1}`);
         } catch (e) {
-            console.log(`    [Retry] Fetch exception: ${e.message}. Retries left: ${retries - 1}`);
+            console.log(`    [Retry] Fetch exception: ${e.name}: ${e.message}. Retries left: ${retries - 1}`);
         }
         retries--;
         if (retries > 0) {
@@ -33,6 +47,7 @@ async function safeQuery(operation, maxRetries = 5) {
 
 async function run() {
     console.log('🔄 Triggering Final Swap...');
+    const supabase = initSupabase();
     
     // Safety Check: Ensure Staging is not empty
     const { data, count, error: countError } = await safeQuery(() => supabase

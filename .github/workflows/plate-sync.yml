@@ -28,6 +28,10 @@ jobs:
 
       - name: Install and Configure Cloudflare WARP
         run: |
+          # Disable IPv6 to prevent DNS/Routing leakage in WARP
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+          
           # Import GPG key and add repository
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
@@ -41,24 +45,24 @@ jobs:
           # Connect
           sudo warp-cli --accept-tos connect
           
-          # Wait for connection to stabilize (Increased to 20s)
+          # Wait for connection to stabilize (Increased to 30s)
           echo "Waiting for WARP connection..."
-          sleep 20
+          sleep 30
           
           # Verify connection status
           sudo warp-cli --accept-tos status || true
 
       - name: Check IP and Connectivity
         run: |
-          echo "Checking IP..."
-          curl -s --max-time 10 ifconfig.me || echo "Failed to get IP"
+          echo "Checking IP (IPv4 only)..."
+          curl -4 -s --max-time 10 ifconfig.me || echo "Failed to get IP"
           
-          echo "Checking Supabase DNS..."
-          nslookup $(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/') || echo "NSLOOKUP failed"
+          echo "Checking Supabase DNS (IPv4)..."
+          host -t A $(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/') || echo "DNS A record lookup failed"
           
           echo "Testing Supabase Connectivity with retry..."
           for i in {1..5}; do
-            curl -I -s --max-time 10 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
+            curl -4 -I -s --max-time 10 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
           done || echo "Supabase direct connection failed after retries"
 
       - name: Setup Node.js

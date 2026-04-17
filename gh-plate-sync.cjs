@@ -157,13 +157,31 @@ class AIManager {
 const aiManager = new AIManager(TARGET_SHARD);
 
 // --- Clients ---
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+let supabase = null;
+
+function initSupabase() {
+    if (!supabase) {
+        supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+            auth: { persistSession: false },
+            global: {
+                fetch: (...args) => {
+                    return fetch(...args).catch(err => {
+                        console.error(`[FetchError] ${err.name}: ${err.message}`);
+                        throw err;
+                    });
+                }
+            }
+        });
+    }
+    return supabase;
+}
 
 // Global state for stations (populated later)
 let TARGET_DEPTS = {};
 let totalStations = 0;
 
 async function loadStationData() {
+    initSupabase();
     console.log('📥 Loading station configuration from DB...');
     let data = null;
     let error = null;
