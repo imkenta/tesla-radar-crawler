@@ -748,29 +748,6 @@ async function processStation(page, deptId, station) {
         }
     }
     
-    // Connectivity Pre-warm (Simple HTTPS check)
-    try {
-        const https = require('https');
-        console.log('🌐 Pre-warming connection to Supabase...');
-        await new Promise((resolve, reject) => {
-            const req = https.get(SUPABASE_URL, { timeout: 10000 }, (res) => {
-                console.log(`✅ Pre-warm check: ${res.statusCode}`);
-                resolve();
-            });
-            req.on('error', (e) => {
-                console.warn(`⚠️  Pre-warm check failed (non-fatal): ${e.message}`);
-                resolve(); // Don't block, just log
-            });
-            req.on('timeout', () => {
-                req.destroy();
-                console.warn('⚠️  Pre-warm check timed out');
-                resolve();
-            });
-        });
-    } catch (e) {
-        // Ignore pre-warm errors
-    }
-
     try {
         await loadStationData();
     } catch (err) {
