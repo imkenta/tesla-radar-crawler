@@ -36,24 +36,28 @@ jobs:
           sudo apt-get update && sudo apt-get install -y cloudflare-warp
 
           # Register and Connect
-          # Note: New warp-cli requires accepting TOS explicitly in some versions, but usually registration implies it.
-          # We use a loop to ensure registration succeeds.
           sudo warp-cli --accept-tos registration new || true
           
           # Connect
           sudo warp-cli --accept-tos connect
           
-          # Wait for connection to stabilize
+          # Wait for connection to stabilize (Increased to 20s)
           echo "Waiting for WARP connection..."
-          sleep 10
+          sleep 20
           
           # Verify connection status
           sudo warp-cli --accept-tos status || true
 
-      - name: Check IP
+      - name: Check IP and Connectivity
         run: |
           echo "Checking IP..."
           curl -s --max-time 10 ifconfig.me || echo "Failed to get IP"
+          
+          echo "Checking Supabase DNS..."
+          nslookup $(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/') || echo "NSLOOKUP failed"
+          
+          echo "Testing Supabase Connectivity..."
+          curl -I -s --max-time 10 ${{ secrets.VITE_SUPABASE_URL }} || echo "Supabase direct connection failed"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -69,7 +73,7 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # PROXY_URL removed to force using system network (WARP)
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
 
   finalize-sync:
     needs: sync-plates

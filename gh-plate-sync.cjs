@@ -185,18 +185,21 @@ async function loadStationData() {
                 console.log(`    [Retry] Supabase error: ${error.message}. Retries left: ${retries - 1}`);
             }
         } catch (e) {
-            console.log(`    [Retry] Fetch exception: ${e.message}. Retries left: ${retries - 1}`);
+            console.log(`    [Retry] Fetch exception: ${e.name}: ${e.message}. Retries left: ${retries - 1}`);
         }
         
         retries--;
         if (retries > 0) {
-            const waitTime = (6 - retries) * 5000; // Exponential-ish backoff: 5s, 10s, 15s, 20s
+            const waitTime = (6 - retries) * 10000; // Increased to 10s, 20s, 30s, 40s
             console.log(`    [Retry] Waiting ${waitTime/1000}s before next attempt...`);
             await new Promise(r => setTimeout(r, waitTime));
         }
     }
 
-    if (error) throw new Error(`Failed to load station config: ${error.message}`);
+    if (error) {
+        console.error('Failed to load station config. SUPABASE_URL:', SUPABASE_URL ? 'PRESENT' : 'MISSING');
+        throw new Error(`Failed to load station config: ${error.message}`);
+    }
     if (!data) throw new Error('Station config not found in DB');
 
     const stationData = data.value;
@@ -716,6 +719,16 @@ async function processStation(page, deptId, station) {
     const totalStartTime = Date.now();
     console.log('⏳ Waiting 5s for network to stabilize...');
     await new Promise(r => setTimeout(r, 5000));
+
+    // Add jitter based on shard to avoid simultaneous hits to Supabase from parallel matrix jobs
+    if (TARGET_SHARD) {
+        const jitterMap = { 'NORTH': 0, 'CENTRAL': 3000, 'SOUTH': 6000 };
+        const shardJitter = jitterMap[TARGET_SHARD.toUpperCase()] || 0;
+        if (shardJitter > 0) {
+            console.log(`⏳ Adding ${shardJitter/1000}s jitter for shard ${TARGET_SHARD}...`);
+            await new Promise(r => setTimeout(r, shardJitter));
+        }
+    }
     
     try {
         await loadStationData();
