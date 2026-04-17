@@ -56,8 +56,10 @@ jobs:
           echo "Checking Supabase DNS..."
           nslookup $(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/') || echo "NSLOOKUP failed"
           
-          echo "Testing Supabase Connectivity..."
-          curl -I -s --max-time 10 ${{ secrets.VITE_SUPABASE_URL }} || echo "Supabase direct connection failed"
+          echo "Testing Supabase Connectivity with retry..."
+          for i in {1..5}; do
+            curl -I -s --max-time 10 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
+          done || echo "Supabase direct connection failed after retries"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
