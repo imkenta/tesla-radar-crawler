@@ -81,7 +81,7 @@ const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PROXY_URL = process.env.PROXY_URL;
-const MODEL_NAME = "gemma-3-27b-it";
+const MODEL_NAME = "gemma-4-31b-it";
 
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
@@ -89,21 +89,79 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
 }
 
 const MVDIS_URL = 'https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo';
-// STATION_DATA removed, loaded dynamically
 
 // Parse Arguments
 const args = process.argv.slice(2);
 const shardArg = args.find(arg => arg.startsWith('--shard='));
 const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 
-// Global state for stations (populated later)
-let TARGET_DEPTS = {};
-let totalStations = 0;
+// --- AI Manager (Failover Support) ---
+class AIManager {
+    constructor(shard) {
+        this.shard = shard;
+        this.modelName = process.env.AI_MODEL_NAME || "gemma-4-31b-it";
+        this.shardKeyName = shard ? `GEMINI_API_KEY_${shard.toUpperCase()}` : null;
+        this.primaryKey = this.shardKeyName ? process.env[this.shardKeyName] : null;
+        this.fallbackKey = process.env.GEMINI_API_KEY;
+        
+        this.currentKey = this.primaryKey || this.fallbackKey;
+        this.isUsingFallback = !this.primaryKey;
+        this.instance = null;
+        this.model = null;
+
+        this.init();
+    }
+
+    init() {
+        if (!this.currentKey) {
+            console.error("[AI] Fatal: No API key available.");
+            process.exit(1);
+        }
+        this.instance = new GoogleGenerativeAI(this.currentKey);
+        this.model = this.instance.getGenerativeModel({ 
+            model: this.modelName,
+            systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters."
+        });
+        const source = this.isUsingFallback ? "DEFAULT_KEY" : (this.shardKeyName || "DEFAULT_KEY");
+        console.log(`[AI] Initialized using: ${source}`);
+    }
+
+    async switchToFallback() {
+        if (this.isUsingFallback || !this.fallbackKey || this.fallbackKey === this.currentKey) return false;
+        
+        console.log(`\n⚠️  [AI] Quota hit on ${this.shardKeyName}. Switching to fallback GEMINI_API_KEY...`);
+        this.currentKey = this.fallbackKey;
+        this.isUsingFallback = true;
+        this.init();
+        return true;
+    }
+
+    async generateContent(payload) {
+        try {
+            return await this.model.generateContent(payload);
+        } catch (e) {
+            // Check if it's a quota error (429 or similar)
+            if (e.message.includes('429') || e.message.toLowerCase().includes('quota') || e.message.toLowerCase().includes('limit')) {
+                const switched = await this.switchToFallback();
+                if (switched) {
+                    console.log('🔄 [AI] Retrying with fallback key...');
+                    return await this.model.generateContent(payload);
+                }
+            }
+            throw e;
+        }
+    }
+}
+
+// Multi-Key Sharding Setup
+const aiManager = new AIManager(TARGET_SHARD);
 
 // --- Clients ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+
+// Global state for stations (populated later)
+let TARGET_DEPTS = {};
+let totalStations = 0;
 
 async function loadStationData() {
     console.log('📥 Loading station configuration from DB...');
@@ -119,7 +177,10 @@ async function loadStationData() {
     const stationData = data.value;
     
     stationData.forEach(dept => {
-        const stations = dept.stations.filter(s => !TARGET_SHARD || s.shard === TARGET_SHARD);
+        const stations = dept.stations.filter(s => {
+            if (!TARGET_SHARD) return true;
+            return s.shard && s.shard.toUpperCase() === TARGET_SHARD.toUpperCase();
+        });
         if (stations.length > 0) {
             TARGET_DEPTS[dept.id] = stations;
             totalStations += stations.length;
@@ -270,18 +331,29 @@ async function solveCaptcha(page) {
             omitBackground: true
         });
 
-        // Refined prompt for better character isolation
-        const prompt = "This image contains a 4-character CAPTCHA with Latin letters (A-Z) and numbers (0-9). IDENTIFY and OUTPUT ONLY the 4 characters. DO NOT include any spaces, punctuation, Chinese characters, or explanation.";
+        // Minimal prompt since systemInstruction handles the constraints
+        const prompt = "Characters in image:";
         
-        const result = await model.generateContent([
+        const result = await aiManager.generateContent([
             prompt,
             { inlineData: { data: imageBuffer, mimeType: "image/jpeg" } }
         ]);
         const response = await result.response;
-        const rawText = response.text();
-        const text = rawText.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const rawText = response.text().trim();
         
-        console.log(`    [AI] Predicted: ${text} (Raw: ${rawText.substring(0, 50).replace(/\n/g, ' ')})`);
+        // Case-insensitive extraction: preserve both upper/lower before converting
+        let text = rawText.replace(/[^a-zA-Z0-9]/g, '');
+        if (text.length !== 4) {
+            const matches = rawText.match(/[a-zA-Z0-9]{4}/g);
+            if (matches && matches.length > 0) {
+                text = matches[matches.length - 1];
+            } else {
+                text = text.slice(-4);
+            }
+        }
+        text = text.toUpperCase();
+        
+        console.log(`    [AI] Predicted: ${text} (Raw: ${rawText.replace(/\n/g, ' ')})`);
         
         if (text && text.length === 4) {
             stats.captchaSuccess++;
