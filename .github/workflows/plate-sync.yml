@@ -81,14 +81,18 @@ jobs:
           echo "=== MVDIS Connectivity Test ==="
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "Accept-Language: zh-TW,zh;q=0.9" \
             "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo" 2>/dev/null || echo "0")
           echo "MVDIS HTTP Status: $HTTP_STATUS"
 
           if [ "$HTTP_STATUS" = "0" ] || [ "$HTTP_STATUS" = "000" ]; then
-            echo "::error::Cannot reach MVDIS (status: $HTTP_STATUS). WARP may not be routing Taiwan traffic. Aborting."
+            echo "::error::Cannot reach MVDIS (TCP failed). WARP may not be routing. Aborting."
             exit 1
+          elif [ "$HTTP_STATUS" = "403" ] || [ "$HTTP_STATUS" = "429" ] || [ "$HTTP_STATUS" = "503" ]; then
+            echo "::warning::MVDIS returned $HTTP_STATUS — IP may be blocked. curl passes but Chrome may be rejected."
+          else
+            echo "MVDIS is reachable (HTTP $HTTP_STATUS)"
           fi
-          echo "MVDIS is reachable (HTTP $HTTP_STATUS)"
 
           echo ""
           echo "=== Supabase Connectivity ==="

@@ -554,19 +554,33 @@ const waitForImage = async (page, selector, timeout = 10000) => {
 };
 
 async function preflightCheck(page) {
-    console.log('🔍 Pre-flight: Testing MVDIS connectivity...');
+    // Stage 1: Verify Chrome's network service is working at all
+    console.log('🔍 Pre-flight [1/2]: Testing Chrome network (example.com)...');
+    try {
+        await page.goto('http://example.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        console.log('✅ Chrome network OK');
+    } catch (e) {
+        console.error(`❌ Chrome cannot navigate to example.com: ${e.message}`);
+        console.error('   → Chrome network service broken. Check: --disable-features=NetworkServiceSandbox');
+        return false;
+    }
+
+    // Stage 2: Verify MVDIS is reachable
+    console.log('🔍 Pre-flight [2/2]: Testing MVDIS connectivity...');
     for (let i = 0; i < 3; i++) {
         try {
             const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
             if (response) {
-                console.log(`✅ Pre-flight OK (HTTP ${response.status()})`);
+                console.log(`✅ MVDIS reachable (HTTP ${response.status()})`);
                 return true;
             }
         } catch (e) {
-            console.log(`❌ Pre-flight attempt ${i + 1}/3 failed: ${e.message}`);
-            if (i < 2) await sleep(10000);
+            console.log(`❌ MVDIS attempt ${i + 1}/3 failed: ${e.message}`);
+            if (i < 2) await sleep(8000);
         }
     }
+    console.error('   → Chrome reached example.com but NOT MVDIS.');
+    console.error('   → MVDIS is blocking the IP or browser fingerprint. Check WARP country.');
     return false;
 }
 
@@ -798,16 +812,14 @@ async function processStation(page, deptId, station) {
     const launchArgs = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=NetworkServiceSandbox',  // Chrome 120+: allow network service in container
         '--window-size=1920,1080',
         '--disable-blink-features=AutomationControlled',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
-        // NOTE: --single-process was removed in Chrome 117+; using it in Puppeteer 24+ (Chrome 127+)
-        // causes the network service to fail to start, producing navigation timeouts for all pages.
     ];
 
     if (PROXY_URL) {
