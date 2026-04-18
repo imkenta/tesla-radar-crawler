@@ -565,6 +565,24 @@ async function preflightCheck(page) {
         return false;
     }
 
+    // Show Chrome's actual outbound IP (what MVDIS sees)
+    try {
+        await page.goto('https://ipinfo.io/json', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        const ipData = await page.evaluate(() => {
+            try { return JSON.parse(document.body.innerText); } catch { return null; }
+        });
+        if (ipData) {
+            console.log(`🌐 Chrome outbound IP: ${ipData.ip} (${ipData.country || '?'} / ${ipData.org || '?'})`);
+            if (ipData.country !== 'TW') {
+                console.error(`❌ Chrome IP is ${ipData.country}, NOT TW — MVDIS will block browser connections.`);
+                console.error('   → Fix: set PROXY_URL secret to a Taiwan HTTP/SOCKS5 proxy.');
+                console.error('   → e.g. PROXY_URL=http://user:pass@tw-proxy-host:port');
+            }
+        }
+    } catch (e) {
+        console.log(`[IP Check] Could not determine Chrome IP: ${e.message}`);
+    }
+
     // Stage 2: Verify MVDIS is reachable
     console.log('🔍 Pre-flight [2/2]: Testing MVDIS connectivity...');
     for (let i = 0; i < 3; i++) {
@@ -580,7 +598,7 @@ async function preflightCheck(page) {
         }
     }
     console.error('   → Chrome reached example.com but NOT MVDIS.');
-    console.error('   → MVDIS is blocking the IP or browser fingerprint. Check WARP country.');
+    console.error('   → MVDIS requires Taiwan IP for browser connections. Set PROXY_URL secret.');
     return false;
 }
 
