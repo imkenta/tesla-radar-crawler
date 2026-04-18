@@ -796,15 +796,18 @@ async function processStation(page, deptId, station) {
     if (PROXY_URL) console.log(`🌐 Using Proxy: ${PROXY_URL.split('@').pop()}`);
 
     const launchArgs = [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox', 
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
         '--window-size=1920,1080',
         '--disable-blink-features=AutomationControlled',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        '--disable-dev-shm-usage', // Critical for Docker/VM with limited /dev/shm
-        '--disable-gpu',           // Save resources
-        '--no-zygote',             // Save resources
-        '--single-process'         // Experimental: might save memory, try if unstable
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        // NOTE: --single-process was removed in Chrome 117+; using it in Puppeteer 24+ (Chrome 127+)
+        // causes the network service to fail to start, producing navigation timeouts for all pages.
     ];
 
     if (PROXY_URL) {
