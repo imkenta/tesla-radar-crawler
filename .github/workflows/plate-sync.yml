@@ -35,36 +35,63 @@ jobs:
           # Install WARP
           sudo apt-get update && sudo apt-get install -y cloudflare-warp
 
-          # Register
-          sudo warp-cli --accept-tos registration new || true
-          
+          # Register (handle both old and new warp-cli syntax across versions)
+          sudo warp-cli registration new --accept-tos 2>/dev/null || \
+          sudo warp-cli --accept-tos registration new 2>/dev/null || true
+
           # Ultimate Stability: Resolve and Hardcode Supabase IP in /etc/hosts
           SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
           SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
           if [ ! -z "$SUB_IP" ]; then
             echo "Hardcoding Supabase IP: $SUB_IP for $SUB_DOMAIN in /etc/hosts"
             echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
-            
+
             echo "Excluding Supabase IP: $SUB_IP from WARP"
-            sudo warp-cli --accept-tos add-excluded-route $SUB_IP/32 || true
+            sudo warp-cli add-excluded-route $SUB_IP/32 2>/dev/null || \
+            sudo warp-cli --accept-tos add-excluded-route $SUB_IP/32 2>/dev/null || true
           fi
-          
+
           # Connect
-          sudo warp-cli --accept-tos connect
-          
+          sudo warp-cli connect 2>/dev/null || \
+          sudo warp-cli --accept-tos connect 2>/dev/null || true
+
           # Wait for connection to stabilize
           echo "Waiting for WARP connection..."
           sleep 30
-          
-          # Verify connection status
-          sudo warp-cli --accept-tos status || true
 
-      - name: Check IP and Connectivity
+          # Verify connection status
+          sudo warp-cli status 2>/dev/null || \
+          sudo warp-cli --accept-tos status 2>/dev/null || true
+
+      - name: Verify IP and MVDIS Connectivity
         run: |
-          echo "Checking IP..."
-          curl -s --max-time 10 ifconfig.me || echo "Failed to get IP"
-          
-          echo "Testing Supabase Connectivity..."
+          echo "=== IP / WARP Check ==="
+          CURRENT_IP=$(curl -s --max-time 15 ifconfig.me || echo "FAILED")
+          echo "Current IP: $CURRENT_IP"
+
+          COUNTRY=$(curl -s --max-time 10 "https://ipinfo.io/${CURRENT_IP}/country" 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
+          echo "IP Country: $COUNTRY"
+          if [ "$COUNTRY" = "TW" ]; then
+            echo "WARP verified: IP is from Taiwan"
+          else
+            echo "WARNING: IP country is $COUNTRY (expected TW). MVDIS may block requests."
+          fi
+
+          echo ""
+          echo "=== MVDIS Connectivity Test ==="
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo" 2>/dev/null || echo "0")
+          echo "MVDIS HTTP Status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" = "0" ] || [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error::Cannot reach MVDIS (status: $HTTP_STATUS). WARP may not be routing Taiwan traffic. Aborting."
+            exit 1
+          fi
+          echo "MVDIS is reachable (HTTP $HTTP_STATUS)"
+
+          echo ""
+          echo "=== Supabase Connectivity ==="
           for i in {1..5}; do
             curl -I -s --max-time 15 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
           done || echo "Supabase direct connection failed"

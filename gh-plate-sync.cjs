@@ -553,6 +553,23 @@ const waitForImage = async (page, selector, timeout = 10000) => {
     }
 };
 
+async function preflightCheck(page) {
+    console.log('🔍 Pre-flight: Testing MVDIS connectivity...');
+    for (let i = 0; i < 3; i++) {
+        try {
+            const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            if (response) {
+                console.log(`✅ Pre-flight OK (HTTP ${response.status()})`);
+                return true;
+            }
+        } catch (e) {
+            console.log(`❌ Pre-flight attempt ${i + 1}/3 failed: ${e.message}`);
+            if (i < 2) await sleep(10000);
+        }
+    }
+    return false;
+}
+
 async function processStation(page, deptId, station) {
     const startTime = Date.now();
     console.log(`\n--- Processing Station: ${station.name} (ID: ${station.id}, Dept: ${deptId}) ---\n`);
@@ -821,7 +838,18 @@ async function processStation(page, deptId, station) {
 
         const syncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
         await reportStatus('RUNNING', null, syncKey);
-        
+
+        // Pre-flight: verify MVDIS is reachable before processing any station
+        const preflight = await preflightCheck(page);
+        if (!preflight) {
+            const errMsg = 'Pre-flight failed: MVDIS unreachable after 3 attempts. WARP may not be routing Taiwan traffic.';
+            console.error(`❌ ${errMsg}`);
+            stats.status = 'FAILED';
+            stats.addError('PREFLIGHT', errMsg);
+            await reportStatus('FAILED', errMsg, syncKey);
+            throw new Error(errMsg);
+        }
+
         // ONLY clear if explicitly NOT in shard mode
         if (TARGET_SHARD === null) {
             await clearStaging();
