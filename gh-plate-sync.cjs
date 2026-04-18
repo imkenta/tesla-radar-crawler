@@ -568,8 +568,10 @@ async function processStation(page, deptId, station) {
     if (!station.no_rental) plateTypes.push('h');
 
     let isFirstQueryInStation = true;
+    let stationAborted = false;
 
     for (const pType of plateTypes) {
+        if (stationAborted) break;
         const typeName = pType === 'g' ? 'Private (g)' : 'Rental (h)';
         console.log(`  > Querying: ${typeName}`);
 
@@ -585,7 +587,23 @@ async function processStation(page, deptId, station) {
             // 1. 導覽與填表
             if (isFirstQueryInStation || attempts > 1) {
                 console.log(`    [Attempt ${attempts}] Full Nav...`);
-                await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                let navOk = false;
+                for (let navTry = 0; navTry < 3; navTry++) {
+                    try {
+                        await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                        navOk = true;
+                        break;
+                    } catch (navErr) {
+                        console.log(`    [Nav] Attempt ${navTry + 1}/3 failed: ${navErr.message}`);
+                        if (navTry < 2) await sleep(8000);
+                    }
+                }
+                if (!navOk) {
+                    console.log('    [Nav] All navigation attempts failed, skipping station.');
+                    status = 'FAILED';
+                    stationAborted = true;
+                    break;
+                }
                 await page.evaluate(() => {
                     if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
                     const btn = Array.from(document.querySelectorAll('a, button, input')).find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
