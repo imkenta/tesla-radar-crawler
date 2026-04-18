@@ -585,7 +585,7 @@ async function processStation(page, deptId, station) {
             // 1. 導覽與填表
             if (isFirstQueryInStation || attempts > 1) {
                 console.log(`    [Attempt ${attempts}] Full Nav...`);
-                await page.goto(MVDIS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+                await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 await page.evaluate(() => {
                     if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
                     const btn = Array.from(document.querySelectorAll('a, button, input')).find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
