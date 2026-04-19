@@ -27,7 +27,19 @@ puppeteer.use(StealthPlugin());
 // --- Logging Setup ---
 const logDir = 'logs';
 if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
-const logFile = fs.createWriteStream(path.join(logDir, `crawler_${Date.now()}.log`), { flags: 'a' });
+
+// One log file per day per shard; auto-delete files older than 7 days
+const shardSuffix = (process.argv.find(a => a.startsWith('--shard=')) || '').replace('--shard=', '') || 'ALL';
+const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+const logFile = fs.createWriteStream(path.join(logDir, `crawler_${shardSuffix}_${todayStr}.log`), { flags: 'a' });
+try {
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    fs.readdirSync(logDir).forEach(f => {
+        if (!f.startsWith('crawler_')) return;
+        const fp = path.join(logDir, f);
+        if (fs.statSync(fp).mtimeMs < cutoff) fs.unlinkSync(fp);
+    });
+} catch {}
 const logStdout = process.stdout;
 
 console.log = function() {
@@ -574,9 +586,9 @@ async function preflightCheck(page) {
         if (ipData) {
             console.log(`🌐 Chrome outbound IP: ${ipData.ip} (${ipData.country || '?'} / ${ipData.org || '?'})`);
             if (ipData.country !== 'TW') {
-                console.error(`❌ Chrome IP is ${ipData.country}, NOT TW — MVDIS will block browser connections.`);
-                console.error('   → Fix: set PROXY_URL secret to a Taiwan HTTP/SOCKS5 proxy.');
-                console.error('   → e.g. PROXY_URL=http://user:pass@tw-proxy-host:port');
+                console.warn(`⚠️  Chrome IP is ${ipData.country}, NOT TW — MVDIS may block browser connections.`);
+                console.warn('   → Fix: set PROXY_URL secret to a Taiwan HTTP/SOCKS5 proxy.');
+                console.warn('   → e.g. PROXY_URL=http://user:pass@tw-proxy-host:port');
             }
         }
     } catch (e) {
