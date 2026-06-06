@@ -114,6 +114,9 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
+          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
+          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
   finalize-sync:
