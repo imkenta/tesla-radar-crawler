@@ -134,118 +134,152 @@ async function run() {
   const scrapedRecords = [];
 
   try {
-    // We scrape both "未決標" (0) and "已決標" (1)
+    // We scrape both "未決標" (0) and "已決標" (1), and both "電動自小客" (g) and "電動租賃車" (h)
     for (const announceType of ['0', '1']) {
-      const typeLabel = announceType === '0' ? '未決標 (Active/Upcoming)' : '已決標 (Closed)';
-      console.log(`🌐 Scraping announcements: ${typeLabel}...`);
+      for (const carType of ['g', 'h']) {
+        const typeLabel = announceType === '0' ? '未決標 (Active/Upcoming)' : '已決標 (Closed)';
+        const carLabel = carType === 'g' ? '電動自小客' : '電動租賃車';
+        console.log(`🌐 Scraping announcements: ${typeLabel} - ${carLabel}...`);
 
-      let navSuccess = false;
-      for (let tryCount = 1; tryCount <= 3; tryCount++) {
-        try {
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-          navSuccess = true;
-          break;
-        } catch (e) {
-          console.warn(`[Nav] Attempt ${tryCount} failed: ${e.message}`);
-          if (tryCount < 3) await new Promise(r => setTimeout(r, 5000));
+        let navSuccess = false;
+        for (let tryCount = 1; tryCount <= 3; tryCount++) {
+          try {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            navSuccess = true;
+            break;
+          } catch (e) {
+            console.warn(`[Nav] Attempt ${tryCount} failed: ${e.message}`);
+            if (tryCount < 3) await new Promise(r => setTimeout(r, 5000));
+          }
         }
-      }
 
-      if (!navSuccess) {
-        console.error(`[Fatal] Could not load announce page after 3 attempts.`);
-        continue;
-      }
+        if (!navSuccess) {
+          console.error(`[Fatal] Could not load announce page after 3 attempts.`);
+          continue;
+        }
 
-      // Close modal popup if present
-      await page.evaluate(() => {
-        const btn = Array.from(document.querySelectorAll('a, button, input')).find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
-        if (btn) btn.click();
-      });
-      await new Promise(r => setTimeout(r, 1000));
+        // Close modal popup if present
+        await page.evaluate(() => {
+          const btn = Array.from(document.querySelectorAll('a, button, input')).find(el => el.innerText?.includes('關閉') || el.value?.includes('關閉'));
+          if (btn) btn.click();
+        });
+        await new Promise(r => setTimeout(r, 1000));
 
-      // Select announceSelected type
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {}),
-        page.select('#announceSelected', announceType)
-      ]);
+        // Select announceSelected type
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {}),
+          page.select('#announceSelected', announceType)
+        ]);
 
-      // Click Query Button
-      console.log('  Submitting form query...');
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(err => console.log('  Navigation wait warning:', err.message)),
-        page.evaluate(() => {
-          const qBtn = Array.from(document.querySelectorAll('a, button, input')).find(b => {
-            const t = (b.innerText || b.value || '').trim();
-            return t === '查詢' || (b.getAttribute('onclick') && b.getAttribute('onclick').includes('query'));
+        // Select plateType (car type)
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {}),
+          page.select('#plateType', carType)
+        ]);
+
+        // Click Query Button
+        console.log('  Submitting form query...');
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(err => console.log('  Navigation wait warning:', err.message)),
+          page.evaluate(() => {
+            const qBtn = Array.from(document.querySelectorAll('a, button, input')).find(b => {
+              const t = (b.innerText || b.value || '').trim();
+              return t === '查詢' || (b.getAttribute('onclick') && b.getAttribute('onclick').includes('query'));
+            });
+            if (qBtn) qBtn.click();
+          })
+        ]);
+
+        // Wait for table to render
+        await new Promise(r => setTimeout(r, 4000));
+
+        // Get total pages from the pagination DOM element
+        const totalVal = await page.evaluate(() => {
+          const el = document.querySelector('#total');
+          return el ? parseInt(el.value) : 1;
+        });
+        const totalPages = totalVal || 1;
+        console.log(`  Total pages to scrape: ${totalPages}`);
+
+        for (let currentPage = 1; currentPage <= totalPages; currentPage++) {
+          console.log(`  Scraping page ${currentPage} of ${totalPages}...`);
+
+          // Parse the announcements table
+          const rowsData = await page.evaluate(() => {
+            const table = Array.from(document.querySelectorAll('table')).find(t => {
+              const text = t.innerText;
+              return text.includes('監理單位') && text.includes('號牌起號') && text.includes('起標時間');
+            });
+
+            if (!table) return [];
+
+            const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
+            return rows.map(r => {
+              const cols = Array.from(r.querySelectorAll('td')).map(td => td.innerText.trim().replace(/\s+/g, ' '));
+              return cols;
+            }).filter(cols => cols.length >= 7);
           });
-          if (qBtn) qBtn.click();
-        })
-      ]);
 
-      // Wait for table to render
-      await new Promise(r => setTimeout(r, 4000));
+          console.log(`    Found ${rowsData.length} announcement rows on page ${currentPage}.`);
 
-      // Parse the announcements table
-      const rowsData = await page.evaluate(() => {
-        const table = Array.from(document.querySelectorAll('table')).find(t => {
-          const text = t.innerText;
-          return text.includes('監理單位') && text.includes('號牌起號') && text.includes('起標時間');
-        });
+          // Convert rows into database records
+          for (const row of rowsData) {
+            const deptName = row[0];
+            const plateType = row[1];
+            const startPlate = row[2];
+            const endPlate = row[3];
+            const startTimeStr = row[4];
+            const endTimeStr = row[5];
+            const deadlineStr = row[6];
 
-        if (!table) return [];
+            // Only keep electric passenger cars (電動自小客) and electric rental/lease cars (電動租賃車)
+            const cleanPlateType = (plateType || '').trim();
+            if (cleanPlateType !== '電動自小客' && cleanPlateType !== '電動租賃車') {
+              continue;
+            }
 
-        const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
-        return rows.map(r => {
-          const cols = Array.from(r.querySelectorAll('td')).map(td => td.innerText.trim().replace(/\s+/g, ' '));
-          return cols;
-        }).filter(cols => cols.length >= 7);
-      });
+            const codes = findStationCodes(deptName, stationData);
+            if (!codes) {
+              console.warn(`⚠️  Cannot resolve station codes for name: "${deptName}"`);
+              continue;
+            }
 
-      console.log(`  Found ${rowsData.length} announcement rows.`);
+            const startTimestamp = parseMinguoDate(startTimeStr);
+            const endTimestamp = parseMinguoDate(endTimeStr);
+            const deadlineTimestamp = parseMinguoDate(deadlineStr);
 
-      // Convert rows into database records
-      for (const row of rowsData) {
-        const deptName = row[0];
-        const plateType = row[1];
-        const startPlate = row[2];
-        const endPlate = row[3];
-        const startTimeStr = row[4];
-        const endTimeStr = row[5];
-        const deadlineStr = row[6];
+            if (!startTimestamp || !endTimestamp || !deadlineTimestamp) {
+              console.warn(`⚠️  Cannot parse dates for row: ${JSON.stringify(row)}`);
+              continue;
+            }
 
-        // Only keep electric passenger cars (電動自小客) and electric rental/lease cars (電動租賃車)
-        const cleanPlateType = (plateType || '').trim();
-        if (cleanPlateType !== '電動自小客' && cleanPlateType !== '電動租賃車') {
-          continue;
+            scrapedRecords.push({
+              dept_name: deptName,
+              section_code: codes.sectionCode,
+              station_code: codes.stationCode,
+              plate_type: plateType,
+              start_plate: startPlate,
+              end_plate: endPlate,
+              start_time: startTimestamp,
+              end_time: endTimestamp,
+              payment_deadline: deadlineTimestamp,
+              updated_at: new Date().toISOString()
+            });
+          }
+
+          // Go to next page if there is one
+          if (currentPage < totalPages) {
+            console.log(`    Navigating to page ${currentPage + 1}...`);
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(err => console.log('    Navigation warning:', err.message)),
+              page.evaluate(() => {
+                const nextBtn = document.querySelector('#next');
+                if (nextBtn) nextBtn.click();
+              })
+            ]);
+            await new Promise(r => setTimeout(r, 4000));
+          }
         }
-
-        const codes = findStationCodes(deptName, stationData);
-        if (!codes) {
-          console.warn(`⚠️  Cannot resolve station codes for name: "${deptName}"`);
-          continue;
-        }
-
-        const startTimestamp = parseMinguoDate(startTimeStr);
-        const endTimestamp = parseMinguoDate(endTimeStr);
-        const deadlineTimestamp = parseMinguoDate(deadlineStr);
-
-        if (!startTimestamp || !endTimestamp || !deadlineTimestamp) {
-          console.warn(`⚠️  Cannot parse dates for row: ${JSON.stringify(row)}`);
-          continue;
-        }
-
-        scrapedRecords.push({
-          dept_name: deptName,
-          section_code: codes.sectionCode,
-          station_code: codes.stationCode,
-          plate_type: plateType,
-          start_plate: startPlate,
-          end_plate: endPlate,
-          start_time: startTimestamp,
-          end_time: endTimestamp,
-          payment_deadline: deadlineTimestamp,
-          updated_at: new Date().toISOString()
-        });
       }
     }
 
