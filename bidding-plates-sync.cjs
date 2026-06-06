@@ -268,49 +268,77 @@ async function run() {
           page.select('#stationCode', station.stationCode)
         ]);
 
-        // Parse plates
-        const parsed = await page.evaluate(() => {
-          const table = Array.from(document.querySelectorAll('table')).find(t => {
-            const text = t.innerText;
-            return text.includes('號牌') && text.includes('號牌類別') && text.includes('底價') && text.includes('目前出價');
+        // Parse plates with pagination support
+        let hasNext = true;
+        let pageCount = 0;
+
+        while (hasNext) {
+          pageCount++;
+          const parsed = await page.evaluate(() => {
+            const table = Array.from(document.querySelectorAll('table')).find(t => {
+              const text = t.innerText;
+              return text.includes('號牌') && text.includes('號牌類別') && text.includes('底價') && text.includes('目前出價');
+            });
+
+            if (!table) return [];
+
+            const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
+            return rows.map(r => {
+              const cols = Array.from(r.querySelectorAll('td')).map(td => td.innerText.trim());
+              return {
+                plateNo: cols[0],
+                plateType: cols[1],
+                basePrice: cols[2],
+                currentBid: cols[3],
+                bidCount: cols[4],
+                endTimeStr: cols[5]
+              };
+            }).filter(x => x.plateNo && /^[A-Z0-9]{2,4}-[A-Z0-9]{2,4}$/i.test(x.plateNo.trim()));
           });
 
-          if (!table) return [];
+          console.log(`  Page ${pageCount}: Parsed ${parsed.length} plates.`);
 
-          const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
-          return rows.map(r => {
-            const cols = Array.from(r.querySelectorAll('td')).map(td => td.innerText.trim());
+          for (const item of parsed) {
+            const basePriceNum = parseInt((item.basePrice || '').replace(/,/g, '')) || 0;
+            const currentBidNum = parseInt((item.currentBid || '').replace(/,/g, '')) || 0;
+            const bidCountNum = parseInt(item.bidCount || '0') || 0;
+            const endTimestamp = parseMinguoDate(item.endTimeStr);
+
+            if (!endTimestamp) continue;
+
+            allScrapedPlates.push({
+              station_id: station.stationCode,
+              plate_no: item.plateNo,
+              plate_type: item.plateType,
+              base_price: basePriceNum,
+              current_bid: currentBidNum,
+              bid_count: bidCountNum,
+              end_time: endTimestamp,
+              updated_at: new Date().toISOString()
+            });
+          }
+
+          // Check if there is a next page
+          const pageInfo = await page.evaluate(() => {
+            const pageInput = document.querySelector('input[name="txtPage"]');
+            const totalInput = document.querySelector('input[name="total"]');
             return {
-              plateNo: cols[0],
-              plateType: cols[1],
-              basePrice: cols[2],
-              currentBid: cols[3],
-              bidCount: cols[4],
-              endTimeStr: cols[5]
+              current: pageInput ? parseInt(pageInput.value) : 1,
+              total: totalInput ? parseInt(totalInput.value) : 1,
+              hasNextButton: !!document.querySelector('#next')
             };
-          }).filter(x => x.plateNo && /^[A-Z0-9]{2,4}-[A-Z0-9]{2,4}$/i.test(x.plateNo.trim()));
-        });
-
-        console.log(`  Parsed ${parsed.length} plates.`);
-
-        for (const item of parsed) {
-          const basePriceNum = parseInt((item.basePrice || '').replace(/,/g, '')) || 0;
-          const currentBidNum = parseInt((item.currentBid || '').replace(/,/g, '')) || 0;
-          const bidCountNum = parseInt(item.bidCount || '0') || 0;
-          const endTimestamp = parseMinguoDate(item.endTimeStr);
-
-          if (!endTimestamp) continue;
-
-          allScrapedPlates.push({
-            station_id: station.stationCode,
-            plate_no: item.plateNo,
-            plate_type: item.plateType,
-            base_price: basePriceNum,
-            current_bid: currentBidNum,
-            bid_count: bidCountNum,
-            end_time: endTimestamp,
-            updated_at: new Date().toISOString()
           });
+
+          if (pageInfo.current < pageInfo.total && pageInfo.hasNextButton) {
+            console.log(`  Navigating from Page ${pageInfo.current} to ${pageInfo.current + 1}...`);
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+              page.click('#next')
+            ]);
+            await new Promise(r => setTimeout(r, 3000));
+          } else {
+            hasNext = false;
+          }
         }
 
       } catch (stErr) {
