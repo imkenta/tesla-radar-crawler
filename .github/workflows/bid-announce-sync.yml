@@ -1,0 +1,84 @@
+name: Bidding Announcements Daily Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Run once a day at 00:00 UTC (08:00 AM Taiwan Time)
+  workflow_dispatch: {}
+
+concurrency:
+  group: bidding-announcements-sync-workflow
+  cancel-in-progress: false
+
+jobs:
+  sync-announcements:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install and Configure Cloudflare WARP
+        run: |
+          # Import GPG key and add repository
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          # Install WARP
+          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+
+          # Register
+          sudo warp-cli registration new --accept-tos 2>/dev/null || \
+          sudo warp-cli --accept-tos registration new 2>/dev/null || true
+
+          # Hardcode and Exclude Supabase IP from WARP
+          SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
+          SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
+          if [ ! -z "$SUB_IP" ]; then
+            echo "Hardcoding Supabase IP: $SUB_IP for $SUB_DOMAIN in /etc/hosts"
+            echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
+
+            echo "Excluding Supabase IP: $SUB_IP from WARP"
+            sudo warp-cli add-excluded-route $SUB_IP/32 2>/dev/null || \
+            sudo warp-cli --accept-tos add-excluded-route $SUB_IP/32 2>/dev/null || true
+          fi
+
+          # Connect
+          sudo warp-cli connect 2>/dev/null || \
+          sudo warp-cli --accept-tos connect 2>/dev/null || true
+
+          # Wait for connection to stabilize
+          echo "Waiting for WARP connection..."
+          sleep 15
+
+          # Verify connection status
+          sudo warp-cli status 2>/dev/null || \
+          sudo warp-cli --accept-tos status 2>/dev/null || true
+
+      - name: Verify IP and MVDIS Connectivity
+        run: |
+          echo "=== IP / WARP Check ==="
+          CURRENT_IP=$(curl -s --max-time 15 ifconfig.me || echo "FAILED")
+          echo "Current IP: $CURRENT_IP"
+
+          COUNTRY=$(curl -s --max-time 10 "https://ipinfo.io/${CURRENT_IP}/country" 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
+          echo "IP Country: $COUNTRY"
+          if [ "$COUNTRY" = "TW" ]; then
+            echo "WARP verified: IP is from Taiwan"
+          else
+            echo "WARNING: IP country is $COUNTRY (expected TW). MVDIS may block requests."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Announcements Sync
+        run: node bid-announce-sync.cjs
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
