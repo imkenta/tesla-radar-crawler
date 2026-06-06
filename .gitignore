@@ -5,3 +5,10 @@ logs/
 temp/
 debug_snapshots/
 eng.traineddata
+
+# Crawler dev scratch / one-off page dumps (not used by production crawlers)
+scratch_*
+dump_bidding_html.cjs
+investigate_bidding_query.cjs
+bidding_form.html
+bidding_page_text.txt
