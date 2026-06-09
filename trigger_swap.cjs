@@ -46,7 +46,42 @@ async function safeQuery(operation, maxRetries = 5) {
     return { error: { message: 'Max retries reached' } };
 }
 
-async function sendEmail(to, subject, html) {
+// --- Hard bounce helpers ---
+
+async function isEmailBounced(supabase, email) {
+    try {
+        const { data } = await supabase
+            .from('email_bounce_list')
+            .select('id')
+            .eq('email', email)
+            .maybeSingle();
+        return !!data;
+    } catch (e) {
+        console.warn(`[Bounce Check] Failed to check bounce list for ${email}:`, e.message);
+        return false; // 查不到就不擋，讓寄信繼續
+    }
+}
+
+async function markEmailBounced(supabase, email, reason) {
+    try {
+        await supabase
+            .from('email_bounce_list')
+            .upsert({ email, reason, bounced_at: new Date().toISOString(), bounce_count: 1 }, { onConflict: 'email' });
+        console.log(`[Email Bounce] ${email} 已標記為 hard bounce，日後不再寄信。原因：${reason}`);
+    } catch (e) {
+        console.error(`[Bounce Mark] 無法標記 ${email}:`, e.message);
+    }
+}
+
+// ---
+
+async function sendEmail(supabase, to, subject, html) {
+    // Hard bounce 守衛：已在退信名單則直接跳過
+    if (await isEmailBounced(supabase, to)) {
+        console.log(`[Email Skip] ${to} 在 hard bounce 名單中，跳過寄信。`);
+        return false;
+    }
+
     const smtpUser = process.env.SMTP_USER;
     const smtpPass = process.env.SMTP_PASS;
 
@@ -78,6 +113,14 @@ async function sendEmail(to, subject, html) {
         return true;
     } catch (err) {
         console.error(`[SMTP Email Error] Failed to send email to ${to}:`, err.message);
+        // 550 = mailbox not found（hard bounce），寫入退信名單
+        const isHardBounce =
+            err.responseCode === 550 ||
+            (err.response && err.response.startsWith('550')) ||
+            (err.message && err.message.includes('5.1.1'));
+        if (isHardBounce) {
+            await markEmailBounced(supabase, to, err.message);
+        }
         return false;
     }
 }
@@ -145,6 +188,7 @@ async function processSoldNotifications() {
                 `;
 
                 const emailSuccess = await sendEmail(
+                    supabase,
                     watch.email,
                     `[Tesla Studio] 收藏車牌 ${item.plate_no} 已被選走（售出）！`,
                     mailHtml
