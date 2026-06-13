@@ -9,6 +9,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const dotenv = require('dotenv');
+const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 
 puppeteer.use(StealthPlugin());
 
@@ -563,6 +564,9 @@ async function run() {
       
       // Process notifications for changed prices
       await processWatchlistAlerts(allScrapedPlates);
+
+      // 號碼訂閱：標牌表已更新，比對使用者登記的想要號碼並通知（每張牌一次）
+      await processPlateSubscriptions({ supabase, sendEmail });
 
     } else {
       console.log('ℹ️ No bidding plates found.');

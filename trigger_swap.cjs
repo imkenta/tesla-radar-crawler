@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 require('dotenv').config();
 
 const url = process.env.VITE_SUPABASE_URL;
@@ -249,6 +250,12 @@ async function run() {
 
         // Process sold notifications for watchlist
         await processSoldNotifications();
+
+        // 號碼訂閱：現貨表已是最新全集，比對使用者登記的想要號碼並通知（每張牌一次）
+        await processPlateSubscriptions({
+            supabase,
+            sendEmail: (to, subject, html) => sendEmail(supabase, to, subject, html),
+        });
     }
 }
 
