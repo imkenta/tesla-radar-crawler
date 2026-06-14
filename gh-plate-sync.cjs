@@ -101,6 +101,10 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
 }
 
 const MVDIS_URL = 'https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo';
+// 監理服務網首頁：施工/維護期間會顯示「今日施工中」公告頁。
+// 重點：首頁「不」封鎖非台灣 IP（只有選號功能頁 m3-emv-plate 才擋 IP），
+// 因此即使 WARP 出口跑到美國、選號頁全 timeout，仍可靠首頁判斷是否為官方施工。
+const MVDIS_HOME_URL = 'https://www.mvdis.gov.tw/';
 
 // Parse Arguments
 const args = process.argv.slice(2);
@@ -524,6 +528,50 @@ async function reportStatus(status, message = null, key = 'plates_full_sync') {
     if (error) console.error('    [DB] Report Status Error:', error.message);
 }
 
+// 將監理站施工/維護狀態寫入單一 row（key='mvdis_service_status'），供前端車牌選號助手讀取顯示橫幅。
+// 三個 shard 並行皆會寫此 row：施工時內容相同（無衝突）；無施工時各 shard 都寫 NORMAL，
+// 施工結束後最多一輪（30 分鐘）即收斂為 NORMAL，前端橫幅自動消失。
+async function reportServiceStatus(isMaintenance, message = null) {
+    const { error } = await supabase
+        .from('sync_metadata')
+        .upsert({
+            key: 'mvdis_service_status',
+            status: isMaintenance ? 'MAINTENANCE' : 'NORMAL',
+            status_message: isMaintenance ? message : null,
+            last_run_at: new Date().toISOString()
+        }, { onConflict: 'key' });
+    if (error) console.error('    [DB] Service Status Error:', error.message);
+}
+
+// 偵測監理服務網首頁是否為「今日施工中」官方施工頁。
+// 自包 try/catch：任何失敗都回傳 isMaintenance=false（degrade 回原 preflight 流程），
+// 絕不因偵測失敗而讓爬蟲整體崩潰。
+async function checkMaintenanceNotice(page) {
+    try {
+        await page.goto(MVDIS_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        const result = await page.evaluate(() => {
+            const bodyText = (document.body && document.body.innerText) || '';
+            // 「今日施工中」為監理站施工頁的官方即時標題（mobile 為 h1、桌面為 h2，故以文字判斷不依賴標籤）
+            const isMaintenance = bodyText.includes('今日施工中');
+            if (!isMaintenance) return { isMaintenance: false, message: null };
+
+            // 抽出公告全文：優先取含日期/時段關鍵字的那一段，退而取「施工」鄰近文字
+            const lines = bodyText.split('\n').map(s => s.trim()).filter(Boolean);
+            const noticeLine = lines.find(l =>
+                /\d+年\d+月\d+日/.test(l) || l.includes('時止') || l.includes('維護作業')
+            );
+            return {
+                isMaintenance: true,
+                message: noticeLine || '監理服務網系統施工維護中，選號服務暫停。'
+            };
+        });
+        return result;
+    } catch (e) {
+        console.log(`[Maintenance Check] 無法判斷施工狀態（${e.message}），改走正常 preflight。`);
+        return { isMaintenance: false, message: null };
+    }
+}
+
 async function performSwap() {
     console.log('🔄 Performing Atomic Swap...');
     const { error } = await supabase.rpc('swap_plates_data');
@@ -883,6 +931,19 @@ async function processStation(page, deptId, station) {
 
         const syncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
         await reportStatus('RUNNING', null, syncKey);
+
+        // 施工偵測（先於選號 preflight）：首頁不擋非台灣 IP，可在 WARP 異常時仍區分
+        // 「官方施工」與「純 IP/WARP 連線問題」。偵測到施工→寫狀態給前端橫幅、正常結束（不噴 FAILED）。
+        const maintenance = await checkMaintenanceNotice(page);
+        if (maintenance.isMaintenance) {
+            console.log(`🚧 偵測到監理站施工公告，跳過本次選號：${maintenance.message}`);
+            await reportServiceStatus(true, maintenance.message);
+            stats.status = 'MAINTENANCE';
+            await reportStatus('MAINTENANCE', `監理站施工中：${maintenance.message}`, syncKey);
+            return; // 跳過選號，交由 finally 正常關閉瀏覽器並結束（非錯誤路徑）
+        }
+        // 無施工：清除施工狀態，讓前端橫幅消失
+        await reportServiceStatus(false, null);
 
         // Pre-flight: verify MVDIS is reachable before processing any station
         const preflight = await preflightCheck(page);
