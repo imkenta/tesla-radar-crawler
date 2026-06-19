@@ -1,8 +1,8 @@
 name: Bidding Announcements Sync
 
 on:
-  schedule:
-    - cron: '0 */12 * * *' # Run every 12 hours (00:00 and 12:00 UTC)
+  # 2026-06-19: 移除 GitHub 內建 schedule，改由外部 cronjob（cron-job.org）經 workflow_dispatch 觸發。
+  # 與 plate-sync / bidding-plates 一致：避免 schedule + cronjob 雙源觸發同一 concurrency group。
   workflow_dispatch: {}
 
 concurrency:
@@ -12,6 +12,8 @@ concurrency:
 jobs:
   sync-announcements:
     runs-on: ubuntu-latest
+    # 防止單次 run 卡死霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。正常只跑 1~4 分。
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Code
