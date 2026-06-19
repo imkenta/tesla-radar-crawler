@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!--
+  Golden fixture：MVDIS 選號結果頁（第 1 頁，共 2 頁）。
+  這是 lib/plate-parser.cjs 的回歸基準。若 MVDIS 改版導致此結構失效，
+  應更新本檔為新的真實 HTML，並同步調整 parser + 測試斷言（而非反過來）。
+  涵蓋邊界：逗號價格、缺 .number 的畸形 cell、缺 .price 的 cell、下一頁按鈕。
+-->
+<html lang="zh-TW">
+<head><meta charset="utf-8"><title>監理服務網 - 自用小客車新領牌照</title></head>
+<body>
+  <h1>臺北市區監理所 -- 自用小客車</h1>
+  <div class="search_summary">
+    查詢結果：共 6 筆　頁次：1 / 2 頁
+  </div>
+
+  <div class="plate_list">
+    <div class="number_cell">
+      <span class="number">EBP-1571</span>
+      <span class="price">2,000元</span>
+    </div>
+    <div class="number_cell">
+      <span class="number">EBP-1575</span>
+      <span class="price">2,000元</span>
+    </div>
+    <div class="number_cell">
+      <span class="number">EBP-2888</span>
+      <span class="price">10,000元</span>
+    </div>
+    <div class="number_cell">
+      <span class="number">EBP-6666</span>
+      <span class="price">36,000元</span>
+    </div>
+    <!-- 畸形：有 .number_cell 但沒有 .number → 應被 filter 掉，不可使整批崩潰 -->
+    <div class="number_cell">
+      <span class="price">2,000元</span>
+    </div>
+    <!-- 邊界：有號碼但沒有 .price → price 應為空字串，不可丟例外 -->
+    <div class="number_cell">
+      <span class="number">EBP-0001</span>
+    </div>
+  </div>
+
+  <input type="button" name="status_next_page" value="下一頁">
+</body>
+</html>

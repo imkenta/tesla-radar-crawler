@@ -13,6 +13,8 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fs = require('fs');
 const path = require('path');
 const util = require('util');
+// 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
+const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -467,45 +469,8 @@ async function doSubmit(page) {
 }
 
 async function parsePageInfo(page) {
-    return page.evaluate(() => {
-        const text = document.body?.innerText || "";
-        
-        // 1. Check for 'No Data' messages first
-        if (text.includes('查無資料') || text.includes('尚無可供選號') || text.includes('對不起')) {
-            return { current: 1, total: 1, count: 0, noData: true };
-        }
-
-        // 2. Match total count (more robust)
-        const countMatch = text.match(/共\s*(\d+)\s*筆/) || text.match(/總數[:：]\s*(\d+)\s*面/);
-        const count = countMatch ? parseInt(countMatch[1]) : 0;
-
-        // 3. Match pagination (specific to MVDIS "頁次：1 / 2")
-        let current = 1;
-        let total = 1;
-        
-        // Try various common patterns
-        const pageMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*頁/) || text.match(/第\s*(\d+)\s*頁[，,]\s*共\s*(\d+)\s*頁/);
-        
-        if (pageMatch) {
-            current = parseInt(pageMatch[1]);
-            total = parseInt(pageMatch[2]);
-        }
-
-        // 4. Safety Check: If total is 1 but count looks like there should be more,
-        // or if we can see the "status_next_page" or "#next" button
-        const hasNextButton = !!document.querySelector('input[name="status_next_page"]') || !!document.querySelector('#next');
-        if (total === 1 && hasNextButton) {
-            total = 2; // Force at least one more loop if button exists
-        }
-
-        return {
-            current: current,
-            total: total,
-            count: count,
-            noData: false,
-            hasNextButton: hasNextButton
-        };
-    });
+    // 解析邏輯見 lib/plate-parser.cjs（與回歸測試共用，page.evaluate 序列化後在 browser 執行）
+    return page.evaluate(parsePageInfoFromDoc);
 }
 
 // --- Main Process Logic ---
@@ -812,12 +777,8 @@ async function processStation(page, deptId, station) {
             while (hasNext) {
                 const info = await parsePageInfo(page);
                 if (info.noData) { hasNext = false; continue; }
-                const plates = await page.evaluate(() => {
-                    return Array.from(document.querySelectorAll('.number_cell')).map(el => ({
-                        no: el.querySelector('.number')?.innerText.trim(),
-                        price: el.querySelector('.price')?.innerText.split('元')[0].replace(/,/g, '').trim()
-                    })).filter(x => x.no);
-                });
+                // 抽號邏輯見 lib/plate-parser.cjs（與回歸測試共用）
+                const plates = await page.evaluate(extractPlates);
                 if (plates.length > 0) collectedPlates.push(...plates);
                 if (info.current < info.total) {
                     const nextBtn = await page.$('input[name="status_next_page"]') || await page.$('#next');

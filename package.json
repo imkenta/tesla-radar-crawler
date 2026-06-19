@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node gh-plate-sync.cjs",
     "sync": "node gh-plate-sync.cjs",
-    "ocr": "node gh-plate-sync-ocr.cjs"
+    "ocr": "node gh-plate-sync-ocr.cjs",
+    "test": "node --test \"test/**/*.test.cjs\""
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
@@ -20,5 +21,8 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }
