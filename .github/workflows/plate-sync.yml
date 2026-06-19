@@ -1,8 +1,9 @@
 name: Daily Plate Sync (Live) v2.1
 
 on:
-  schedule:
-    - cron: '*/30 * * * *' # Run every 30 minutes
+  # 2026-06-19: 移除 GitHub 內建 schedule，改由外部 cronjob 經 workflow_dispatch 觸發（時間較準）。
+  # 原因：GitHub schedule 會延遲數小時，且與外部 cronjob 雙重觸發同一 concurrency group，
+  # 造成「Canceling since a higher priority waiting request」連鎖取消、全面癱瘓。
   workflow_dispatch: {}
 
 # Prevent multiple workflow runs from overlapping and corrupting the staging table
@@ -10,9 +11,49 @@ concurrency:
   group: plate-sync-workflow
   cancel-in-progress: false
 
+permissions:
+  contents: read # checkout 需要
+  actions: read  # guard 需要查詢執行中的 run
+
 jobs:
-  sync-plates:
+  # 「跳過重複觸發」閘門（2026-06-19 新增）：
+  # cron-job.org 固定每 20 分觸發一次，正常 run 約 10~15 分跑完、不會重疊。
+  # 但偶爾單次 run 會超過 20 分鐘，這時下一輪觸發進來，若放任排隊就會互相取消（連鎖癱瘓）。
+  # 解法：每個新 run 先檢查是否已有另一個 run 正在執行；有的話這一輪直接跳過——
+  # 不排隊、也不打斷正在跑的（保護 staging table），等下一個 20 分週期即可。
+  # 注意：每次觸發仍會建立一個 run（可確認觸發正常），只是重複的那個會秒跳過。
+  guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Skip if another run is already in progress
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/plate-sync.yml/runs?status=in_progress&per_page=100" \
+            --jq '.total_count' 2>/dev/null || echo "")
+          echo "目前 in_progress 的 run 數（含自己）：${COUNT:-查詢失敗}"
+          if [ -z "$COUNT" ]; then
+            echo "::warning::無法查詢執行中的 run（API 失敗），保險起見照常執行。"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$COUNT" -gt 1 ]; then
+            echo "::notice::已有另一輪 plate-sync 在執行，跳過這一輪以避免互踩。"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  sync-plates:
+    needs: guard
+    if: needs.guard.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    # 卡死的 shard 最多跑 45 分鐘就被砍，避免霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。
+    # 45 分是依歷史成功耗時（11~49 分）抓的上限：不誤殺正常慢 run，又能及早終結 hang。
+    timeout-minutes: 45
     strategy:
       matrix:
         shard: [NORTH, CENTRAL, SOUTH]
@@ -122,6 +163,7 @@ jobs:
   finalize-sync:
     needs: sync-plates
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: success() # Only run if all shards succeeded
     steps:
       - name: Checkout Code

@@ -1,8 +1,8 @@
 name: Bidding Plates Realtime Sync
 
 on:
-  schedule:
-    - cron: '*/30 * * * *' # Run every 30 minutes
+  # 2026-06-19: 移除 GitHub 內建 schedule，改由外部 cronjob（cron-job.org）經 workflow_dispatch 觸發。
+  # 與 plate-sync 一致：避免 schedule + cronjob 雙源觸發同一 concurrency group 造成連鎖取消。
   workflow_dispatch: {}
 
 concurrency:
@@ -12,6 +12,9 @@ concurrency:
 jobs:
   sync-bidding-plates:
     runs-on: ubuntu-latest
+    # 防止單次 run 卡死霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。
+    # 正常只跑 1~2 分，設 10 分綽綽有餘。此 workflow 跑得快、每 10 分觸發不會重疊，故不需 guard。
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Code
