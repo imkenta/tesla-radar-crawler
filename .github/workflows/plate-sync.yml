@@ -60,7 +60,7 @@ jobs:
       fail-fast: false # Let other shards finish even if one fails
     
     concurrency:
-      group: ${{ github.workflow }}-${{ matrix.shard }}
+      group: plate-sync-shard-${{ matrix.shard }}
       cancel-in-progress: false
 
     steps:
@@ -165,6 +165,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: success() # Only run if all shards succeeded
+    concurrency:
+      group: plate-sync-finalize
+      cancel-in-progress: false
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

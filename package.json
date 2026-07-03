@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node gh-plate-sync.cjs",
     "sync": "node gh-plate-sync.cjs",
-    "ocr": "node gh-plate-sync-ocr.cjs",
     "test": "node --test \"test/**/*.test.cjs\""
   },
   "dependencies": {
