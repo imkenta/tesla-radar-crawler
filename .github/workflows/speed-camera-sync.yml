@@ -1,0 +1,37 @@
+name: Speed Camera Sync
+
+on:
+  # 僅 workflow_dispatch，不設 schedule（2026-06-19 雙源觸發連鎖取消事故政策，
+  # 見 plate-sync.yml / bidding-plates-sync.yml 同一決議）。
+  # ⚠️ 啟用前置條件：production 的 public.speed_cameras 表尚未建立，
+  # 表建好、secrets 確認、cron-job.org 排程設定完成前，不可手動觸發本 workflow。
+  workflow_dispatch: {}
+
+concurrency:
+  group: speed-camera-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-speed-cameras:
+    runs-on: ubuntu-latest
+    # 正常只跑數分鐘（3 個開放資料來源下載+解析+upsert），15 分鐘上限足夠且能及早終結 hang。
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Speed Camera Sync (write mode)
+        run: node speed-camera-sync.cjs --write
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NODE_OPTIONS: '--dns-result-order=ipv4first'

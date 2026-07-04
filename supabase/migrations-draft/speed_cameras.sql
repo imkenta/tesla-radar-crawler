@@ -1,6 +1,6 @@
--- ⚠️ DRAFT — 尚未套用至任何 Supabase 專案（本地或 production）。
--- 本檔案僅為 R7（固定式測速照相導航預警）爬蟲側規格產出物，供後續整合時參考。
--- 若要正式套用，請移出 migrations-draft/ 放進 supabase/migrations/ 並走正常 migration 流程。
+-- ⚠️ 正式版已依 D2 決議移至 TeslaToolbox/supabase/migrations（含 RLS 唯讀 policy
+-- 與 direction not null 修正：direction text not null default ''）。
+-- 本檔僅存歷史參考，不代表目前套用中的正式 schema，勿依本檔內容直接套用。
 --
 -- 對應正規化 schema：lib/speed-camera-parser.cjs 輸出的
 -- { city, address, road, direction, speed_limit, lat, lng, source, fetched_at }
