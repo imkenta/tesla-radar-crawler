@@ -15,6 +15,8 @@ const path = require('path');
 const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
+// Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
+const { MODEL_LADDER, EXHAUSTED, nextLadderState } = require('./lib/ai-model-ladder.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -95,7 +97,7 @@ const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PROXY_URL = process.env.PROXY_URL;
-const MODEL_NAME = "gemma-4-31b-it";
+const MODEL_NAME = MODEL_LADDER[0].model; // 僅供啟動 log 顯示用，實際模型由 AIManager 階梯狀態決定
 
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
@@ -114,18 +116,28 @@ const shardArg = args.find(arg => arg.startsWith('--shard='));
 const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 
 // --- AI Manager (Failover Support) ---
+//
+// Key 分流（不動）：每個 shard 各自獨立的 GEMINI_API_KEY_{SHARD}，缺省退回 GEMINI_API_KEY。
+// 模型階梯（本次新增，per-instance/per-process 狀態，三個 shard 各自獨立，不共用不寫檔）：
+// gemma-4-26b-a4b-it → 3 次 API 層失敗 → gemma-4-31b-it → 2 次失敗 → gemini-3-flash-preview
+// → 1 次失敗 → EXHAUSTED（本請求交回既有失敗處理 / Tesseract 路徑，行為不變）。
+// 升級後 sticky：不會降回較低層級。純階梯邏輯見 lib/ai-model-ladder.cjs（可測、與此處分離）。
 class AIManager {
     constructor(shard) {
         this.shard = shard;
-        this.modelName = process.env.AI_MODEL_NAME || "gemma-4-31b-it";
         this.shardKeyName = shard ? `GEMINI_API_KEY_${shard.toUpperCase()}` : null;
         this.primaryKey = this.shardKeyName ? process.env[this.shardKeyName] : null;
         this.fallbackKey = process.env.GEMINI_API_KEY;
-        
+
         this.currentKey = this.primaryKey || this.fallbackKey;
         this.isUsingFallback = !this.primaryKey;
         this.instance = null;
         this.model = null;
+
+        // 模型階梯狀態：this 上的欄位＝per-instance，每個 process（= 每個 shard）各自一份。
+        this.ladderTierIndex = 0;
+        this.ladderFailureCount = 0;
+        this.modelName = MODEL_LADDER[this.ladderTierIndex].model;
 
         this.init();
     }
@@ -136,17 +148,17 @@ class AIManager {
             process.exit(1);
         }
         this.instance = new GoogleGenerativeAI(this.currentKey);
-        this.model = this.instance.getGenerativeModel({ 
+        this.model = this.instance.getGenerativeModel({
             model: this.modelName,
             systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters."
         });
         const source = this.isUsingFallback ? "DEFAULT_KEY" : (this.shardKeyName || "DEFAULT_KEY");
-        console.log(`[AI] Initialized using: ${source}`);
+        console.log(`[AI] Initialized using: ${source} / model: ${this.modelName}`);
     }
 
     async switchToFallback() {
         if (this.isUsingFallback || !this.fallbackKey || this.fallbackKey === this.currentKey) return false;
-        
+
         console.log(`\n⚠️  [AI] Quota hit on ${this.shardKeyName}. Switching to fallback GEMINI_API_KEY...`);
         this.currentKey = this.fallbackKey;
         this.isUsingFallback = true;
@@ -154,18 +166,45 @@ class AIManager {
         return true;
     }
 
+    // API 層失敗累計後嘗試升級模型階梯。回傳 true＝已升級（重新 init 換 model，key 不變）。
+    // 回傳 false＝尚未達門檻，或已在最後一層且判定 EXHAUSTED（呼叫端需自行處理耗盡情形）。
+    escalateModelTier() {
+        this.ladderFailureCount++;
+        const next = nextLadderState(this.ladderTierIndex, this.ladderFailureCount);
+        if (next === EXHAUSTED) {
+            return false;
+        }
+        if (next.tierIndex === this.ladderTierIndex) {
+            return false; // 未達升級門檻，停留原層級
+        }
+        console.log(`\n⚠️  [AI] ${MODEL_LADDER[this.ladderTierIndex].model} 累計失敗 ${this.ladderFailureCount} 次，升級至 ${next.model}...`);
+        this.ladderTierIndex = next.tierIndex;
+        this.ladderFailureCount = 0; // 新層級的失敗計數歸零重新累計
+        this.modelName = next.model;
+        this.init(); // 只換 model，key（this.currentKey）不變
+        return true;
+    }
+
     async generateContent(payload) {
         try {
             return await this.model.generateContent(payload);
         } catch (e) {
-            // Check if it's a quota error (429 or similar)
+            // Check if it's a quota error (429 or similar) — key 層 fallback（不動既有邏輯）
             if (e.message.includes('429') || e.message.toLowerCase().includes('quota') || e.message.toLowerCase().includes('limit')) {
-                const switched = await this.switchToFallback();
-                if (switched) {
+                const switchedKey = await this.switchToFallback();
+                if (switchedKey) {
                     console.log('🔄 [AI] Retrying with fallback key...');
                     return await this.model.generateContent(payload);
                 }
             }
+
+            // API 層失敗（429/4xx/5xx/timeout/網路）→ 嘗試升級模型階梯後重試一次
+            const escalated = this.escalateModelTier();
+            if (escalated) {
+                console.log(`🔄 [AI] Retrying with escalated model ${this.modelName}...`);
+                return await this.model.generateContent(payload);
+            }
+
             throw e;
         }
     }
