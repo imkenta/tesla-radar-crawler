@@ -27,7 +27,13 @@
  */
 
 const fs = require('fs');
-const { parseTaipei, parseNewTaipei, parseKaohsiung, parseKaohsiungJson } = require('./lib/speed-camera-parser.cjs');
+const {
+  parseTaipei,
+  parseNewTaipei,
+  parseKaohsiung,
+  parseKaohsiungJson,
+  parseTaoyuan,
+} = require('./lib/speed-camera-parser.cjs');
 const { toUpsertPayloads } = require('./lib/speed-camera-writer.cjs');
 
 // 各縣市原始資料下載連結（見 docs/speed-camera-sources.md 逐縣市細節）。
@@ -60,6 +66,12 @@ const SOURCES = [
         parse: parseKaohsiungJson,
       },
     ],
+  },
+  {
+    name: 'taoyuan',
+    url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download',
+    parse: parseTaoyuan,
+    fallbackUrls: [],
   },
 ];
 

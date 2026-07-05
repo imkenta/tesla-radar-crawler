@@ -20,6 +20,7 @@ const {
   parseNewTaipei,
   parseKaohsiung,
   parseKaohsiungJson,
+  parseTaoyuan,
   toSpeedLimit,
   toCoord,
 } = require('../lib/speed-camera-parser.cjs');
@@ -228,6 +229,65 @@ test('parseKaohsiungJson：座標欄位與速限欄位處理規則與 CSV 版相
       lat: 22.63776,
       lng: 120.336788,
       source: 'kaohsiung',
+      fetched_at: FIXED_NOW,
+    },
+  ]);
+});
+
+test('parseTaoyuan：Big5 編碼 CSV，且「經度/緯度」欄位在不同設備類別下順序相反時仍正確判斷（golden）', () => {
+  // fixture 由本機台灣 IP 於 2026-07-05 從 opendata.tycg.gov.tw 實測下載節錄，
+  // 涵蓋兩種欄位順序：「固定式測速照相設備」經度在前（與表頭一致），
+  // 「路口多功能測速照相設備」「區間平均速率測速照相設備」緯度在前（與表頭不一致，實測發現的陷阱）。
+  const buf = fixtureBuffer('speed-camera-taoyuan.csv');
+  const result = parseTaoyuan(buf, FIXED_NOW);
+
+  assert.equal(result.length, 4);
+  assert.deepEqual(result, [
+    {
+      city: '桃園市',
+      address: '桃園區 成功路三段235號前',
+      road: '成功路三段235號前',
+      direction: '往桃園市區方向',
+      speed_limit: 40,
+      lat: 25.00729,
+      lng: 121.32475,
+      source: 'taoyuan',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      city: '桃園市',
+      address: '桃園區 春日路561號前',
+      road: '春日路561號前',
+      direction: '往桃園市區方向',
+      speed_limit: 50,
+      lat: 25.005,
+      lng: 121.31246,
+      source: 'taoyuan',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      // 「路口多功能測速照相設備」：來源欄位順序是 緯度,經度（與表頭「經度,緯度」相反）
+      // 解析器依數值大小判斷，仍正確輸出 lat<27, lng>119
+      city: '桃園市',
+      address: '桃園區 國際路二段與大興西路三段路口',
+      road: '國際路二段與大興西路三段路口',
+      direction: '國際路上雙向',
+      speed_limit: 50,
+      lat: 25.002139,
+      lng: 121.286824,
+      source: 'taoyuan',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      // 「區間平均速率測速照相設備」：同樣是緯度,經度順序（陷阱）
+      city: '桃園市',
+      address: '龜山區 萬壽路一段18.9K至20K',
+      road: '萬壽路一段18.9K至20K',
+      direction: '往龜山(南)(區間測速)',
+      speed_limit: 50,
+      lat: 25.011771,
+      lng: 121.375618,
+      source: 'taoyuan',
       fetched_at: FIXED_NOW,
     },
   ]);
