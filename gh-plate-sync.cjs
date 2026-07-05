@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isServerError, QUOTA_PER_DAY } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isServerError, QUOTA_PER_DAY, resolveShardKeys } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -140,20 +140,14 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 class AIManager {
     constructor(shard) {
         this.shard = shard;
-        this.shardKeyName = shard ? `GEMINI_API_KEY_${shard.toUpperCase()}` : null;
 
-        // key 候選（優先序：shard key → DEFAULT key）。值相同視為同一把 key（同一配額池）
-        // 去重，否則死亡標記會失真（標死 shard 名卻從 DEFAULT 名繼續打同一個池）。
-        this.keysByName = new Map();
-        if (this.shardKeyName && process.env[this.shardKeyName]) {
-            this.keysByName.set(this.shardKeyName, process.env[this.shardKeyName]);
-        }
-        const defaultKey = process.env.GEMINI_API_KEY;
-        if (defaultKey && !Array.from(this.keysByName.values()).includes(defaultKey)) {
-            this.keysByName.set('GEMINI_API_KEY', defaultKey);
-        }
-        if (this.keysByName.size === 0) {
-            console.error("[AI] Fatal: No API key available.");
+        // key 解析純函式（lib/ai-model-ladder.cjs 的 resolveShardKeys，與回歸測試共用
+        // 單一真理）：shard 模式下缺該 shard 專屬 key 直接 throw，快速失敗、絕不
+        // 靜默落回只用 DEFAULT key 硬跑（見 test/shard-key-resolve.test.cjs）。
+        try {
+            this.keysByName = resolveShardKeys(shard, process.env);
+        } catch (e) {
+            console.error(`[AI] Fatal: ${e.message}`);
             process.exit(1);
         }
 
@@ -911,7 +905,8 @@ async function processStation(page, deptId, station) {
 
     // Add wider jitter based on shard to avoid simultaneous hits to Supabase
     if (TARGET_SHARD) {
-        const jitterMap = { 'NORTH': 0, 'CENTRAL': 20000, 'SOUTH': 40000 };
+        // 2026-07-05：3→5 分片，5 個 shard 錯開 20s 間隔避免同時打 Supabase。
+        const jitterMap = { 'NORTH': 0, 'CENTRAL': 20000, 'SOUTH': 40000, 'SHARD4': 60000, 'SHARD5': 80000 };
         const shardJitter = jitterMap[TARGET_SHARD.toUpperCase()] || 0;
         if (shardJitter > 0) {
             console.log(`⏳ Adding ${shardJitter/1000}s jitter for shard ${TARGET_SHARD} to prevent parallel collision...`);

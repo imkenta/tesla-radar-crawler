@@ -56,7 +56,8 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        shard: [NORTH, CENTRAL, SOUTH]
+        # 2026-07-05: 3→5 分片重構，站點配載見 lib/shard-config.cjs / supabase/migrations-draft/shard_5way_mvdis_stations.sql
+        shard: [NORTH, CENTRAL, SOUTH, SHARD4, SHARD5]
       fail-fast: false # Let other shards finish even if one fails
     
     concurrency:
@@ -158,6 +159,8 @@ jobs:
           GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
           GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
           GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
+          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
+          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
   finalize-sync:
