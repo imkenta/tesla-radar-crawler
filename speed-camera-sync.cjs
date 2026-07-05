@@ -43,12 +43,59 @@ const SOURCES = [
   },
 ];
 
-async function fetchBuffer(url) {
+const FETCH_MAX_ATTEMPTS = 3;
+const FETCH_TIMEOUT_MS = 30_000;
+const FETCH_RETRY_DELAYS_MS = [5_000, 15_000]; // 第 1 次失敗後等 5s 重試，第 2 次失敗後等 15s 重試
+
+// module.exports.sleep 可在測試中被覆寫以跳過真實等待；正式執行永遠是真實 delay。
+function sleep(ms) {
+  return module.exports.sleep(ms);
+}
+function realSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchBufferOnce(url) {
   const fetch = globalThis.fetch || (await import('node-fetch')).default;
-  const res = await fetch(url, { headers: { 'User-Agent': 'tesla-radar-crawler/1.0 (speed-camera-sync)' } });
-  if (!res.ok) throw new Error(`下載失敗 HTTP ${res.status}：${url}`);
-  const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'tesla-radar-crawler/1.0 (speed-camera-sync)' },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`下載失敗 HTTP ${res.status}：${url}`);
+    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * 下載來源資料，失敗時最多重試 FETCH_MAX_ATTEMPTS 次（指數退避）。
+ * 每次重試都印一行 log（來源名、第幾次嘗試、錯誤摘要），方便從 Actions log 判斷
+ * 是單次抖動還是穩定性封鎖。全部嘗試皆失敗才拋出最後一次的錯誤。
+ *
+ * @param {string} url
+ * @param {string} sourceName 用於 log 前綴
+ */
+async function fetchBuffer(url, sourceName) {
+  let lastErr;
+  for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fetchBufferOnce(url);
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `[speed-camera-sync] ${sourceName} 下載重試 ${attempt}/${FETCH_MAX_ATTEMPTS} 失敗：${err.message}`
+      );
+      if (attempt < FETCH_MAX_ATTEMPTS) {
+        await sleep(FETCH_RETRY_DELAYS_MS[attempt - 1]);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function syncAll() {
@@ -58,7 +105,7 @@ async function syncAll() {
   for (const source of SOURCES) {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
     try {
-      const buffer = await fetchBuffer(source.url);
+      const buffer = await fetchBuffer(source.url, source.name);
       const records = source.parse(buffer, fetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       results.push(...records);
@@ -86,7 +133,7 @@ async function writeAll(supabase) {
     const result = { name: source.name, ok: false, written: 0, staleDeleted: 0, error: null };
     try {
       console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
-      const buffer = await fetchBuffer(source.url);
+      const buffer = await fetchBuffer(source.url, source.name);
       const records = source.parse(buffer, batchFetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
 
@@ -223,4 +270,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { syncAll, writeAll, writeSyncLog, SOURCES };
+module.exports = { syncAll, writeAll, writeSyncLog, SOURCES, sleep: realSleep };
