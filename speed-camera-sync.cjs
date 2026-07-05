@@ -21,31 +21,49 @@
  */
 
 const fs = require('fs');
-const { parseTaipei, parseNewTaipei, parseKaohsiung } = require('./lib/speed-camera-parser.cjs');
+const { parseTaipei, parseNewTaipei, parseKaohsiung, parseKaohsiungJson } = require('./lib/speed-camera-parser.cjs');
 const { toUpsertPayloads } = require('./lib/speed-camera-writer.cjs');
 
 // 各縣市原始資料下載連結（見 docs/speed-camera-sources.md 逐縣市細節）。
+//
+// fallbackUrls：主 URL 全部重試用盡仍失敗時的備援入口（不同主機）。目前只有高雄有——
+// data.kcg.gov.tw 從 GitHub Actions（美國 runner）連續 timeout/fetch failed，本機台灣 IP
+// 正常，高度懷疑地理封鎖；openapi.kcg.gov.tw 是不同主機（不同 IP），JSON 格式，
+// 輸出 schema 經 248 筆全量比對與 CSV 版逐欄位一致（見 lib/speed-camera-parser.cjs
+// parseKaohsiungJson 與 test/speed-camera-parser.test.cjs）。
 const SOURCES = [
   {
     name: 'taipei',
     url: 'https://data.taipei/api/frontstage/tpeod/dataset/resource.download?rid=5012e8ba-5ace-4821-8482-ee07c147fd0a',
     parse: parseTaipei,
+    fallbackUrls: [],
   },
   {
     name: 'new-taipei',
     url: 'https://data.ntpc.gov.tw/api/datasets/99f3ff6e-0352-4399-a726-775ab765a1dc/csv/file',
     parse: parseNewTaipei,
+    fallbackUrls: [],
   },
   {
     name: 'kaohsiung',
     url: 'https://data.kcg.gov.tw/File/directDownload/d300ae36-e3b7-41c1-aa27-39c48a6f8c4b',
     parse: parseKaohsiung,
+    fallbackUrls: [
+      {
+        url: 'https://openapi.kcg.gov.tw/Api/Service/Get/d300ae36-e3b7-41c1-aa27-39c48a6f8c4b',
+        parse: parseKaohsiungJson,
+      },
+    ],
   },
 ];
 
 const FETCH_MAX_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 30_000;
 const FETCH_RETRY_DELAYS_MS = [5_000, 15_000]; // 第 1 次失敗後等 5s 重試，第 2 次失敗後等 15s 重試
+
+const FALLBACK_MAX_ATTEMPTS = 2;
+const FALLBACK_RETRY_DELAY_MS = 3_000; // 每個 fallback 入口內部重試前的短退避
+const MAX_TOTAL_ATTEMPTS = FETCH_MAX_ATTEMPTS + FALLBACK_MAX_ATTEMPTS * 3; // 硬上界（主 URL + 最多 3 個 fallback 入口）
 
 // module.exports.sleep 可在測試中被覆寫以跳過真實等待；正式執行永遠是真實 delay。
 function sleep(ms) {
@@ -73,29 +91,74 @@ async function fetchBufferOnce(url) {
 }
 
 /**
- * 下載來源資料，失敗時最多重試 FETCH_MAX_ATTEMPTS 次（指數退避）。
+ * 對單一 URL 下載，失敗時最多重試 maxAttempts 次。
  * 每次重試都印一行 log（來源名、第幾次嘗試、錯誤摘要），方便從 Actions log 判斷
  * 是單次抖動還是穩定性封鎖。全部嘗試皆失敗才拋出最後一次的錯誤。
  *
  * @param {string} url
- * @param {string} sourceName 用於 log 前綴
+ * @param {string} logLabel 用於 log 前綴（來源名，fallback 時額外標註主機名）
+ * @param {number} maxAttempts
+ * @param {number[]|number} retryDelaysMs 每次重試前的等待毫秒數（陣列依索引取值，或單一數字每次相同）
  */
-async function fetchBuffer(url, sourceName) {
+async function fetchWithRetry(url, logLabel, maxAttempts, retryDelaysMs) {
   let lastErr;
-  for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fetchBufferOnce(url);
     } catch (err) {
       lastErr = err;
-      console.error(
-        `[speed-camera-sync] ${sourceName} 下載重試 ${attempt}/${FETCH_MAX_ATTEMPTS} 失敗：${err.message}`
-      );
-      if (attempt < FETCH_MAX_ATTEMPTS) {
-        await sleep(FETCH_RETRY_DELAYS_MS[attempt - 1]);
+      console.error(`[speed-camera-sync] ${logLabel} 重試 ${attempt}/${maxAttempts} 失敗：${err.message}`);
+      if (attempt < maxAttempts) {
+        const delay = Array.isArray(retryDelaysMs) ? retryDelaysMs[attempt - 1] : retryDelaysMs;
+        await sleep(delay);
       }
     }
   }
   throw lastErr;
+}
+
+/**
+ * 下載某個 source 的資料：先重試主 URL（FETCH_MAX_ATTEMPTS 次），全敗後依序嘗試
+ * source.fallbackUrls（每個 fallback 入口最多 FALLBACK_MAX_ATTEMPTS 次、短退避）。
+ * 每次切換到新的鏡像都印一行 log（含主機名），方便從 log 判斷實際走了哪個入口。
+ * 總嘗試次數受 MAX_TOTAL_ATTEMPTS 硬上界保護。全部入口皆失敗才拋出最後一次的錯誤。
+ *
+ * @param {object} source SOURCES 內的一筆
+ * @returns {Promise<{ buffer: Buffer, parse: Function }>}
+ */
+async function fetchSourceBuffer(source) {
+  let totalAttempts = 0;
+  const primaryAttempts = Math.min(FETCH_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS);
+
+  try {
+    const buffer = await fetchWithRetry(source.url, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS);
+    return { buffer, parse: source.parse };
+  } catch (err) {
+    totalAttempts += primaryAttempts;
+    let lastErr = err;
+
+    for (const fallback of source.fallbackUrls || []) {
+      if (totalAttempts >= MAX_TOTAL_ATTEMPTS) break;
+      const host = new URL(fallback.url).host;
+      console.error(`[speed-camera-sync] ${source.name} 主來源失敗，改用鏡像 ${host} ...`);
+
+      const attemptsLeft = Math.min(FALLBACK_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS - totalAttempts);
+      try {
+        const buffer = await fetchWithRetry(
+          fallback.url,
+          `${source.name} 鏡像(${host})`,
+          attemptsLeft,
+          FALLBACK_RETRY_DELAY_MS
+        );
+        return { buffer, parse: fallback.parse || source.parse };
+      } catch (fallbackErr) {
+        totalAttempts += attemptsLeft;
+        lastErr = fallbackErr;
+      }
+    }
+
+    throw lastErr;
+  }
 }
 
 async function syncAll() {
@@ -105,8 +168,8 @@ async function syncAll() {
   for (const source of SOURCES) {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
     try {
-      const buffer = await fetchBuffer(source.url, source.name);
-      const records = source.parse(buffer, fetchedAt);
+      const { buffer, parse } = await fetchSourceBuffer(source);
+      const records = parse(buffer, fetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       results.push(...records);
     } catch (err) {
@@ -133,8 +196,8 @@ async function writeAll(supabase) {
     const result = { name: source.name, ok: false, written: 0, staleDeleted: 0, error: null };
     try {
       console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
-      const buffer = await fetchBuffer(source.url, source.name);
-      const records = source.parse(buffer, batchFetchedAt);
+      const { buffer, parse } = await fetchSourceBuffer(source);
+      const records = parse(buffer, batchFetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);

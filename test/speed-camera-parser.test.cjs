@@ -19,6 +19,7 @@ const {
   parseTaipei,
   parseNewTaipei,
   parseKaohsiung,
+  parseKaohsiungJson,
   toSpeedLimit,
   toCoord,
 } = require('../lib/speed-camera-parser.cjs');
@@ -174,6 +175,56 @@ test('parseKaohsiung：座標欄位命名「座標緯N度/座標經E度」且順
       road: '中山高西側便道與九如一路口',
       direction: '北向南',
       speed_limit: null,
+      lat: 22.63776,
+      lng: 120.336788,
+      source: 'kaohsiung',
+      fetched_at: FIXED_NOW,
+    },
+  ]);
+});
+
+test('parseKaohsiungJson：openapi.kcg.gov.tw JSON 鏡像——全量 248 筆與 CSV 主來源逐筆輸出完全一致（golden，fallback 對照組）', () => {
+  // fixture 由本機台灣 IP 於 2026-07-05 各下載一次原始驗證取得：
+  //   CSV：https://data.kcg.gov.tw/File/directDownload/d300ae36-e3b7-41c1-aa27-39c48a6f8c4b
+  //   JSON：https://openapi.kcg.gov.tw/Api/Service/Get/d300ae36-e3b7-41c1-aa27-39c48a6f8c4b
+  const csvBuf = fixtureBuffer('speed-camera-kaohsiung-full.csv');
+  const jsonBuf = fixtureBuffer('speed-camera-kaohsiung-openapi.json');
+
+  const csvRecords = parseKaohsiung(csvBuf, FIXED_NOW);
+  const jsonRecords = parseKaohsiungJson(jsonBuf, FIXED_NOW);
+
+  assert.equal(csvRecords.length, 248);
+  assert.equal(jsonRecords.length, 248);
+  assert.deepEqual(jsonRecords, csvRecords);
+});
+
+test('parseKaohsiungJson：座標欄位與速限欄位處理規則與 CSV 版相同（單筆樣本）', () => {
+  const sample = {
+    data: [
+      {
+        Seq: 7,
+        編號: '7',
+        型式: '線圈數位',
+        測照地點: '中山高西側便道與九如一路口',
+        測照方向: '北向南',
+        速限: '違左',
+        行政區: '三民',
+        測照型式: '違左',
+        座標緯N度: '22.63776',
+        座標經E度: '120.336788',
+      },
+    ],
+  };
+  const buf = Buffer.from(JSON.stringify(sample), 'utf8');
+  const result = parseKaohsiungJson(buf, FIXED_NOW);
+
+  assert.deepEqual(result, [
+    {
+      city: '高雄市',
+      address: '三民 中山高西側便道與九如一路口',
+      road: '中山高西側便道與九如一路口',
+      direction: '北向南',
+      speed_limit: null, // 座標欄位順序（緯在前、經在後）與 CSV 版相同解析規則
       lat: 22.63776,
       lng: 120.336788,
       source: 'kaohsiung',
