@@ -16,7 +16,9 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, nextLadderState } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, nextLadderState, classifyQuotaError, isServerError, QUOTA_PER_MINUTE } = require('./lib/ai-model-ladder.cjs');
+// CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
+const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -87,7 +89,10 @@ class RateLimiter {
     }
 }
 
-const geminiLimiter = new RateLimiter(25, 60000);
+// 2026-07-05：25 req/min 超過 Gemma 系列 RPM 上限 15，持續自撞 429。降至 12/min 留 buffer。
+// AI_RATE_LIMIT_PER_MIN 可覆蓋（測試/緊急調整用）。
+const AI_RATE_LIMIT_PER_MIN = parseInt(process.env.AI_RATE_LIMIT_PER_MIN, 10) || 12;
+const geminiLimiter = new RateLimiter(AI_RATE_LIMIT_PER_MIN, 60000);
 
 // --- Config ---
 const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
@@ -118,10 +123,14 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 // --- AI Manager (Failover Support) ---
 //
 // Key 分流（不動）：每個 shard 各自獨立的 GEMINI_API_KEY_{SHARD}，缺省退回 GEMINI_API_KEY。
-// 模型階梯（本次新增，per-instance/per-process 狀態，三個 shard 各自獨立，不共用不寫檔）：
-// gemma-4-26b-a4b-it → 3 次 API 層失敗 → gemma-4-31b-it → 2 次失敗 → gemini-3-flash-preview
-// → 1 次失敗 → EXHAUSTED（本請求交回既有失敗處理 / Tesseract 路徑，行為不變）。
+// 模型階梯（per-instance/per-process 狀態，三個 shard 各自獨立，不共用不寫檔）：
+// gemma-4-26b-a4b-it → 3 次失敗 → gemma-4-31b-it → 2 次失敗 → gemini-3.1-flash-lite
+// → 2 次失敗 → gemini-3-flash-preview → 1 次失敗 → EXHAUSTED（交回既有失敗處理 / Tesseract 路徑）。
 // 升級後 sticky：不會降回較低層級。純階梯邏輯見 lib/ai-model-ladder.cjs（可測、與此處分離）。
+//
+// 429 分流（2026-07-05 新增，見 classifyQuotaError）：
+// - 每分鐘限流 → 退避（retry-after 或 20s）後同層重試一次，不計入升級門檻。
+// - 每日配額耗盡 → 本層本輪直接標死，強制升級，不浪費重試次數。
 class AIManager {
     constructor(shard) {
         this.shard = shard;
@@ -150,7 +159,16 @@ class AIManager {
         this.instance = new GoogleGenerativeAI(this.currentKey);
         this.model = this.instance.getGenerativeModel({
             model: this.modelName,
-            systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters."
+            // 2026-07-05：26B 實戰會把整段思考碎念吐進回應（例："M8L_ (Wait, let me
+            // look closer)... Let's try: MN8L.MN8L"）。補一句更直白的硬約束；
+            // 解析端另有 lib/captcha-parser.cjs 做嚴格截取兜底，兩層防禦。
+            systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters. 只輸出驗證碼的4個字元，禁止任何其他文字或解釋。",
+            // temperature:0 壓制隨機性、減少模型「碎碎念」的空間；maxOutputTokens 壓到
+            // 剛好夠放 4 字元的量（留一點餘裕給模型可能加的前綴），物理上斬斷長篇思考過程。
+            generationConfig: {
+                temperature: 0,
+                maxOutputTokens: 16,
+            },
         });
         const source = this.isUsingFallback ? "DEFAULT_KEY" : (this.shardKeyName || "DEFAULT_KEY");
         console.log(`[AI] Initialized using: ${source} / model: ${this.modelName}`);
@@ -168,8 +186,15 @@ class AIManager {
 
     // API 層失敗累計後嘗試升級模型階梯。回傳 true＝已升級（重新 init 換 model，key 不變）。
     // 回傳 false＝尚未達門檻，或已在最後一層且判定 EXHAUSTED（呼叫端需自行處理耗盡情形）。
-    escalateModelTier() {
-        this.ladderFailureCount++;
+    //
+    // forceEscalate＝true（每日配額耗盡場景）：不論目前累計了幾次失敗，直接視為已達
+    // 本層升級門檻，立即升層——每日耗盡不會因為多等幾次重試就恢復，沒有必要浪費
+    // failuresToEscalate 次數的重試機會（那些重試只會原地再吃 429）。
+    escalateModelTier(forceEscalate = false) {
+        const currentThreshold = MODEL_LADDER[this.ladderTierIndex].failuresToEscalate;
+        this.ladderFailureCount = forceEscalate
+            ? Math.max(this.ladderFailureCount + 1, currentThreshold)
+            : this.ladderFailureCount + 1;
         const next = nextLadderState(this.ladderTierIndex, this.ladderFailureCount);
         if (next === EXHAUSTED) {
             return false;
@@ -198,8 +223,37 @@ class AIManager {
                 }
             }
 
-            // API 層失敗（429/4xx/5xx/timeout/網路）→ 嘗試升級模型階梯後重試一次
-            const escalated = this.escalateModelTier();
+            // 429 分流：區分「每分鐘限流」vs「每日配額耗盡」，避免分鐘限流誤耗升級門檻的失敗計數。
+            const quota = classifyQuotaError(e);
+            if (quota.isQuotaError && quota.quotaWindow === QUOTA_PER_MINUTE) {
+                const waitMs = quota.retryAfterMs || 20000;
+                console.log(`⏳ [AI] ${this.modelName} 每分鐘限流，退避 ${Math.ceil(waitMs / 1000)}s 後同層重試（不計入升級門檻）...`);
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
+                try {
+                    return await this.model.generateContent(payload);
+                } catch (retryErr) {
+                    e = retryErr; // 重試仍失敗 → 落入下方一般升級路徑處理
+                }
+            }
+
+            // 5xx 退避（2026-07-05 新增）：Google 端暫時性伺服器錯誤，與配額無關。
+            // 26B 間歇性回 500，短暫退避後同層重試往往就成功，不該讓瞬斷直接算進升級
+            // 門檻的失敗計數（那會讓 26B 因單純運氣不好被過早踢下主力層）。只重試 1 次，
+            // 再失敗才落入下方一般升級路徑（計入該層失敗計數）。
+            if (isServerError(e)) {
+                const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
+                console.log(`⏳ [AI] ${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
+                try {
+                    return await this.model.generateContent(payload);
+                } catch (retryErr) {
+                    e = retryErr; // 重試仍失敗 → 落入下方一般升級路徑處理，計入升級門檻
+                }
+            }
+
+            // 每日配額耗盡：本層本輪直接標死，不浪費升級計數的重試機會，強制升級（若已可升級）。
+            const isDailyExhausted = quota.isQuotaError && quota.quotaWindow !== QUOTA_PER_MINUTE;
+            const escalated = this.escalateModelTier(isDailyExhausted);
             if (escalated) {
                 console.log(`🔄 [AI] Retrying with escalated model ${this.modelName}...`);
                 return await this.model.generateContent(payload);
@@ -445,23 +499,18 @@ async function solveCaptcha(page) {
         ]);
         const response = await result.response;
         const rawText = response.text().trim();
-        
-        // Case-insensitive extraction: preserve both upper/lower before converting
-        let text = rawText.replace(/[^a-zA-Z0-9]/g, '');
-        if (text.length !== 4) {
-            const matches = rawText.match(/[a-zA-Z0-9]{4}/g);
-            if (matches && matches.length > 0) {
-                text = matches[matches.length - 1];
-            } else {
-                text = text.slice(-4);
-            }
-        }
-        text = text.toUpperCase();
-        
-        console.log(`    [AI] Predicted: ${text} (Raw: ${rawText.replace(/\n/g, ' ')})`);
-        
-        if (text && text.length === 4) {
+
+        // 嚴格截取（lib/captcha-parser.cjs）：抓不到合格 4 字元候選一律回傳 null，
+        // 絕不再用 slice(-4) 從碎念裡硬湊出「看起來像答案」的垃圾字串——那種字串
+        // 送進表單必壞，還會觸發最貴的完整重導航循環。null 由呼叫端視為本地失敗、
+        // 重打 AI（不消耗 API 層失敗計數，因為這是解析失敗不是 API 失敗）。
+        const text = extractCaptchaCode(rawText);
+
+        if (text) {
+            console.log(`    [AI] Predicted: ${text} (Raw: ${rawText.replace(/\n/g, ' ')})`);
             stats.captchaSuccess++;
+        } else {
+            console.log(`    [AI] 本地解析失敗，抓不到合格 4 字元候選，拒絕提交 (Raw: ${rawText.replace(/\n/g, ' ')})`);
         }
         return text;
     } catch (e) {
