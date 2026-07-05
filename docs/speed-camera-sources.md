@@ -90,7 +90,7 @@
   2. `--write` 執行時，先查 DB 既有同 `(source, address, direction)` 列已有座標者（`getExistingCoordsForSource`），直接沿用，絕不重複呼叫 Nominatim。
   3. 剩餘缺座標紀錄才呼叫 `lib/geocoder.cjs`（1 req/s 節流），單輪呼叫上限 `SPEEDCAM_GEOCODE_MAX_CALLS`（預設 100，72 筆一輪內可補完）。
   4. geocode 查無結果或失敗：該筆 lat/lng 留 null 入庫，**不計入 source 失敗**（`writeAll` 仍標記 `ok: true`）。
-- **首次回填實測**（本機台灣 IP，2026-07-05，真實 Nominatim）：72 筆全數為新地址（DB 原無 tainan 座標資料），詳細成功率見任務回報。
+- **首次回填實測**（本機台灣 IP，2026-07-05，真實 Nominatim，`node speed-camera-sync.cjs --write`）：72 筆全數為新地址（DB 原無 tainan 座標資料）；geocode 成功 **17/72（23.6%）**，其餘 55 筆留 null 入庫（不算失敗，符合設計）。抽查失敗樣本發現原因不單一：部分殘留系統類型字樣（如「...路口多功能違規科技執法系統」未被 cleanTainanLocation 完全清乾淨的後綴），但也有不少是外觀乾淨的路口描述（如「中山路與中正路三段路口」）依然查無結果——Nominatim/OSM 對台南路口交叉點的資料覆蓋本身有限，非純文字清理問題。未來若要提高成功率，可考慮：(a) 換用更貼合台灣路網的 geocoder（如政府圖資或 Google Geocoding API，需另評估費用與 ToS）、(b) 對系統類型後綴做更積極的字典比對清理。本輪未做這些精修，屬於已知限制，留待下一輪視覆蓋率需求決定是否投入。
 
 ## 全國無統一格式的具體證據
 - 座標欄位命名：台北/新北/桃園用「經度/緯度」或 `longitude/latitude`；高雄用「座標緯N度/座標經E度」（順序相反）；台南完全沒有座標欄位。
