@@ -33,8 +33,15 @@ const {
   parseKaohsiung,
   parseKaohsiungJson,
   parseTaoyuan,
+  parseTainan,
 } = require('./lib/speed-camera-parser.cjs');
-const { toUpsertPayloads } = require('./lib/speed-camera-writer.cjs');
+const { toUpsertPayloads, coordLookupKey, fillMissingCoords } = require('./lib/speed-camera-writer.cjs');
+const { createGeocoder } = require('./lib/geocoder.cjs');
+
+// 單輪 --write 最多對 Nominatim 呼叫的 geocode 次數上限（見 fillMissingCoords）。
+// 台南首次回填 72 筆超過此上限時，需分多輪執行才能補完（下一輪起，已補到座標的
+// 地址會在 fillMissingCoords 第一步直接從 DB 沿用，不會重複呼叫 Nominatim）。
+const GEOCODE_MAX_CALLS_PER_RUN = Number(process.env.SPEEDCAM_GEOCODE_MAX_CALLS) || 100;
 
 // 各縣市原始資料下載連結（見 docs/speed-camera-sources.md 逐縣市細節）。
 //
@@ -72,6 +79,14 @@ const SOURCES = [
     url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download',
     parse: parseTaoyuan,
     fallbackUrls: [],
+  },
+  {
+    name: 'tainan',
+    url: 'https://data.tainan.gov.tw/File/DirectDownload/1c7e82f0-d6b2-4b20-aeff-5c768100f82c',
+    parse: parseTainan,
+    fallbackUrls: [],
+    // 台南來源無座標欄位，--write 模式需在 upsert 前跑 geocode 補值（見 writeAll）。
+    needsGeocode: true,
   },
 ];
 
@@ -201,6 +216,30 @@ async function getStaleDaysForSource(supabase, sourceName) {
   return ageMs / (24 * 60 * 60 * 1000);
 }
 
+/**
+ * 查詢某 source 在 DB 現有的座標，組成 coordLookupKey → {lat,lng} 的 Map，
+ * 供 fillMissingCoords 判斷「這個地址是否已經 geocode 過」，避免重複打 Nominatim。
+ * 只抓 lat/lng 皆非 null 的列（沒座標的列查了也沒用）。
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @param {string} sourceName
+ * @returns {Promise<Map<string, {lat: number, lng: number}>>}
+ */
+async function getExistingCoordsForSource(supabase, sourceName) {
+  const { data, error } = await supabase
+    .from('speed_cameras')
+    .select('address, direction, lat, lng')
+    .eq('source', sourceName)
+    .not('lat', 'is', null)
+    .not('lng', 'is', null);
+  if (error || !data) return new Map();
+
+  const map = new Map();
+  for (const row of data) {
+    map.set(coordLookupKey(sourceName, row.address, row.direction), { lat: row.lat, lng: row.lng });
+  }
+  return map;
+}
+
 async function syncAll() {
   const fetchedAt = new Date().toISOString();
   const results = [];
@@ -226,19 +265,40 @@ async function syncAll() {
  * 每個 source 的結果（成功/失敗）彙總後回傳，由呼叫端決定 exit code 與寫入 sync_logs。
  *
  * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @param {object} [opts]
+ * @param {{geocode: (address: string) => Promise<{lat:number,lng:number}|null>}} [opts.geocoder] 測試注入 mock geocoder；預設 lib/geocoder.cjs 的真實 Nominatim 實例。
  * @returns {Promise<{ batchFetchedAt: string, sourceResults: Array<{name: string, ok: boolean, stale: boolean, staleDays: number|null, written: number, staleDeleted: number, error: string|null}> }>}
  */
-async function writeAll(supabase) {
+async function writeAll(supabase, opts = {}) {
   const batchFetchedAt = new Date().toISOString();
   const sourceResults = [];
+  // 共用同一個 geocoder 實例：Nominatim 1 req/s 節流是跨 source 全域的，
+  // 不是每個 source 各自 1 req/s（避免多個需要 geocode 的來源疊加超過節流限制）。
+  const geocoder = opts.geocoder || createGeocoder();
 
   for (const source of SOURCES) {
     const result = { name: source.name, ok: false, stale: false, staleDays: null, written: 0, staleDeleted: 0, error: null };
     try {
       console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
       const { buffer, parse } = await fetchSourceBuffer(source);
-      const records = parse(buffer, batchFetchedAt);
+      let records = parse(buffer, batchFetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
+
+      if (source.needsGeocode) {
+        const existingCoords = await getExistingCoordsForSource(supabase, source.name);
+        const fillResult = await fillMissingCoords(
+          records,
+          existingCoords,
+          (address) => geocoder.geocode(address),
+          GEOCODE_MAX_CALLS_PER_RUN
+        );
+        records = fillResult.records;
+        console.error(
+          `[speed-camera-sync] ${source.name} geocode 補值：沿用 DB ${fillResult.reusedFromDb} 筆、` +
+            `新查 ${fillResult.geocodeAttempted} 筆（成功 ${fillResult.geocodeSucceeded}）、` +
+            `超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
+        );
+      }
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);
 
@@ -394,4 +454,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { syncAll, writeAll, writeSyncLog, SOURCES, sleep: realSleep };
+module.exports = {
+  syncAll,
+  writeAll,
+  writeSyncLog,
+  SOURCES,
+  sleep: realSleep,
+  getExistingCoordsForSource,
+  GEOCODE_MAX_CALLS_PER_RUN,
+};
