@@ -35,14 +35,24 @@ const {
   parseTaoyuan,
   parseTainan,
   parseTaichung,
+  parseNationalNpa,
 } = require('./lib/speed-camera-parser.cjs');
-const { toUpsertPayloads, coordLookupKey, fillMissingCoords } = require('./lib/speed-camera-writer.cjs');
+const {
+  toUpsertPayloads,
+  coordLookupKey,
+  fillMissingCoords,
+  dedupeAgainstExisting,
+} = require('./lib/speed-camera-writer.cjs');
 const { createGeocoder } = require('./lib/geocoder.cjs');
 
 // 單輪 --write 最多對 Nominatim 呼叫的 geocode 次數上限（見 fillMissingCoords）。
 // 台南首次回填 72 筆超過此上限時，需分多輪執行才能補完（下一輪起，已補到座標的
 // 地址會在 fillMissingCoords 第一步直接從 DB 沿用，不會重複呼叫 Nominatim）。
 const GEOCODE_MAX_CALLS_PER_RUN = Number(process.env.SPEEDCAM_GEOCODE_MAX_CALLS) || 100;
+
+// 全國集（national-npa）與六都自建源的執行期聯集去重距離門檻（公尺）。
+// 見 lib/speed-camera-writer.cjs dedupeAgainstExisting 與 docs/speed-camera-sources.md。
+const NATIONAL_NPA_DEDUPE_THRESHOLD_M = 30;
 
 // 各縣市原始資料下載連結（見 docs/speed-camera-sources.md 逐縣市細節）。
 //
@@ -96,6 +106,19 @@ const SOURCES = [
     url: 'https://www.police.taichung.gov.tw/filedownload?file=downlod/202605151635480.pdf&filedisplay=%E8%87%BA%E4%B8%AD%E5%B8%82%E6%94%BF%E5%BA%9C%E8%AD%A6%E5%AF%9F%E5%B1%80%E5%9F%B7%E8%A1%8C%E5%9B%BA%E5%AE%9A%E5%BC%8F%E7%A7%91%E5%AD%B8%E5%84%80%E5%99%A8%E5%9F%B7%E6%B3%95%E8%A8%AD%E5%82%99%E5%8F%96%E7%B7%A0%E5%9C%B0%E9%BB%9E%E4%B8%80%E8%A6%BD%E8%A1%A83.pdf&flag=doc',
     parse: parseTaichung,
     fallbackUrls: [],
+  },
+  {
+    // 警政署全國集「測速執法設置點」（data.gov.tw/dataset/7320）：涵蓋全 21 縣市
+    // （連江縣缺，見 docs/speed-camera-sources.md）。parseNationalNpa 只排除非縣市格式的
+    // 國道路段分類，**不**排除六都——六都與自建源的重複收錄改由 writeAll 在寫入前執行
+    // 「執行期聯集去重」（見 dedupeAgainstExisting）：與本輪其他六個自建源解析出的座標
+    // haversine ≤30m 視為同一支才丟棄，其餘（含六都的獨有點位）保留。
+    // 必須排在 SOURCES 陣列最後，writeAll 才能在處理它之前先收集完其他六源的座標。
+    name: 'national-npa',
+    url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/8B41C4A6-FDC4-4971-98BA-7FFCFE1C294C/download',
+    parse: parseNationalNpa,
+    fallbackUrls: [],
+    dedupeAgainstOtherSources: true,
   },
 ];
 
@@ -252,13 +275,35 @@ async function getExistingCoordsForSource(supabase, sourceName) {
 async function syncAll() {
   const fetchedAt = new Date().toISOString();
   const results = [];
+  // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析出的座標點位
+  // （dry-run 不連 DB，台南無 geocode 補值，座標為 null，不會參與比對，見
+  // dedupeAgainstExisting 的說明；行為與 --write 模式一致地繼承這個既有限制）。
+  const collectedPoints = [];
 
   for (const source of SOURCES) {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
     try {
       const { buffer, parse } = await fetchSourceBuffer(source);
-      const records = await parse(buffer, fetchedAt);
+      let records = await parse(buffer, fetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
+
+      if (source.dedupeAgainstOtherSources) {
+        const before = records.length;
+        const { kept, droppedCount } = dedupeAgainstExisting(
+          records,
+          collectedPoints,
+          NATIONAL_NPA_DEDUPE_THRESHOLD_M
+        );
+        records = kept;
+        console.error(
+          `[speed-camera-sync] ${source.name} 聯集去重：原始 ${before} 筆 → 與既有源重疊丟棄 ${droppedCount} 筆 → 保留 ${records.length} 筆`
+        );
+      } else {
+        for (const r of records) {
+          if (r.lat != null && r.lng != null) collectedPoints.push({ lat: r.lat, lng: r.lng });
+        }
+      }
+
       results.push(...records);
     } catch (err) {
       console.error(`[speed-camera-sync] ${source.name} 失敗：${err.message}`);
@@ -284,6 +329,9 @@ async function writeAll(supabase, opts = {}) {
   // 共用同一個 geocoder 實例：Nominatim 1 req/s 節流是跨 source 全域的，
   // 不是每個 source 各自 1 req/s（避免多個需要 geocode 的來源疊加超過節流限制）。
   const geocoder = opts.geocoder || createGeocoder();
+  // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析（含台南 geocode
+  // 補值後）的座標點位，見 SOURCES 內 national-npa 項與 dedupeAgainstExisting 說明。
+  const collectedPoints = [];
 
   for (const source of SOURCES) {
     const result = { name: source.name, ok: false, stale: false, staleDays: null, written: 0, staleDeleted: 0, error: null };
@@ -307,6 +355,23 @@ async function writeAll(supabase, opts = {}) {
             `新查 ${fillResult.geocodeAttempted} 筆（成功 ${fillResult.geocodeSucceeded}）、` +
             `超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
         );
+      }
+
+      if (source.dedupeAgainstOtherSources) {
+        const before = records.length;
+        const { kept, droppedCount } = dedupeAgainstExisting(
+          records,
+          collectedPoints,
+          NATIONAL_NPA_DEDUPE_THRESHOLD_M
+        );
+        records = kept;
+        console.error(
+          `[speed-camera-sync] ${source.name} 聯集去重：原始 ${before} 筆 → 與既有源重疊丟棄 ${droppedCount} 筆 → 保留 ${records.length} 筆`
+        );
+      } else {
+        for (const r of records) {
+          if (r.lat != null && r.lng != null) collectedPoints.push({ lat: r.lat, lng: r.lng });
+        }
       }
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);

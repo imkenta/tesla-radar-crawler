@@ -16,6 +16,8 @@ const {
   isStale,
   coordLookupKey,
   fillMissingCoords,
+  haversineMeters,
+  dedupeAgainstExisting,
 } = require('../lib/speed-camera-writer.cjs');
 
 test('toUpsertPayload：direction 為 null 正規化成空字串', () => {
@@ -224,4 +226,98 @@ test('fillMissingCoords：混合情境——已有座標/DB沿用/新geocode/查
   assert.equal(result.reusedFromDb, 1);
   assert.equal(result.geocodeAttempted, 2); // 只有地址C、地址D 呼叫（地址A有座標不查、地址B沿用DB不查）
   assert.equal(result.geocodeSucceeded, 1);
+});
+
+// --- haversineMeters / dedupeAgainstExisting（全國集執行期聯集去重） ---
+
+test('haversineMeters：同一點距離為 0', () => {
+  assert.equal(haversineMeters(25.0745, 121.5199, 25.0745, 121.5199), 0);
+});
+
+test('haversineMeters：已知兩點距離約略正確（新北市八里區同址飄移約 1.7 公尺）', () => {
+  const d = haversineMeters(25.14027, 121.38151, 25.14028, 121.38152);
+  assert.ok(d > 0 && d < 5, `預期 0~5 公尺，實際 ${d}`);
+});
+
+test('haversineMeters：相距明顯遙遠的兩點（台北 vs 金門，實測約 319 公里）', () => {
+  const d = haversineMeters(25.0745, 121.5199, 24.4588, 118.4315);
+  assert.ok(d > 300_000 && d < 340_000, `預期約 300~340 公里，實際 ${d} 公尺`);
+});
+
+test('dedupeAgainstExisting：距離在門檻內（同一支）→ 丟棄', () => {
+  const nationalRecords = [{ city: '新北市', address: 'a', lat: 25.14028, lng: 121.38152 }];
+  const existingPoints = [{ lat: 25.14027, lng: 121.38151 }];
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, existingPoints, 30);
+  assert.equal(kept.length, 0);
+  assert.equal(droppedCount, 1);
+});
+
+test('dedupeAgainstExisting：距離超過門檻（不同支）→ 保留', () => {
+  // 兩點相距約 240 公里，遠超 30m 門檻
+  const nationalRecords = [{ city: '金門縣', address: 'a', lat: 24.4588, lng: 118.4315 }];
+  const existingPoints = [{ lat: 25.0745, lng: 121.5199 }];
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, existingPoints, 30);
+  assert.equal(kept.length, 1);
+  assert.equal(droppedCount, 0);
+  assert.deepEqual(kept[0], nationalRecords[0]);
+});
+
+test('dedupeAgainstExisting：門檻邊界——剛好在門檻內外的兩筆分別判同/判異', () => {
+  // 以基準點 (25,121) 為中心，構造一筆距離明顯 <30m、一筆明顯 >30m 的全國集紀錄
+  const base = { lat: 25, lng: 121 };
+  // 緯度 1 度約 111km，0.0001 度約 11.1m（< 30m）
+  const near = { city: 'X', address: 'near', lat: 25.0001, lng: 121 };
+  // 0.001 度約 111m（> 30m）
+  const far = { city: 'Y', address: 'far', lat: 25.001, lng: 121 };
+
+  const { kept, droppedCount } = dedupeAgainstExisting([near, far], [base], 30);
+  assert.equal(droppedCount, 1);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].address, 'far');
+});
+
+test('dedupeAgainstExisting：不比對 direction/方向——純距離判斷，方向描述不同也視為同一支', () => {
+  // 見 dedupeAgainstExisting 文件註解：各 source 方向欄位語意不統一，
+  // 勉強比對方向反而容易漏丟重複點，因此設計上刻意不比對 direction。
+  const nationalRecords = [{ city: '新北市', address: 'a', direction: '往八里', lat: 25.14028, lng: 121.38152 }];
+  const existingPoints = [{ lat: 25.14027, lng: 121.38151, direction: '往淡水' }]; // 方向描述完全不同
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, existingPoints, 30);
+  assert.equal(droppedCount, 1);
+  assert.equal(kept.length, 0);
+});
+
+test('dedupeAgainstExisting：existingPoints 為空陣列 → 全部保留', () => {
+  const nationalRecords = [
+    { city: 'A', address: 'a', lat: 25, lng: 121 },
+    { city: 'B', address: 'b', lat: 24, lng: 120 },
+  ];
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, [], 30);
+  assert.equal(kept.length, 2);
+  assert.equal(droppedCount, 0);
+});
+
+test('dedupeAgainstExisting：existingPoints 內混雜無座標(lat/lng null)的既有列 → 該列不參與比對，不誤判', () => {
+  const nationalRecords = [{ city: '臺南市', address: 'a', lat: 23.0, lng: 120.2 }];
+  // 台南自建源本身若尚未 geocode，既有點位 lat/lng 會是 null——這種列必須被忽略，
+  // 不能讓 null vs 數字的比較意外判定為距離 0（同一支）。
+  const existingPoints = [{ lat: null, lng: null }];
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, existingPoints, 30);
+  assert.equal(kept.length, 1);
+  assert.equal(droppedCount, 0);
+});
+
+test('dedupeAgainstExisting：全國集紀錄混合重疊與獨有 → 各自正確分流，且保留原順序', () => {
+  const overlapping = { city: '新北市', address: '重疊點', lat: 25.14028, lng: 121.38152 };
+  const unique1 = { city: '金門縣', address: '獨有點1', lat: 24.458809, lng: 118.43147 };
+  const unique2 = { city: '宜蘭縣', address: '獨有點2', lat: 24.778543, lng: 121.75933 };
+  const existingPoints = [{ lat: 25.14027, lng: 121.38151 }];
+
+  const { kept, droppedCount } = dedupeAgainstExisting(
+    [overlapping, unique1, unique2],
+    existingPoints,
+    30
+  );
+
+  assert.equal(droppedCount, 1);
+  assert.deepEqual(kept, [unique1, unique2]);
 });

@@ -23,6 +23,8 @@ const {
   parseTaoyuan,
   parseTainan,
   parseTaichung,
+  parseNationalNpa,
+  isEligibleNationalNpaCity,
   cleanTainanLocation,
   toSpeedLimit,
   toCoord,
@@ -438,6 +440,95 @@ test('parseTaichung：文字型 PDF（非掃描），跨頁抽取、備註換行
     source: 'taichung',
     fetched_at: FIXED_NOW,
   });
+});
+
+test('parseNationalNpa：UTF-8 BOM CSV，雙層表頭（英文欄位名+中文說明列）正確跳過、國道路段分類排除、六都不在 parser 層排除（golden）', () => {
+  // fixture 節錄自 data.gov.tw/dataset/7320「測速執法設置點」真實下載（2026-07-05，
+  // 見 docs/speed-camera-sources.md）：金門縣x2、宜蘭縣、臺北市（六都，parser 層保留，
+  // 六都與自建源的重複收錄改由 speed-camera-sync.cjs 執行期聯集去重處理）、
+  // 國道一號（非縣市格式，parser 層排除）、嘉義市，共 7 筆原始列。
+  const buf = fixtureBuffer('speed-camera-national-npa.csv');
+  const result = parseNationalNpa(buf, FIXED_NOW);
+
+  assert.equal(result.length, 5); // 6 筆原始資料列（金門x2/宜蘭/臺北/國道一號/嘉義）- 1 筆國道一號（非縣市格式）
+  assert.deepEqual(result, [
+    {
+      city: '金門縣',
+      address: '金湖鎮 金湖鎮黃海路(陽明湖路段)',
+      road: '金湖鎮黃海路(陽明湖路段)',
+      direction: '南北雙向',
+      speed_limit: 60,
+      lat: 24.458809,
+      lng: 118.43147,
+      source: 'national-npa',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      city: '金門縣',
+      address: '金城鎮 金城鎮西海路一段(水頭路段)',
+      road: '金城鎮西海路一段(水頭路段)',
+      direction: '東西雙向',
+      speed_limit: 50,
+      lat: 24.411718,
+      lng: 118.29999,
+      source: 'national-npa',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      city: '宜蘭縣',
+      address: '宜蘭市 台9線78k中山路五段南下',
+      road: '台9線78k中山路五段南下',
+      direction: '南北雙向',
+      speed_limit: 60,
+      lat: 24.778543,
+      lng: 121.75933,
+      source: 'national-npa',
+      fetched_at: FIXED_NOW,
+    },
+    {
+      // 臺北市（六都）：RegionName 為空字串，address 只保留 Address；
+      // parser 層不排除六都，見上方測試說明。
+      city: '臺北市',
+      address: '自強隧道區間測速',
+      road: '自強隧道區間測速',
+      direction: '南北雙向',
+      speed_limit: 50,
+      lat: 25.090601,
+      lng: 121.549255,
+      source: 'national-npa',
+      fetched_at: FIXED_NOW,
+    },
+    // 「國道一號」（非縣市格式，CityName 不以市/縣結尾）這筆被排除，不出現在輸出中。
+    {
+      city: '嘉義市',
+      address: '東區 忠孝路與義教街口',
+      road: '忠孝路與義教街口',
+      direction: '南向北(超速闖紅燈)',
+      speed_limit: 50,
+      lat: 23.498264,
+      lng: 120.4515,
+      source: 'national-npa',
+      fetched_at: FIXED_NOW,
+    },
+  ]);
+
+  // 座標抽驗：全數落在台灣地理範圍（大略 lat 21-26、lng 118-123）
+  for (const r of result) {
+    assert.ok(r.lat > 21 && r.lat < 26, `lat 超出範圍：${r.lat}`);
+    assert.ok(r.lng > 118 && r.lng < 123, `lng 超出範圍：${r.lng}`);
+  }
+});
+
+test('isEligibleNationalNpaCity：縣市格式（市/縣結尾）為 true，國道/公路路段分類為 false', () => {
+  assert.equal(isEligibleNationalNpaCity('金門縣'), true);
+  assert.equal(isEligibleNationalNpaCity('臺北市'), true); // 六都不在此排除
+  assert.equal(isEligibleNationalNpaCity('嘉義市'), true);
+  assert.equal(isEligibleNationalNpaCity('國道一號'), false);
+  assert.equal(isEligibleNationalNpaCity('國道3甲'), false);
+  assert.equal(isEligibleNationalNpaCity('台2已線'), false);
+  assert.equal(isEligibleNationalNpaCity(''), false);
+  assert.equal(isEligibleNationalNpaCity(null), false);
+  assert.equal(isEligibleNationalNpaCity(undefined), false);
 });
 
 test('toSpeedLimit：非數字/空值一律回傳 null，不可拋例外', () => {
