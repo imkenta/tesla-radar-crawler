@@ -34,6 +34,7 @@ const {
   parseKaohsiungJson,
   parseTaoyuan,
   parseTainan,
+  parseTaichung,
 } = require('./lib/speed-camera-parser.cjs');
 const { toUpsertPayloads, coordLookupKey, fillMissingCoords } = require('./lib/speed-camera-writer.cjs');
 const { createGeocoder } = require('./lib/geocoder.cjs');
@@ -87,6 +88,14 @@ const SOURCES = [
     fallbackUrls: [],
     // 台南來源無座標欄位，--write 模式需在 upsert 前跑 geocode 補值（見 writeAll）。
     needsGeocode: true,
+  },
+  {
+    // 台中無結構化開放資料，來源是官方 PDF（文字型，非掃描，見 lib/speed-camera-parser.cjs
+    // parseTaichung 與 docs/speed-camera-sources.md）。已含座標，不需 geocode。
+    name: 'taichung',
+    url: 'https://www.police.taichung.gov.tw/filedownload?file=downlod/202605151635480.pdf&filedisplay=%E8%87%BA%E4%B8%AD%E5%B8%82%E6%94%BF%E5%BA%9C%E8%AD%A6%E5%AF%9F%E5%B1%80%E5%9F%B7%E8%A1%8C%E5%9B%BA%E5%AE%9A%E5%BC%8F%E7%A7%91%E5%AD%B8%E5%84%80%E5%99%A8%E5%9F%B7%E6%B3%95%E8%A8%AD%E5%82%99%E5%8F%96%E7%B7%A0%E5%9C%B0%E9%BB%9E%E4%B8%80%E8%A6%BD%E8%A1%A83.pdf&flag=doc',
+    parse: parseTaichung,
+    fallbackUrls: [],
   },
 ];
 
@@ -248,7 +257,7 @@ async function syncAll() {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
     try {
       const { buffer, parse } = await fetchSourceBuffer(source);
-      const records = parse(buffer, fetchedAt);
+      const records = await parse(buffer, fetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       results.push(...records);
     } catch (err) {
@@ -281,7 +290,7 @@ async function writeAll(supabase, opts = {}) {
     try {
       console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
       const { buffer, parse } = await fetchSourceBuffer(source);
-      let records = parse(buffer, batchFetchedAt);
+      let records = await parse(buffer, batchFetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
 
       if (source.needsGeocode) {

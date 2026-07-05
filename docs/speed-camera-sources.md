@@ -12,7 +12,7 @@
 | 新北市 | [固定式測速照相（全市總表）](https://data.ntpc.gov.tw/datasets/99f3ff6e-0352-4399-a726-775ab765a1dc) | CSV | 有（longitude/latitude） | 不定期 | UTF-8 (BOM) | 190 筆 | ✅ |
 | 桃園市 | [桃園市固定式測速照相](https://data.gov.tw/dataset/25935) | CSV | 有（經度/緯度，⚠️部分列順序相反，見下） | 不定期 | **Big5**（需轉碼） | 171 筆 | ✅（R8） |
 | 高雄市 | [111年固定式違規照相設備及科技執法](https://data.gov.tw/dataset/148455) | CSV/JSON | 有（座標緯N度/座標經E度，非標準欄位命名） | 不定期 | UTF-8 (BOM) | 248 筆 | ✅ |
-| 台中市 | 見下方「台中市」章節（R8 PDF spike） | PDF | — | — | — | — | ❌ 掃描型 PDF，不實作（見證據） |
+| 台中市 | [固定式科學儀器執法設備取締地點一覽表](https://www.police.taichung.gov.tw/traffic/home.jsp?id=55&parentpath=0,5,53) | PDF（文字型） | 有（座標緯度/座標經度） | 不定期 | UTF-8（PDF 文字層） | 229 筆 | ✅（R8，PDF spike 判定為文字型，已實作） |
 | 台南市 | [智慧管理科技執法設備設置地點](https://data.tainan.gov.tw/Resource/1c7e82f0-d6b2-4b20-aeff-5c768100f82c) | CSV/JSON | 無（geocode 補值） | 最後更新 2025-12-26 | UTF-8 (BOM) | 72 筆 | ✅（R8，geocode） |
 
 ## 逐縣市細節
@@ -52,10 +52,28 @@
 - 陷阱1：Big5 編碼；地址是片段（如「成功路三段235號前」），不含行政區全名，組完整地址需拼接「設置行政區」欄位。
 - 陷阱2（R8 實測發現，文件未記載）：表頭寫「經度,緯度」，但**只有「固定式測速照相設備」類型該兩欄順序與表頭一致**；「路口多功能測速照相設備」「區間平均速率測速照相設備」兩種類型（全檔 171 筆中 58 筆）該兩欄實際是「緯度,經度」（順序相反）。`parseTaoyuan`（`lib/speed-camera-parser.cjs`）改用數值大小判斷：台灣經度（~119-122）恆大於緯度（~21-27），取兩欄中較大者為經度，不依欄位名/順序假設。實測 171 筆全數落在台灣經緯度範圍內（lat 24.79-25.12、lng 121.01-121.41）。
 
-### 台中市 —— 查無開放資料
-- 台中市政府資料開放平台（opendata.taichung.gov.tw）搜尋「科技執法」「固定式測速照相」查無對應資料集。
-- 台中市政府警察局交通警察大隊網站僅提供 **PDF** 版「科學儀器執法設備固定式及移動式取締地點一覽表」，非結構化開放資料，不適合程式化解析（PDF table 解析成本高且格式易變動，本輪不做）。
-- 若未來要涵蓋台中，選項：(a) 定期人工下載 PDF 後用 pdf-parse 抽表格，準確度需人工複核；(b) 等待台中市政府釋出結構化資料。
+### 台中市 —— 查無結構化開放資料，PDF spike（R8）判定文字型、已實作（source=`taichung`）
+- 台中市政府資料開放平台（opendata.taichung.gov.tw）搜尋「科技執法」「固定式測速照相」查無對應資料集，確認仍只有 PDF。
+- 資料集：`臺中市政府警察局「固定式科學儀器執法設備」取締地點一覽表(115年3月10日)`
+- 官方來源頁面（表單下載）：
+  `https://www.police.taichung.gov.tw/traffic/home.jsp?id=55&parentpath=0,5,53`
+- 下載連結（PDF，2026-07-05 實測下載驗證，845835 bytes，14 頁）：
+  `https://www.police.taichung.gov.tw/filedownload?file=downlod/202605151635480.pdf&filedisplay=...&flag=doc`
+  （filedisplay 為 URL-encoded 中文檔名，見 `speed-camera-sync.cjs` SOURCES 內完整字串；下載連結非 session-based，重複下載 md5 一致，可穩定排程抓取。）
+- **PDF spike 判定過程與證據**：
+  1. `pdftotext -layout`（poppler）與 Node `pdf-parse`（`PDFParse.getText()`）兩種獨立工具分別抽取，皆取得**與視覺呈現一致的完整文字層**（非空白、非亂碼），確認為**文字型 PDF，非掃描影像**——若為掃描型，這兩種工具皆只能拿到空字串或需要 OCR。
+  2. 全 14 頁、229 筆記錄逐筆比對：每筆的「編號」連續遞增 1~229（`sequential? True`）、每筆座標皆落在台中市地理範圍（緯度 23.5-24.6、經度 120.4-121.0，零筆超出）、`(行政區+設置地點, 拍攝方向)` 組合零重複，確認表格結構規律可靠，不是排版混亂的自由格式文字。
+  3. 判定：**文字型且表格結構可靠 → 依規格實作 parser**（未使用 OCR）。
+- **版面解析規則**（`parseTaichung`，`lib/speed-camera-parser.cjs`）：每筆紀錄的欄位跨 2 行（少數因備註/取締項目換行變 3-4 行）：
+  ```
+  <編號> <行政區> <設置地點>[ (備註，如往XX方向) ]
+  <取締項目（可能再換行）> <座標緯度> <座標經度> <拍攝方向> <速限> <管轄單位>[ ※]
+  ```
+  以「行首為『數字 + 空白 + X區 + 空白』」判斷新紀錄起點；座標列尾端固定為「緯度 經度 方向 速限 XX分局」正則比對（容許尾端多印一個 `※` 註記符號，無額外語意，忽略）。
+- **新增依賴**：`pdf-parse@2.4.5`（已加入 `package.json`/`package-lock.json`）。其 2.x 版 API 為 `PDFParse` class + `getText()`（非 1.x 的函式呼叫），文字抽取為非同步 API，`parseTaichung` 因此為 `async function`（`speed-camera-sync.cjs` 呼叫端已改為 `await parse(...)`，其餘同步 parser 不受影響）。
+- 座標已含在來源資料中（「座標緯度/座標經度」欄位），**不需要 geocode**。
+- 「取締項目」欄位混合「闖紅燈」「不依標誌、標線、號誌指示行駛」「超速」等多種類型（同新北市/台南模式，保留原始資料不篩選）。
+- 若未來 PDF 改版導致版面結構跑掉：`parseTaichung` 對抽不到座標的記錄只會印一行警告並略過該筆（見原始碼 `flush()` 內 `console.error`），不會拋例外中斷整個 source，但需留意此時筆數會明顯低於 229，屬於需要人工複核版面規則的訊號。
 
 ### 台南市 —— 無座標，R8 已實作 geocode 補值流程（source=`tainan`）
 - 資料集：`臺南市智慧管理科技執法設備設置地點`

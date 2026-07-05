@@ -22,6 +22,7 @@ const {
   parseKaohsiungJson,
   parseTaoyuan,
   parseTainan,
+  parseTaichung,
   cleanTainanLocation,
   toSpeedLimit,
   toCoord,
@@ -381,6 +382,62 @@ test('cleanTainanLocation：開頭標籤與結尾違規列舉皆正確去除', (
   );
   assert.equal(cleanTainanLocation(''), '');
   assert.equal(cleanTainanLocation(null), '');
+});
+
+test('parseTaichung：文字型 PDF（非掃描），跨頁抽取、備註換行、座標欄位皆正確解析（golden）', async () => {
+  // fixture 為官方「固定式科學儀器執法設備」取締地點一覽表 PDF 的前 2 頁節錄
+  // （2026-07-05 從 police.taichung.gov.tw 表單下載頁面實測下載，全 14 頁 229 筆已驗證
+  // 為文字層非掃描影像；本 fixture 涵蓋跨頁抽取 31 筆，含備註換行「(往XX方向)」case）。
+  const buf = fixtureBuffer('speed-camera-taichung.pdf');
+  const result = await parseTaichung(buf, FIXED_NOW);
+
+  assert.equal(result.length, 31);
+  assert.deepEqual(result[0], {
+    city: '臺中市',
+    address: '中區 中區建國路與民權路口',
+    road: '中區建國路與民權路口',
+    direction: '西往東',
+    speed_limit: 50,
+    lat: 24.13584,
+    lng: 120.68225,
+    source: 'taichung',
+    fetched_at: FIXED_NOW,
+  });
+  assert.deepEqual(result[1], {
+    city: '臺中市',
+    address: '中區 中區三民路三段與公園路口',
+    road: '中區三民路三段與公園路口',
+    direction: '北往南',
+    speed_limit: 50,
+    lat: 24.14563,
+    lng: 120.68389,
+    source: 'taichung',
+    fetched_at: FIXED_NOW,
+  });
+  // 第 15 筆：設置地點後方有備註換行「(往五權路方向)」，應併入 address/road
+  assert.deepEqual(result[14], {
+    city: '臺中市',
+    address: '北區 北區三民路三段與崇德路一段路口 (往五權路方向)',
+    road: '北區三民路三段與崇德路一段路口 (往五權路方向)',
+    direction: '北往南',
+    speed_limit: 50,
+    lat: 24.15467,
+    lng: 120.68617,
+    source: 'taichung',
+    fetched_at: FIXED_NOW,
+  });
+  // 最後一筆（跨頁後第 31 筆，第 2 頁最末列，驗證跨頁銜接無遺漏無錯位）
+  assert.deepEqual(result[30], {
+    city: '臺中市',
+    address: '南區 南區復興路一段129號前',
+    road: '南區復興路一段129號前',
+    direction: '東往西',
+    speed_limit: 60,
+    lat: 24.11106,
+    lng: 120.64844,
+    source: 'taichung',
+    fetched_at: FIXED_NOW,
+  });
 });
 
 test('toSpeedLimit：非數字/空值一律回傳 null，不可拋例外', () => {
