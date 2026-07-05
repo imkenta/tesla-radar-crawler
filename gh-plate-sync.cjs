@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, nextLadderState, classifyQuotaError, isServerError, QUOTA_PER_MINUTE } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isServerError, QUOTA_PER_DAY } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -122,41 +122,54 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 
 // --- AI Manager (Failover Support) ---
 //
-// Key 分流（不動）：每個 shard 各自獨立的 GEMINI_API_KEY_{SHARD}，缺省退回 GEMINI_API_KEY。
-// 模型階梯（per-instance/per-process 狀態，三個 shard 各自獨立，不共用不寫檔）：
-// gemma-4-26b-a4b-it → 3 次失敗 → gemma-4-31b-it → 2 次失敗 → gemini-3.1-flash-lite
-// → 2 次失敗 → gemini-3-flash-preview → 1 次失敗 → EXHAUSTED（交回既有失敗處理 / Tesseract 路徑）。
-// 升級後 sticky：不會降回較低層級。純階梯邏輯見 lib/ai-model-ladder.cjs（可測、與此處分離）。
-//
-// 429 分流（2026-07-05 新增，見 classifyQuotaError）：
-// - 每分鐘限流 → 退避（retry-after 或 20s）後同層重試一次，不計入升級門檻。
-// - 每日配額耗盡 → 本層本輪直接標死，強制升級，不浪費重試次數。
+// 狀態機純邏輯在 lib/ai-model-ladder.cjs 的 LadderState（可測）；此處只做 I/O（API 呼叫、
+// 退避 sleep、log、SDK 重建）。2026-07-05 三次修正，依三 shard 實戰 log：
+// - 階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemma-4-31b-it(敗2)
+//   → gemini-3.1-flash-lite(敗2) → gemini-3-flash-preview(敗1) → EXHAUSTED。
+// - 連續失敗才升級：成功呼叫重置當前層失敗計數（v1 累計語義讓中區在多次成功之間
+//   累積零星 500 也升級到已死的 31B——已修）。
+// - key 協同：同一層先試 shard key（GEMINI_API_KEY_{SHARD}），該 (key, model) 被日配額
+//   標死才試 DEFAULT key（GEMINI_API_KEY），兩者皆死才升層。取代 v1 的 sticky
+//   switchToFallback——v1 任何 429（含分鐘級）都永久切到 DEFAULT key，會把三個 shard
+//   的分鐘級突發全壓到同一把共用 key 上，反而害它也被限流。
+// - 429 分流：quotaId 含 PerDay → 該 (key, model) 本輪標死、立即跳選，絕不退避重試；
+//   PerMinute 或無 PerDay 字樣 → 退避（RetryInfo.retryDelay 或 20s）同 combo 重試 1 次，
+//   成功不計數。
+// - 5xx → 退避 5-10 秒同 combo 重試 1 次，成功不計數，再失敗才計入升級門檻。
+// 狀態 per-instance/per-process：三個 shard 各自獨立，不共用不寫檔。
 class AIManager {
     constructor(shard) {
         this.shard = shard;
         this.shardKeyName = shard ? `GEMINI_API_KEY_${shard.toUpperCase()}` : null;
-        this.primaryKey = this.shardKeyName ? process.env[this.shardKeyName] : null;
-        this.fallbackKey = process.env.GEMINI_API_KEY;
 
-        this.currentKey = this.primaryKey || this.fallbackKey;
-        this.isUsingFallback = !this.primaryKey;
-        this.instance = null;
-        this.model = null;
-
-        // 模型階梯狀態：this 上的欄位＝per-instance，每個 process（= 每個 shard）各自一份。
-        this.ladderTierIndex = 0;
-        this.ladderFailureCount = 0;
-        this.modelName = MODEL_LADDER[this.ladderTierIndex].model;
-
-        this.init();
-    }
-
-    init() {
-        if (!this.currentKey) {
+        // key 候選（優先序：shard key → DEFAULT key）。值相同視為同一把 key（同一配額池）
+        // 去重，否則死亡標記會失真（標死 shard 名卻從 DEFAULT 名繼續打同一個池）。
+        this.keysByName = new Map();
+        if (this.shardKeyName && process.env[this.shardKeyName]) {
+            this.keysByName.set(this.shardKeyName, process.env[this.shardKeyName]);
+        }
+        const defaultKey = process.env.GEMINI_API_KEY;
+        if (defaultKey && !Array.from(this.keysByName.values()).includes(defaultKey)) {
+            this.keysByName.set('GEMINI_API_KEY', defaultKey);
+        }
+        if (this.keysByName.size === 0) {
             console.error("[AI] Fatal: No API key available.");
             process.exit(1);
         }
-        this.instance = new GoogleGenerativeAI(this.currentKey);
+
+        this.ladder = new LadderState(Array.from(this.keysByName.keys()));
+        this.instance = null;
+        this.model = null;
+        this.init();
+    }
+
+    // 「本次實際使用」的模型／key——所有 log 標籤讀這裡，不讀基礎常數 MODEL_NAME
+    // （v1 bug：solveCaptcha 標籤印基礎模型、實際打的是升級後模型，除錯被誤導）。
+    get modelName() { return this.ladder.model; }
+    get currentKeyName() { return this.ladder.keyName; }
+
+    init() {
+        this.instance = new GoogleGenerativeAI(this.keysByName.get(this.currentKeyName));
         this.model = this.instance.getGenerativeModel({
             model: this.modelName,
             // 2026-07-05：26B 實戰會把整段思考碎念吐進回應（例："M8L_ (Wait, let me
@@ -170,96 +183,74 @@ class AIManager {
                 maxOutputTokens: 16,
             },
         });
-        const source = this.isUsingFallback ? "DEFAULT_KEY" : (this.shardKeyName || "DEFAULT_KEY");
-        console.log(`[AI] Initialized using: ${source} / model: ${this.modelName}`);
-    }
-
-    async switchToFallback() {
-        if (this.isUsingFallback || !this.fallbackKey || this.fallbackKey === this.currentKey) return false;
-
-        console.log(`\n⚠️  [AI] Quota hit on ${this.shardKeyName}. Switching to fallback GEMINI_API_KEY...`);
-        this.currentKey = this.fallbackKey;
-        this.isUsingFallback = true;
-        this.init();
-        return true;
-    }
-
-    // API 層失敗累計後嘗試升級模型階梯。回傳 true＝已升級（重新 init 換 model，key 不變）。
-    // 回傳 false＝尚未達門檻，或已在最後一層且判定 EXHAUSTED（呼叫端需自行處理耗盡情形）。
-    //
-    // forceEscalate＝true（每日配額耗盡場景）：不論目前累計了幾次失敗，直接視為已達
-    // 本層升級門檻，立即升層——每日耗盡不會因為多等幾次重試就恢復，沒有必要浪費
-    // failuresToEscalate 次數的重試機會（那些重試只會原地再吃 429）。
-    escalateModelTier(forceEscalate = false) {
-        const currentThreshold = MODEL_LADDER[this.ladderTierIndex].failuresToEscalate;
-        this.ladderFailureCount = forceEscalate
-            ? Math.max(this.ladderFailureCount + 1, currentThreshold)
-            : this.ladderFailureCount + 1;
-        const next = nextLadderState(this.ladderTierIndex, this.ladderFailureCount);
-        if (next === EXHAUSTED) {
-            return false;
-        }
-        if (next.tierIndex === this.ladderTierIndex) {
-            return false; // 未達升級門檻，停留原層級
-        }
-        console.log(`\n⚠️  [AI] ${MODEL_LADDER[this.ladderTierIndex].model} 累計失敗 ${this.ladderFailureCount} 次，升級至 ${next.model}...`);
-        this.ladderTierIndex = next.tierIndex;
-        this.ladderFailureCount = 0; // 新層級的失敗計數歸零重新累計
-        this.modelName = next.model;
-        this.init(); // 只換 model，key（this.currentKey）不變
-        return true;
+        console.log(`[AI] Initialized using: ${this.currentKeyName} / model: ${this.modelName}`);
     }
 
     async generateContent(payload) {
-        try {
-            return await this.model.generateContent(payload);
-        } catch (e) {
-            // Check if it's a quota error (429 or similar) — key 層 fallback（不動既有邏輯）
-            if (e.message.includes('429') || e.message.toLowerCase().includes('quota') || e.message.toLowerCase().includes('limit')) {
-                const switchedKey = await this.switchToFallback();
-                if (switchedKey) {
-                    console.log('🔄 [AI] Retrying with fallback key...');
-                    return await this.model.generateContent(payload);
+        // 迴圈有界：日配額死亡矩陣單調成長（≤ keys×tiers 個組合）、分鐘級/5xx 退避
+        // 各限重試 1 次（per-call 旗標）、一般失敗要嘛升級（≤ 層數次）要嘛 throw。
+        let minuteRetried = false;
+        let serverRetried = false;
+        for (;;) {
+            // EXHAUSTED 之後 ladder 仍指向最後一個（已死）combo：快速失敗，絕不再打已標死組合。
+            if (this.ladder.isCurrentComboDead()) {
+                throw new Error(`[AI] 階梯耗盡：所有 (key, model) 組合本輪已標死（最後停在 ${this.currentKeyName}/${this.modelName}）`);
+            }
+            try {
+                const result = await this.model.generateContent(payload);
+                this.ladder.recordSuccess(); // 連續失敗語義：任何成功都重置當前層失敗計數
+                return result;
+            } catch (e) {
+                const quota = classifyQuotaError(e);
+
+                // 日配額耗盡（quotaId 含 PerDay）→ 該 (key, model) 本輪標死、立即跳選。
+                // RetryInfo.retryDelay 對日配額無意義，絕不退避重試。
+                if (quota.isQuotaError && quota.quotaWindow === QUOTA_PER_DAY) {
+                    const deadCombo = `${this.currentKeyName}/${this.modelName}`;
+                    const prevTier = this.ladder.tierIndex;
+                    const next = this.ladder.markCurrentComboDead();
+                    console.log(`💀 [AI] 日配額耗盡，標死 ${deadCombo}（本輪不再嘗試）`);
+                    if (next === EXHAUSTED) {
+                        console.log('🛑 [AI] 所有 (key, model) 組合皆已標死，交回既有失敗處理。');
+                        throw e;
+                    }
+                    const kind = next.tierIndex === prevTier ? '同層換 key' : '跳層';
+                    console.log(`🔀 [AI] ${kind} → ${this.currentKeyName}/${this.modelName}`);
+                    this.init();
+                    continue;
                 }
-            }
 
-            // 429 分流：區分「每分鐘限流」vs「每日配額耗盡」，避免分鐘限流誤耗升級門檻的失敗計數。
-            const quota = classifyQuotaError(e);
-            if (quota.isQuotaError && quota.quotaWindow === QUOTA_PER_MINUTE) {
-                const waitMs = quota.retryAfterMs || 20000;
-                console.log(`⏳ [AI] ${this.modelName} 每分鐘限流，退避 ${Math.ceil(waitMs / 1000)}s 後同層重試（不計入升級門檻）...`);
-                await new Promise((resolve) => setTimeout(resolve, waitMs));
-                try {
-                    return await this.model.generateContent(payload);
-                } catch (retryErr) {
-                    e = retryErr; // 重試仍失敗 → 落入下方一般升級路徑處理
+                // 分鐘級限流（PerMinute 或 429 但無 PerDay 字樣）→ 退避後同 combo 重試
+                // 1 次，成功不計入升級門檻；再失敗落入下方一般計數。
+                if (quota.isQuotaError && !minuteRetried) {
+                    minuteRetried = true;
+                    const waitMs = quota.retryAfterMs || 20000;
+                    console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 分鐘級限流，退避 ${Math.ceil(waitMs / 1000)}s 後同層重試（不計入升級門檻）...`);
+                    await new Promise((resolve) => setTimeout(resolve, waitMs));
+                    continue;
                 }
-            }
 
-            // 5xx 退避（2026-07-05 新增）：Google 端暫時性伺服器錯誤，與配額無關。
-            // 26B 間歇性回 500，短暫退避後同層重試往往就成功，不該讓瞬斷直接算進升級
-            // 門檻的失敗計數（那會讓 26B 因單純運氣不好被過早踢下主力層）。只重試 1 次，
-            // 再失敗才落入下方一般升級路徑（計入該層失敗計數）。
-            if (isServerError(e)) {
-                const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
-                console.log(`⏳ [AI] ${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
-                await new Promise((resolve) => setTimeout(resolve, waitMs));
-                try {
-                    return await this.model.generateContent(payload);
-                } catch (retryErr) {
-                    e = retryErr; // 重試仍失敗 → 落入下方一般升級路徑處理，計入升級門檻
+                // 5xx 暫時性錯誤 → 退避 5-10 秒同 combo 重試 1 次；重試成功不計數
+                // （26B 間歇性 500 不該讓它被踢下主力層），再失敗落入下方一般計數。
+                if (isServerError(e) && !serverRetried) {
+                    serverRetried = true;
+                    const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
+                    console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
+                    await new Promise((resolve) => setTimeout(resolve, waitMs));
+                    continue;
                 }
-            }
 
-            // 每日配額耗盡：本層本輪直接標死，不浪費升級計數的重試機會，強制升級（若已可升級）。
-            const isDailyExhausted = quota.isQuotaError && quota.quotaWindow !== QUOTA_PER_MINUTE;
-            const escalated = this.escalateModelTier(isDailyExhausted);
-            if (escalated) {
-                console.log(`🔄 [AI] Retrying with escalated model ${this.modelName}...`);
-                return await this.model.generateContent(payload);
+                // 一般 API 層失敗：連續失敗計數 +1，達門檻升級（自動跳過已標死 combo）。
+                const before = `${this.currentKeyName}/${this.modelName}`;
+                const outcome = this.ladder.recordFailure();
+                if (!outcome.escalated) {
+                    // 未達門檻（計數保留待下次）或已無層可升——丟回呼叫端既有失敗處理。
+                    throw e;
+                }
+                console.log(`⚠️  [AI] ${before} 連續失敗達門檻，升級 → ${this.currentKeyName}/${this.modelName}`);
+                this.init();
+                continue;
             }
-
-            throw e;
         }
     }
 }
@@ -477,7 +468,9 @@ async function solveCaptcha(page) {
     await geminiLimiter.wait(); 
     stats.captchaAttempts++;
     
-    console.log(`    [AI] Solving CAPTCHA (${MODEL_NAME})...`);
+    // 標籤必印「本次實際呼叫的模型/key」（讀 aiManager 即時狀態），不可印基礎常數
+    // MODEL_NAME——v1 曾印基礎模型、實際打升級後模型，實戰除錯被誤導。
+    console.log(`    [AI] Solving CAPTCHA (${aiManager.modelName} @ ${aiManager.currentKeyName})...`);
     try {
         const captchaEl = await page.$('#pickimg');
         if (!captchaEl) throw new Error('CAPTCHA image not found');
