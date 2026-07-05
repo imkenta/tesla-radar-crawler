@@ -146,10 +146,10 @@ test('fillMissingCoords：DB 已有同 (source,address,direction) 座標 → 直
   assert.equal(result.geocodeAttempted, 0);
 });
 
-test('fillMissingCoords：新地址（DB 無既有座標）→ 呼叫 geocodeFn 並填入結果', async () => {
+test('fillMissingCoords：新地址（DB 無既有座標）→ 呼叫 geocodeFn，且 source=tainan 補「臺南市」前綴消歧義', async () => {
   const r = record({ address: '北區 全新地址' });
   const geocodeFn = mock.fn(async (address) => {
-    assert.equal(address, '北區 全新地址');
+    assert.equal(address, '臺南市北區 全新地址');
     return { lat: 23.05, lng: 120.15 };
   });
 
@@ -192,6 +192,19 @@ test('fillMissingCoords：單輪 geocode 上限——超過上限的紀錄不呼
   assert.equal(result.records[2].lat, null); // 第 3 筆超過上限，本輪不處理
 });
 
+test('fillMissingCoords：僅 source===tainan 補「臺南市」前綴，其他 source 原樣傳入 geocodeFn（不誤傷其他來源）', async () => {
+  const records = [
+    record({ source: 'tainan', address: '北區 某路口' }),
+    record({ source: 'kaohsiung', address: '某路口' }),
+  ];
+  const geocodeFn = mock.fn(async (address) => ({ lat: 22.5, lng: 120.3, address }));
+
+  await fillMissingCoords(records, new Map(), geocodeFn, 100);
+
+  assert.equal(geocodeFn.mock.calls[0].arguments[0], '臺南市北區 某路口');
+  assert.equal(geocodeFn.mock.calls[1].arguments[0], '某路口');
+});
+
 test('fillMissingCoords：混合情境——已有座標/DB沿用/新geocode/查無結果 同批次皆正確處理', async () => {
   const withCoords = record({ address: '地址A', lat: 1, lng: 2 });
   const dbReuse = record({ address: '地址B' });
@@ -202,8 +215,8 @@ test('fillMissingCoords：混合情境——已有座標/DB沿用/新geocode/查
     [coordLookupKey('tainan', '地址B', '雙向'), { lat: 10, lng: 20 }],
   ]);
   const geocodeFn = mock.fn(async (address) => {
-    if (address === '地址C') return { lat: 30, lng: 40 };
-    if (address === '地址D') return null;
+    if (address === '臺南市地址C') return { lat: 30, lng: 40 };
+    if (address === '臺南市地址D') return null;
     throw new Error(`不應呼叫 geocodeFn(${address})`);
   });
 

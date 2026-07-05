@@ -35,6 +35,38 @@ test('geocode：成功查詢回傳 lat/lng，且帶自訂 User-Agent 與正確 U
   assert.match(calls[0].options.headers['User-Agent'], /tesla-radar-crawler/);
 });
 
+test('geocode：請求帶 countrycodes=tw 與 viewbox/bounded=1（限定台灣範圍，減少跨國誤配候選）', async () => {
+  const calls = [];
+  const fetchImpl = mock.fn(async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse([{ lat: '25.033', lon: '121.565' }]);
+  });
+
+  const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 0 });
+  await geocoder.geocode('台南市北門路段');
+
+  assert.ok(calls[0].url.includes('countrycodes=tw'), calls[0].url);
+  assert.ok(calls[0].url.includes('bounded=1'), calls[0].url);
+  assert.ok(calls[0].url.includes('viewbox='), calls[0].url);
+});
+
+test('geocode：回傳座標落在台灣邊界外（跨國誤配，如中國同名路名）→ 視為失敗回傳 null', async () => {
+  // 案例：「中正路」「中山路口」等台灣常見路名在中國也存在同名，Nominatim 曾誤配到河南/山東等地。
+  const fetchImpl = mock.fn(async () => jsonResponse([{ lat: '34.6544515', lon: '112.4306743' }]));
+  const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 0 });
+
+  const result = await geocoder.geocode('北區 公園路與公園南路口');
+  assert.equal(result, null);
+});
+
+test('geocode：回傳座標剛好在台灣 bbox 邊界內（含金門等外島）→ 正常接受', async () => {
+  const fetchImpl = mock.fn(async () => jsonResponse([{ lat: '24.4588', lon: '118.4315' }])); // 金門
+  const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 0 });
+
+  const result = await geocoder.geocode('金門某地址');
+  assert.deepEqual(result, { lat: 24.4588, lng: 118.4315 });
+});
+
 test('geocode：查無結果（空陣列）回傳 null，不拋例外', async () => {
   const fetchImpl = mock.fn(async () => jsonResponse([]));
   const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 0 });

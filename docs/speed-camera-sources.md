@@ -90,7 +90,9 @@
   2. `--write` 執行時，先查 DB 既有同 `(source, address, direction)` 列已有座標者（`getExistingCoordsForSource`），直接沿用，絕不重複呼叫 Nominatim。
   3. 剩餘缺座標紀錄才呼叫 `lib/geocoder.cjs`（1 req/s 節流），單輪呼叫上限 `SPEEDCAM_GEOCODE_MAX_CALLS`（預設 100，72 筆一輪內可補完）。
   4. geocode 查無結果或失敗：該筆 lat/lng 留 null 入庫，**不計入 source 失敗**（`writeAll` 仍標記 `ok: true`）。
-- **首次回填實測**（本機台灣 IP，2026-07-05，真實 Nominatim，`node speed-camera-sync.cjs --write`）：72 筆全數為新地址（DB 原無 tainan 座標資料）；geocode 成功 **17/72（23.6%）**，其餘 55 筆留 null 入庫（不算失敗，符合設計）。抽查失敗樣本發現原因不單一：部分殘留系統類型字樣（如「...路口多功能違規科技執法系統」未被 cleanTainanLocation 完全清乾淨的後綴），但也有不少是外觀乾淨的路口描述（如「中山路與中正路三段路口」）依然查無結果——Nominatim/OSM 對台南路口交叉點的資料覆蓋本身有限，非純文字清理問題。未來若要提高成功率，可考慮：(a) 換用更貼合台灣路網的 geocoder（如政府圖資或 Google Geocoding API，需另評估費用與 ToS）、(b) 對系統類型後綴做更積極的字典比對清理。本輪未做這些精修，屬於已知限制，留待下一輪視覆蓋率需求決定是否投入。
+- **首次回填實測**（本機台灣 IP，2026-07-05，真實 Nominatim，`node speed-camera-sync.cjs --write`）：72 筆全數為新地址（DB 原無 tainan 座標資料）；geocode 成功 **17/72（23.6%）**，其餘 55 筆留 null 入庫（不算失敗，符合設計）。
+  - ⚠️ **勘誤（2026-07-06）**：上述 17 筆中 **15 筆是跨國誤配的假陽性**（座標落在中國，見下方「Nominatim geocode 使用時機」章節修復記錄），真實成功只有 **2/72（2.8%）**。
+- **修復後重回填實測**（本機台灣 IP，2026-07-06，geocoder 已加 `countrycodes=tw`+viewbox/bounded+台灣 bbox 驗證、查詢字串補「臺南市」前綴）：沿用 DB 2 筆（先前僅存的真成功座標）、新查 70 筆**成功 0**。誠實結論：台南地址是「X路與Y路口」路口交叉格式，Nominatim/OSM 對台灣路口交叉點的解析能力在台灣界內趨近 **0%**——先前較高的「成功率」全靠跨國撞名假陽性撐起來。寧可 null 不可錯：台南市轄區的座標覆蓋實質由 `national-npa` 全國集的 **139 個台南點位**承擔（有原生座標），自建 tainan 源保留供未來補值。未來選項：TGOS 全國門牌地址定位服務（政府圖資，可解路口交叉格式），需另評估申請與 ToS。
 
 ## 全國無統一格式的具體證據
 - 座標欄位命名：台北/新北/桃園用「經度/緯度」或 `longitude/latitude`；高雄用「座標緯N度/座標經E度」（順序相反）；台南完全沒有座標欄位。
@@ -102,7 +104,13 @@
 ## Nominatim geocode 使用時機
 台北/新北/高雄/桃園皆已有原生座標，**不需要 geocode**。台南（`source=tainan`）無座標，R8 已串接 `lib/geocoder.cjs`（節流 1 req/s、自訂 User-Agent）進 `--write` 流程，見上方「台南市」章節。測試（`test/geocoder.test.cjs`、`test/speed-camera-writer.test.cjs`、`test/speed-camera-sync.test.cjs`）全部 mock，不打真實 Nominatim；只有本機首次回填執行過一次真實呼叫（72 次，1 req/s，約 72 秒）。
 
-⚠️ **已知資料品質問題（2026-07-05 發現，非本輪修復範圍）**：DB 現有 `tainan` 資料中有 15 筆座標被 Nominatim 誤配到中國大陸境內（如「新化區 中正路與中山路口」被配到河南省），肇因於清理後的地址字串（`cleanTainanLocation`）缺乏「臺灣」/「臺南市」上下文，Nominatim 對「北區」「南區」這類通用行政區名+常見路名在無國家限定下容易撞名到海外同名地點。已另開背景任務追蹤修復（geocoder 加地理邊界限制 + 清理既有髒資料），不在本次全國集接入任務範圍內處理。
+✅ **跨國誤配問題已修復（2026-07-05 發現、2026-07-06 修復）**：DB 曾有 15 筆 `tainan` 座標被 Nominatim 誤配到中國大陸境內（如「新化區 中正路與中山路口」被配到河南省），肇因於清理後的地址字串缺乏台灣上下文。修復內容：
+- `lib/geocoder.cjs` 模組預設加台灣邊界——請求帶 `countrycodes=tw` + `viewbox`/`bounded=1`，且回傳座標不在台灣 bbox（lat 20–27, lng 117–123）一律視為失敗回 null（縱深防禦，任何呼叫端都不會再踩）。
+- `lib/speed-camera-writer.cjs` `fillMissingCoords` 僅對 `source==='tainan'` 的 geocode 查詢字串補「臺南市」前綴消歧義。
+- production 15 筆髒座標已清為 null，清污＋重回填後全表出界列 = 0（驗證 SQL：`lat not between 20 and 27 or lng not between 117 and 123`）。
+- 互動確認：台南列將來若取得正確座標，下輪 `national-npa` 的台南重疊點會被既有 30m 聯集去重自動丟棄，無害。
+
+⚠️ **已知成本（可容忍，暫不處理）**：tainan 有 70 筆地址 geocode 恆失敗（路口格式，見上方台南章節），每輪 `--write` 都會重試這 70 筆（1 req/s 節流，約 70 秒/輪、每週一輪，本機成本可容忍）。未來優化選項：對「已知查無結果」的地址做負面快取（記錄失敗地址跳過重查），視執行頻率需求再投入。
 
 ---
 
