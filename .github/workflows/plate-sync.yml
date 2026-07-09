@@ -68,14 +68,37 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Cache Cloudflare WARP apt packages
+        id: cache-warp-apt
+        uses: actions/cache@v4
+        with:
+          path: ~/.warp-apt-cache
+          key: warp-apt-${{ runner.os }}-v1
+          restore-keys: |
+            warp-apt-${{ runner.os }}-
+
       - name: Install and Configure Cloudflare WARP
         run: |
           # Import GPG key and add repository
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
-          # Install WARP
+          # 快取命中：把 .deb 複製進 apt archives，讓 apt-get install 跳過 119MB 下載
+          # 快取未命中：此命令靜默失敗，走正常下載路徑
+          sudo cp "$HOME/.warp-apt-cache/"*.deb /var/cache/apt/archives/ 2>/dev/null \
+            && echo "Cache hit: restored .deb packages to apt archives." \
+            || echo "Cache miss: packages will be downloaded fresh this run."
+
+          # 保留 .deb 檔以供 actions/cache 在 job 結束時儲存
+          echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
+
+          # Install WARP（快取命中時 apt-get install 略過下載，只驗證 + 解壓縮，約 30s）
           sudo apt-get update && sudo apt-get install -y cloudflare-warp
+
+          # 將安裝好的 .deb 存到使用者可讀的目錄，供下一輪快取
+          mkdir -p "$HOME/.warp-apt-cache"
+          sudo cp /var/cache/apt/archives/*.deb "$HOME/.warp-apt-cache/" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.warp-apt-cache"
 
           # Register (handle both old and new warp-cli syntax across versions)
           sudo warp-cli registration new --accept-tos 2>/dev/null || \
