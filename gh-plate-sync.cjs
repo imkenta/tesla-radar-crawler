@@ -1056,6 +1056,6 @@ async function processStation(page, deptId, station) {
             // Ignore kill errors
         }
         
-        process.exit(0);
+        process.exit(stats.status === 'FAILED' ? 1 : 0);
     }
 })();
