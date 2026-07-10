@@ -820,15 +820,24 @@ async function processStation(page, deptId, station) {
             // 4. 暴力偵測結果 (每 2 秒檢查一次，最多 15 次 = 30秒)
             for (let i = 0; i < 15; i++) {
                 await sleep(2000);
-                const pageInfo = await page.evaluate(() => {
-                    const h1 = document.querySelector('h1')?.innerText || '';
-                    const body = document.body?.innerText || "";
-                    return {
-                        isResult: h1.includes('--') || document.querySelector('.number_cell') !== null,
-                        isNoData: body.includes('截至目前為止') || body.includes('查無資料'),
-                        isError: body.includes('驗證數字輸入錯誤') || body.includes('請輸入驗證數字')
-                    };
-                });
+                let pageInfo;
+                try {
+                    pageInfo = await page.evaluate(() => {
+                        const h1 = document.querySelector('h1')?.innerText || '';
+                        const body = document.body?.innerText || "";
+                        return {
+                            isResult: h1.includes('--') || document.querySelector('.number_cell') !== null,
+                            isNoData: body.includes('截至目前為止') || body.includes('查無資料'),
+                            isError: body.includes('驗證數字輸入錯誤') || body.includes('請輸入驗證數字')
+                        };
+                    });
+                } catch (evalErr) {
+                    if (evalErr.message && evalErr.message.includes('Execution context was destroyed')) {
+                        console.log(`    [Wait] Page navigating (context destroyed), will retry in 2s...`);
+                        continue;
+                    }
+                    throw evalErr;
+                }
 
                 if (alertMsg || pageInfo.isError) {
                     console.log(`    [Fail] Captcha Error detected.`);
