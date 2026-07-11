@@ -775,7 +775,12 @@ async function processStation(page, deptId, station) {
                     const btn = document.querySelector('a[onclick*="doReturnWithData"]');
                     if (btn) btn.click();
                 });
-                await page.waitForSelector('#selPlateType', { timeout: 10000 });
+                try {
+                    await page.waitForSelector('#selPlateType', { timeout: 10000 });
+                } catch (waitErr) {
+                    console.log(`    [Action] Quick Re-query 逾時（${waitErr.message}），退回 Full Nav 重試...`);
+                    continue;
+                }
                 await selectWithEvent(page, '#selPlateType', pType);
                 await sleep(1000);
             }
@@ -836,6 +841,10 @@ async function processStation(page, deptId, station) {
                         console.log(`    [Wait] Page navigating (context destroyed), will retry in 2s...`);
                         continue;
                     }
+                    if (evalErr.name === 'ProtocolError' || (evalErr.message && evalErr.message.includes('timed out'))) {
+                        console.log(`    [Wait] Protocol timeout during result poll (${evalErr.message}), abandoning this attempt for Full Nav retry...`);
+                        break;
+                    }
                     throw evalErr;
                 }
 
@@ -853,6 +862,14 @@ async function processStation(page, deptId, station) {
 
             page.off('dialog', dialogHandler);
             if (!success) console.log('\n    [Wait] No confirmed state found, retrying...');
+        }
+
+        if (!success && !stationAborted) {
+            // attempt 全數耗盡仍無法取得結果（OCR 連敗、ProtocolError 連命中等），
+            // 該站資料不完整，必須標記 FAILED 讓 stationsFailed 計數觸發嚴格語義守門。
+            console.log(`    [Fail] All ${maxQueryAttempts} attempts exhausted for ${typeName}, marking station FAILED.`);
+            status = 'FAILED';
+            stationAborted = true;
         }
 
         if (success) {
@@ -899,6 +916,7 @@ async function processStation(page, deptId, station) {
     const duration = ((Date.now() - startTime) / 1000);
     console.log(`⏱️  Station ${station.name} finished in ${duration.toFixed(2)}s`);
     if (status !== 'FAILED') stats.stationsSuccess++;
+    else stats.stationsFailed++;
     stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: platesFound, retries: retries, status: status });
 }
 
@@ -954,6 +972,7 @@ async function processStation(page, deptId, station) {
 
     const browser = await puppeteer.launch({
         headless: "new",
+        protocolTimeout: 60000,
         args: launchArgs
     });
 
@@ -1012,7 +1031,16 @@ async function processStation(page, deptId, station) {
             console.log(`\n=== Dept ${deptId} (${stations.length} stations) ===`);
 
             for (const station of stations) {
-                await processStation(page, deptId, station);
+                const stationAttemptStart = Date.now();
+                try {
+                    await processStation(page, deptId, station);
+                } catch (stationErr) {
+                    const duration = (Date.now() - stationAttemptStart) / 1000;
+                    console.error(`    [Station] ${station.name} 發生未攔截錯誤，跳過本站：${stationErr.message}`);
+                    stats.stationsFailed++;
+                    stats.addError('STATION:' + station.name, stationErr.message);
+                    stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: 0, retries: 0, status: 'FAILED' });
+                }
                 console.log('☕ Quota protection break (2-4s)...');
                 await randomSleep(1000, 2000);
             }
@@ -1020,19 +1048,28 @@ async function processStation(page, deptId, station) {
             await randomSleep(1500, 2500);
         }
 
-        // Only perform swap if running in full mode (legacy). 
-        // In Shard mode, swap is handled by a separate Finalizer Job.
-        if (TARGET_SHARD === null) {
+        const { count } = await supabase.from('available_plates_staging').select('*', { count: 'exact', head: true });
+        if (stats.stationsFailed > 0) {
+            // 從嚴：任一站失敗，該站車牌就會從 staging 缺席；swap 後 finalizer 的
+            // REMOVED diff 會把它誤判為「已售出」，觸發假通知信給 watchlist 訂閱者。
+            // 先擋守門再決定 exit code，legacy 和 shard 兩種模式都不做 swap。
+            const failMsg = `${stats.stationsFailed} station(s) failed this run, blocking swap to avoid false "sold" notifications.`;
+            console.error(`❌ ${failMsg}`);
+            stats.status = 'FAILED';
+            await reportStatus('FAILED', failMsg, syncKey);
+        } else if (TARGET_SHARD === null) {
+            // Only perform swap if running in full mode (legacy).
+            // In Shard mode, swap is handled by a separate Finalizer Job.
             await performSwap();
+            if (count === 0) {
+                stats.status = 'WARNING';
+                await reportStatus('WARNING', 'Sync completed but 0 plates found.', syncKey);
+            } else {
+                stats.status = 'COMPLETED';
+                await reportStatus('COMPLETED', null, syncKey);
+            }
         } else {
             console.log('✨ Shard sync complete. Waiting for Finalizer to swap.');
-        }
-
-        const { count } = await supabase.from('available_plates_staging').select('*', { count: 'exact', head: true });
-        if (count === 0 && !TARGET_SHARD) {
-            stats.status = 'WARNING';
-            await reportStatus('WARNING', 'Sync completed but 0 plates found.', syncKey);
-        } else {
             stats.status = 'COMPLETED';
             await reportStatus('COMPLETED', null, syncKey);
         }
