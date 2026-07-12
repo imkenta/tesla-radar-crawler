@@ -618,9 +618,24 @@ async function performSwap() {
     if (error) {
         console.error('    [DB] Swap Error:', error.message);
         await reportStatus('FAILED', 'Atomic Swap Failed: ' + error.message);
-    } else {
-        console.log('✅ Production data updated successfully.');
+        return false;
     }
+
+    // swap_plates_data() 是 void RPC：熔斷觸發時只把 sync_metadata.status 寫成
+    // SKIPPED_CIRCUIT_BREAKER 並清空 staging，不會回傳 error。必須回讀確認，
+    // 否則呼叫端會把它覆寫成 COMPLETED（false green）。
+    const { data: meta } = await supabase
+        .from('sync_metadata')
+        .select('status, status_message')
+        .eq('key', 'plates_full_sync')
+        .maybeSingle();
+    if (meta?.status === 'SKIPPED_CIRCUIT_BREAKER') {
+        console.error(`    [DB] Circuit breaker tripped, swap skipped: ${meta.status_message || ''}`);
+        return false;
+    }
+
+    console.log('✅ Production data updated successfully.');
+    return true;
 }
 
 // Helper to select and dispatch events
@@ -891,6 +906,7 @@ async function processStation(page, deptId, station) {
                 const uniquePlates = Array.from(new Map(collectedPlates.map(p => [p.no, p])).values());
                 
                 let insertRetries = 3;
+                let insertOk = false;
                 while (insertRetries > 0) {
                     try {
                         const { error } = await supabase.from('available_plates_staging').insert(uniquePlates.map(p => ({
@@ -898,7 +914,7 @@ async function processStation(page, deptId, station) {
                             plate_type: pType, window_id: '01', plate_no: p.no, price: parseInt(p.price) || 0,
                             updated_at: new Date().toISOString(), status: 'AVAILABLE'
                         })));
-                        if (!error) break;
+                        if (!error) { insertOk = true; break; }
                         console.log(`    [Retry] DB Insert error: ${error.message}. Retries left: ${insertRetries - 1}`);
                     } catch (e) {
                         console.log(`    [Retry] DB Insert fetch exception: ${e.message}. Retries left: ${insertRetries - 1}`);
@@ -906,10 +922,18 @@ async function processStation(page, deptId, station) {
                     insertRetries--;
                     if (insertRetries > 0) await new Promise(r => setTimeout(r, 3000));
                 }
-                
-                console.log(`    [DB] Staged ${uniquePlates.length} plates.`);
-                stats.totalPlates += uniquePlates.length;
-                platesFound += uniquePlates.length;
+
+                if (insertOk) {
+                    console.log(`    [DB] Staged ${uniquePlates.length} plates.`);
+                    stats.totalPlates += uniquePlates.length;
+                    platesFound += uniquePlates.length;
+                } else {
+                    // insert 重試耗盡：這批車牌其實沒進 staging，不能算進成功筆數，
+                    // 否則會綠燈通過但資料實際缺席（false green）。
+                    console.log(`    [Fail] DB Insert exhausted retries for ${typeName}, marking station FAILED.`);
+                    status = 'FAILED';
+                    stationAborted = true;
+                }
             }
         }
     }
@@ -1060,8 +1084,10 @@ async function processStation(page, deptId, station) {
         } else if (TARGET_SHARD === null) {
             // Only perform swap if running in full mode (legacy).
             // In Shard mode, swap is handled by a separate Finalizer Job.
-            await performSwap();
-            if (count === 0) {
+            const swapped = await performSwap();
+            if (!swapped) {
+                stats.status = 'FAILED';
+            } else if (count === 0) {
                 stats.status = 'WARNING';
                 await reportStatus('WARNING', 'Sync completed but 0 plates found.', syncKey);
             } else {

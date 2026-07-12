@@ -370,6 +370,7 @@ async function processAnnouncementOpenAlerts() {
 
 async function run() {
   const startTime = Date.now();
+  let hadUpsertError = false;
   console.log('🚀 Starting Bidding Plates Sync...');
 
   // 0. Watchlist 通知（不論是否有 active 競標站台都先執行；結標需在清除過期牌之前撈取）
@@ -559,6 +560,7 @@ async function run() {
 
         if (upsertErr) {
           console.error('[BiddingPlatesSync] Upsert error in chunk:', upsertErr.message);
+          hadUpsertError = true;
         }
       }
       
@@ -574,9 +576,14 @@ async function run() {
 
   } catch (err) {
     console.error('[BiddingPlatesSync] Crawler run failed:', err);
+    hadUpsertError = true;
   } finally {
     await browser.close();
     console.log(`🏁 Finished. Total Runtime: ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
+    if (hadUpsertError) {
+      console.error('[BiddingPlatesSync] Completed with data write errors; marking run as failed.');
+      process.exitCode = 1;
+    }
   }
 }
 

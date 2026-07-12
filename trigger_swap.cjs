@@ -1,6 +1,16 @@
 const { createClient } = require('@supabase/supabase-js');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
+const { SHARD_NAMES } = require('./lib/shard-config.cjs');
 require('dotenv').config();
+
+// 最低筆數／最大下降比例保護：擋「幾乎全空但非 0」或「相對正式表暴跌」的殘缺批次。
+// DB 端 swap_plates_data() 也有 20% 熔斷，這裡在呼叫 RPC 前先擋一層，讓
+// trigger_swap.cjs 能明確 exit 非 0，不必等 RPC 側靜默 TRUNCATE 才發現。
+const MIN_STAGING_COUNT = 50;
+const MAX_DROP_RATIO = 0.2;
+// Shard 新鮮度窗口：finalize job 緊接在 5 個 shard 之後跑（各 shard 逾時 45 分鐘），
+// 2 小時窗口足夠涵蓋排隊延遲，又能抓到「shard sync_metadata 是很久以前的殘留」。
+const SHARD_FRESHNESS_WINDOW_MS = 2 * 60 * 60 * 1000;
 
 const url = process.env.VITE_SUPABASE_URL;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -212,9 +222,40 @@ async function processSoldNotifications() {
 async function run() {
     console.log('🔄 Triggering Final Swap...');
     const supabase = initSupabase();
-    
-    // Safety Check: Ensure Staging is not empty
-    const { data, count, error: countError } = await safeQuery(() => supabase
+
+    // Safety Check 1：確認所有 shard 都真的跑完且狀態新鮮。理論上 workflow 的
+    // needs+if:success() 已經擋住任一 shard 失敗，這裡加一層獨立驗證，避免將來
+    // 有人繞過 workflow gate 手動跑本檔、或某個 shard 靜默沒寫 sync_metadata。
+    for (const shard of SHARD_NAMES) {
+        const shardKey = `plates_sync_shard_${shard}`;
+        const { data: shardMeta, error: shardMetaError } = await safeQuery(() => supabase
+            .from('sync_metadata')
+            .select('status, last_run_at')
+            .eq('key', shardKey)
+            .maybeSingle());
+
+        if (shardMetaError) {
+            console.error(`❌ Failed to check sync_metadata for shard ${shard}:`, shardMetaError.message);
+            process.exit(1);
+        }
+        if (!shardMeta) {
+            console.error(`❌ Shard ${shard} has no sync_metadata row (${shardKey}). Aborting swap.`);
+            process.exit(1);
+        }
+        if (shardMeta.status !== 'COMPLETED') {
+            console.error(`❌ Shard ${shard} status is "${shardMeta.status}" (expected COMPLETED). Aborting swap.`);
+            process.exit(1);
+        }
+        const ageMs = Date.now() - new Date(shardMeta.last_run_at).getTime();
+        if (!Number.isFinite(ageMs) || ageMs > SHARD_FRESHNESS_WINDOW_MS) {
+            console.error(`❌ Shard ${shard} last_run_at is stale (${shardMeta.last_run_at}). Aborting swap.`);
+            process.exit(1);
+        }
+    }
+    console.log(`✅ All ${SHARD_NAMES.length} shards reported COMPLETED and fresh.`);
+
+    // Safety Check 2：最低筆數 + 相對正式表的下降比例。
+    const { count, error: countError } = await safeQuery(() => supabase
         .from('available_plates_staging')
         .select('*', { count: 'exact', head: true }));
 
@@ -229,34 +270,75 @@ async function run() {
         return; // Exit safely without swapping
     }
 
+    if (count < MIN_STAGING_COUNT) {
+        console.error(`❌ Staging has only ${count} records (< floor ${MIN_STAGING_COUNT}). Aborting swap to avoid publishing a partial batch.`);
+        process.exit(1);
+    }
+
+    const { count: prodCount, error: prodCountError } = await safeQuery(() => supabase
+        .from('available_plates')
+        .select('*', { count: 'exact', head: true }));
+
+    if (prodCountError) {
+        console.error('❌ Failed to check production count:', prodCountError.message);
+        process.exit(1);
+    }
+
+    if (prodCount > 0) {
+        const dropRatio = (prodCount - count) / prodCount;
+        if (dropRatio > MAX_DROP_RATIO) {
+            console.error(`❌ Staging count dropped ${(dropRatio * 100).toFixed(1)}% vs production (${prodCount} → ${count}), exceeds ${(MAX_DROP_RATIO * 100).toFixed(0)}% floor. Aborting swap.`);
+            process.exit(1);
+        }
+    }
+
     console.log(`✅ Staging has ${count} records. Proceeding with swap...`);
 
     const { error } = await safeQuery(() => supabase.rpc('swap_plates_data'));
-    
+
     if (error) {
         console.error('❌ Swap Failed:', error.message);
         process.exit(1);
-    } else {
-        const successMsg = `同步完成，共抓取 ${count} 筆資料`;
-        console.log(`✅ ${successMsg}. Production data updated.`);
-        
-        // Update main metadata status
-        await safeQuery(() => supabase.from('sync_metadata').upsert({
-            key: 'plates_full_sync',
-            status: 'COMPLETED',
-            status_message: successMsg,
-            last_run_at: new Date().toISOString()
-        }, { onConflict: 'key' }));
-
-        // Process sold notifications for watchlist
-        await processSoldNotifications();
-
-        // 號碼訂閱：現貨表已是最新全集，比對使用者登記的想要號碼並通知（每張牌一次）
-        await processPlateSubscriptions({
-            supabase,
-            sendEmail: (to, subject, html) => sendEmail(supabase, to, subject, html),
-        });
     }
+
+    // swap_plates_data() 是 void RPC：熔斷觸發時只把 sync_metadata.status 寫成
+    // SKIPPED_CIRCUIT_BREAKER 並清空 staging，不會回傳 error。必須回讀確認，
+    // 否則下面會把它覆寫成 COMPLETED（false green）。
+    const { data: metaAfterSwap, error: metaAfterSwapError } = await safeQuery(() => supabase
+        .from('sync_metadata')
+        .select('status, status_message')
+        .eq('key', 'plates_full_sync')
+        .maybeSingle());
+
+    if (metaAfterSwapError) {
+        console.error('❌ Failed to verify swap result:', metaAfterSwapError.message);
+        process.exit(1);
+    }
+
+    if (metaAfterSwap?.status === 'SKIPPED_CIRCUIT_BREAKER') {
+        console.error(`❌ Circuit breaker tripped, swap skipped: ${metaAfterSwap.status_message || ''}`);
+        process.exit(1);
+    }
+
+    const successMsg = `同步完成，共抓取 ${count} 筆資料`;
+    console.log(`✅ ${successMsg}. Production data updated.`);
+
+    // Update main metadata status
+    await safeQuery(() => supabase.from('sync_metadata').upsert({
+        key: 'plates_full_sync',
+        status: 'COMPLETED',
+        status_message: successMsg,
+        last_run_at: new Date().toISOString()
+    }, { onConflict: 'key' }));
+
+    // Process sold notifications for watchlist
+    await processSoldNotifications();
+
+    // 號碼訂閱：現貨表已是最新全集，比對使用者登記的想要號碼並通知（每張牌一次）
+    await processPlateSubscriptions({
+        supabase,
+        sendEmail: (to, subject, html) => sendEmail(supabase, to, subject, html),
+    });
 }
 
 run();

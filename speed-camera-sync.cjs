@@ -341,6 +341,12 @@ async function writeAll(supabase, opts = {}) {
       let records = await parse(buffer, batchFetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
 
+      if (records.length === 0) {
+        // 解析出 0 筆通常代表來源格式跑版或抓取異常，不是「這次真的沒資料」。
+        // 丟到下面既有的 catch，走原本的 stale-tolerance 判斷，避免誤刪既有資料。
+        throw new Error('解析出 0 筆，可能是來源格式跑版或抓取異常，中止本輪避免誤刪既有資料');
+      }
+
       if (source.needsGeocode) {
         const existingCoords = await getExistingCoordsForSource(supabase, source.name);
         const fillResult = await fillMissingCoords(
