@@ -549,11 +549,20 @@ async function run() {
 
     // 6. Sync to DB & Process Alerts
     if (allScrapedPlates.length > 0) {
-      console.log(`📥 Upserting ${allScrapedPlates.length} plates to public.bidding_plates...`);
-      
+      // 跨頁爬取期間排序會變動，同一張牌可能被抓到兩次；
+      // 同一 conflict key 撞進同一條 upsert 會整批被 Postgres 拒絕（21000），
+      // 先按 key 去重、保留後抓到的那筆（出價資訊較新）
+      const deduped = [...new Map(
+        allScrapedPlates.map(p => [`${p.station_id}|${p.plate_no}|${p.end_time}`, p])
+      ).values()];
+      if (deduped.length < allScrapedPlates.length) {
+        console.log(`⚠️ Removed ${allScrapedPlates.length - deduped.length} duplicate plate rows before upsert.`);
+      }
+      console.log(`📥 Upserting ${deduped.length} plates to public.bidding_plates...`);
+
       const chunkSize = 100;
-      for (let i = 0; i < allScrapedPlates.length; i += chunkSize) {
-        const chunk = allScrapedPlates.slice(i, i + chunkSize);
+      for (let i = 0; i < deduped.length; i += chunkSize) {
+        const chunk = deduped.slice(i, i + chunkSize);
         const { error: upsertErr } = await supabase
           .from('bidding_plates')
           .upsert(chunk, { onConflict: 'station_id,plate_no,end_time' });
@@ -565,7 +574,7 @@ async function run() {
       }
       
       // Process notifications for changed prices
-      await processWatchlistAlerts(allScrapedPlates);
+      await processWatchlistAlerts(deduped);
 
       // 號碼訂閱：標牌表已更新，比對使用者登記的想要號碼並通知（每張牌一次）
       await processPlateSubscriptions({ supabase, sendEmail });
