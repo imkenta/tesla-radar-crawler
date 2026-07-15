@@ -10,6 +10,10 @@ const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const dotenv = require('dotenv');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
+const {
+  groupActiveEvAnnouncements,
+  partitionEligibleBiddingPlates
+} = require('./lib/bidding-plate-eligibility.cjs');
 
 puppeteer.use(StealthPlugin());
 
@@ -135,7 +139,7 @@ async function loadActiveStations() {
   console.log('🔍 Querying active bidding stations from announcements...');
   const { data, error } = await supabase
     .from('bid_announcements')
-    .select('section_code, station_code')
+    .select('section_code, station_code, plate_type, start_plate, end_plate, start_time, end_time')
     .lte('start_time', new Date().toISOString())
     .gte('end_time', new Date().toISOString());
 
@@ -143,21 +147,8 @@ async function loadActiveStations() {
     throw new Error(`Failed to load active announcements: ${error.message}`);
   }
 
-  // Deduplicate
-  const seen = new Set();
-  const stations = [];
-  for (const item of data || []) {
-    const key = `${item.section_code}-${item.station_code}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      stations.push({
-        sectionCode: item.section_code,
-        stationCode: item.station_code
-      });
-    }
-  }
-
-  return stations;
+  // 同站只爬一次，但保留每個有效電動公告的類別與號段，供結果頁 fail-closed 過濾。
+  return groupActiveEvAnnouncements(data || []);
 }
 
 async function processWatchlistAlerts(plates) {
@@ -488,9 +479,12 @@ async function run() {
             }).filter(x => x.plateNo && /^[A-Z0-9]{2,4}-[A-Z0-9]{2,4}$/i.test(x.plateNo.trim()));
           });
 
-          console.log(`  Page ${pageCount}: Parsed ${parsed.length} plates.`);
+          const { eligible, rejected } = partitionEligibleBiddingPlates(parsed, station.announcements);
+          console.log(
+            `  Page ${pageCount}: Parsed ${parsed.length}; eligible EV ${eligible.length}; rejected ${rejected.length}.`
+          );
 
-          for (const item of parsed) {
+          for (const item of eligible) {
             const basePriceNum = parseInt((item.basePrice || '').replace(/,/g, '')) || 0;
             const currentBidNum = parseInt((item.currentBid || '').replace(/,/g, '')) || 0;
             const bidCountNum = parseInt(item.bidCount || '0') || 0;
