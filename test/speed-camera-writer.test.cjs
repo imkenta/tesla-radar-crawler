@@ -299,6 +299,19 @@ test('dedupeAgainstExisting：不比對 direction/方向——純距離判斷，
   assert.equal(kept.length, 0);
 });
 
+test('dedupeAgainstExisting：國道與公路分類不享有文字例外，相同座標仍視為重複點', () => {
+  const nationalRecords = [
+    { city: '國道五號', address: '北上16.9公里', lat: 24.901, lng: 121.61 },
+    { city: '台2已線', address: '不同點位', lat: 24.95, lng: 121.7 },
+  ];
+  const existingPoints = [{ lat: 24.901, lng: 121.61 }];
+
+  const { kept, droppedCount } = dedupeAgainstExisting(nationalRecords, existingPoints, 30);
+
+  assert.equal(droppedCount, 1);
+  assert.deepEqual(kept, [nationalRecords[1]]);
+});
+
 test('dedupeAgainstExisting：existingPoints 為空陣列 → 全部保留', () => {
   const nationalRecords = [
     { city: 'A', address: 'a', lat: 25, lng: 121 },

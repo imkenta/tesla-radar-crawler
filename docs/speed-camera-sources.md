@@ -120,14 +120,14 @@
 既有六源（taipei/new-taipei/kaohsiung/taoyuan/tainan/taichung）只涵蓋六都，共 1053 筆，六都以外 15 縣市（基隆、新竹市、新竹縣、苗栗、彰化、南投、雲林、嘉義市、嘉義縣、屏東、宜蘭、花蓮、台東、澎湖、金門）完全零資料。
 
 - **資料集**：`測速執法設置點`（data.gov.tw/dataset/7320），提供機關：內政部警政署，授權：政府資料開放授權條款第1版
-- **實際下載連結**（2026-07-05 實測驗證）：
-  `https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/8B41C4A6-FDC4-4971-98BA-7FFCFE1C294C/download`
-- **格式**：CSV，UTF-8 with BOM，HTTP 200，235,630 bytes
+- **實際下載連結**（2026-07-21 由 data.gov.tw 正式資料集頁面重新核對）：
+  `https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/D737B2D5-B478-42C9-BE8C-94A5FBB7D907/download`
+- **格式**：CSV，UTF-8 with BOM，HTTP 200，239,079 bytes
 - **欄位**：`CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit`
 - **⚠️ 雙層表頭陷阱（實測發現，非文件記載）**：第 1 行是英文欄位名（`CityName,...`），第 2 行是中文欄位說明（`設置縣市,設置市區鄉鎮,...`），**從第 3 行起才是真實資料**。`parseNationalNpa`（`lib/speed-camera-parser.cjs`）用「Longitude/Latitude 兩欄無法解析為有限數字」判斷並跳過該說明列，比寫死 row index 更穩健。
 - **座標完整度**：實測全量抽驗零缺值
-- **縣市涵蓋**：CityName 欄位實測共 31 種值，21 個為合法縣市（**缺連江縣**），另 10 種是「國道一號」「國道3甲」「台2已線」等國道/公路路段分類（非縣市，共 169 筆），`isEligibleNationalNpaCity`（判斷是否以「市」或「縣」結尾）過濾掉這類值。
-- **全量統計**：1867 筆（不含表頭說明列）= 六都 864 筆 + 六都以外 15 縣市 834 筆 + 國道等非縣市 169 筆。`parseNationalNpa` 只排除國道等 169 筆，輸出 1698 筆（21 縣市，含六都）。
+- **CityName 涵蓋**：實測共 31 種值，21 個為行政縣市（**缺連江縣**），另 10 種是「國道一號」「國道3甲」「台2已線」等國道／公路分類（169 筆）。這些都是有效測速點，parser 不做名稱或字尾資格判斷。
+- **全量統計**（2026-07-21 直接下載現行正式資源）：1895 筆（不含表頭說明列）= 六都 895 筆 + 六都以外 15 縣市 831 筆 + 國道／公路 169 筆；其中 `國道五號` 20 筆。`parseNationalNpa` 只排除無有效座標的說明列或髒資料，所有有效點位完整輸出。
 
 ## 決策依據：為何不用「排除六都」黑名單，改用執行期聯集去重
 
@@ -148,7 +148,7 @@
 
 ## 實作：執行期聯集去重（非靜態黑名單）
 
-`speed-camera-sync.cjs` 的 `writeAll`/`syncAll` 在逐 source 迴圈中，對前六個自建 source（含台南 geocode 補值後）逐一收集座標到 `collectedPoints`；處理到 `national-npa`（陣列中排最後，標記 `dedupeAgainstOtherSources: true`）時，呼叫 `dedupeAgainstExisting(records, collectedPoints, 30)`：座標 haversine ≤30 公尺視為同一支予以丟棄，其餘（六都的獨有點位 + 15 縣市全部）保留入庫。
+`speed-camera-sync.cjs` 的 `writeAll`/`syncAll` 在逐 source 迴圈中，對前六個自建 source（含台南 geocode 補值後）逐一收集座標到 `collectedPoints`；處理到 `national-npa`（陣列中排最後，標記 `dedupeAgainstOtherSources: true`）時，呼叫 `dedupeAgainstExisting(records, collectedPoints, 30)`：不讀取 CityName、道路名稱或方向字詞，只以座標 haversine ≤30 公尺判定跨來源重複點，其餘全部保留入庫。
 
 優點：自建源優先（同一點位以自建源資料為準，不重複）、全國集補漏（六都獨有點位不再流失）、零維護（未來任一源增減點位，去重自動跟上，不需要人工維護黑名單/白名單）。
 

@@ -108,14 +108,13 @@ const SOURCES = [
     fallbackUrls: [],
   },
   {
-    // 警政署全國集「測速執法設置點」（data.gov.tw/dataset/7320）：涵蓋全 21 縣市
-    // （連江縣缺，見 docs/speed-camera-sources.md）。parseNationalNpa 只排除非縣市格式的
-    // 國道路段分類，**不**排除六都——六都與自建源的重複收錄改由 writeAll 在寫入前執行
-    // 「執行期聯集去重」（見 dedupeAgainstExisting）：與本輪其他六個自建源解析出的座標
-    // haversine ≤30m 視為同一支才丟棄，其餘（含六都的獨有點位）保留。
+    // 警政署全國集「測速執法設置點」（data.gov.tw/dataset/7320）。parser 不依 CityName、
+    // 縣市字尾或道路名稱排除任何有效座標；六都、其他縣市及國道／公路資料全部保留。
+    // 與自建源的重複收錄只由 writeAll 的座標聯集去重處理（見 dedupeAgainstExisting）：
+    // 與本輪其他六個來源座標 haversine ≤30m 視為同一點才丟棄，其餘完整保留。
     // 必須排在 SOURCES 陣列最後，writeAll 才能在處理它之前先收集完其他六源的座標。
     name: 'national-npa',
-    url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/8B41C4A6-FDC4-4971-98BA-7FFCFE1C294C/download',
+    url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/D737B2D5-B478-42C9-BE8C-94A5FBB7D907/download',
     parse: parseNationalNpa,
     fallbackUrls: [],
     dedupeAgainstOtherSources: true,
