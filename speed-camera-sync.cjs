@@ -44,6 +44,7 @@ const {
   toUpsertPayloads,
   coordLookupKey,
   fillMissingCoords,
+  collapseSourceConflictDuplicates,
   dedupeAgainstExisting,
 } = require('./lib/speed-camera-writer.cjs');
 const { createGeocoder } = require('./lib/geocoder.cjs');
@@ -157,6 +158,20 @@ function logClassificationCounts(sourceName, records) {
   console.error(
     `[speed-camera-sync] ${sourceName} 測速分類：確認 ${counts.confirmed}／排除 ${counts.rejected}／待確認 ${counts.unknown}`
   );
+}
+
+function collapseSourceRecords(records, sourceName) {
+  const result = collapseSourceConflictDuplicates(records, NATIONAL_NPA_DEDUPE_THRESHOLD_M);
+  if (result.duplicateCount > 0) {
+    console.error(
+      `[speed-camera-sync] ${sourceName} 同來源 conflict key 去重：合併 ` +
+        `${result.duplicateCount} 筆` +
+        (result.speedLimitConflictCount > 0
+          ? `（速限衝突 ${result.speedLimitConflictCount} 筆，採較低值）`
+          : '')
+    );
+  }
+  return result.records;
 }
 
 // module.exports.sleep 可在測試中被覆寫以跳過真實等待；正式執行永遠是真實 delay。
@@ -313,6 +328,7 @@ async function syncAll() {
       let records = await parse(buffer, fetchedAt);
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       logClassificationCounts(source.name, records);
+      records = collapseSourceRecords(records, source.name);
 
       if (source.dedupeAgainstOtherSources) {
         const before = records.length;
@@ -392,6 +408,8 @@ async function writeAll(supabase, opts = {}) {
             `超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
         );
       }
+
+      records = collapseSourceRecords(records, source.name);
 
       if (source.dedupeAgainstOtherSources) {
         const before = records.length;
