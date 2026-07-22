@@ -68,6 +68,35 @@ test('toUpsertPayload：有值的 direction 原樣保留', () => {
   assert.equal(payload.updated_at, '2026-07-05T00:00:00.000Z');
 });
 
+test('toUpsertPayload：測速確認、道路類別與方向語意完整寫入', () => {
+  const payload = toUpsertPayload({
+    city: '國道五號',
+    address: '雪山隧道南下',
+    road: '國道五號',
+    direction: '南下',
+    speed_limit: 90,
+    lat: 24.9,
+    lng: 121.7,
+    speed_status: 'confirmed',
+    enforcement_items_raw: null,
+    classification_basis: 'source_contract:speed_only',
+    camera_type: 'fixed',
+    road_class: 'freeway',
+    road_level: 'tunnel',
+    direction_mode: 'single',
+    direction_bearing: 180,
+    source: 'national-npa',
+    fetched_at: '2026-07-22T00:00:00.000Z',
+  }, '2026-07-22T00:00:00.000Z');
+
+  assert.equal(payload.speed_status, 'confirmed');
+  assert.equal(payload.camera_type, 'fixed');
+  assert.equal(payload.road_class, 'freeway');
+  assert.equal(payload.direction_mode, 'single');
+  assert.equal(payload.direction_bearing, 180);
+  assert.equal(payload.classification_basis, 'source_contract:speed_only');
+});
+
 test('toUpsertPayload：所有筆都帶上同一個本輪批次 updated_at', () => {
   const records = [
     { city: 'A', address: 'a', source: 's', fetched_at: 't1' },
