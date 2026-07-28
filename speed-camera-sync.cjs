@@ -37,6 +37,7 @@ const {
   parseTainan,
   parseTaichung,
   parseTaichungMobile,
+  parseFreewayNpa,
   parseNationalNpa,
 } = require('./lib/speed-camera-parser.cjs');
 const { isConfirmedSpeedRecord } = require('./lib/speed-camera-metadata.cjs');
@@ -96,9 +97,13 @@ const SOURCES = [
   },
   {
     name: 'taoyuan',
-    url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download',
+    url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/36e77f60-dabe-4fd0-8f69-a99f9acfd6f4/download',
     parse: parseTaoyuan,
-    fallbackUrls: [],
+    fallbackUrls: [
+      {
+        url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download',
+      },
+    ],
   },
   {
     name: 'tainan',
@@ -123,17 +128,25 @@ const SOURCES = [
     fallbackUrls: [],
   },
   {
+    // 高速公路局／警政署國道固定式測速照相點位（TGOS ZIP）。
+    // 放在 national-npa 之前，讓較豐富的國道設備／取締欄位在 30m 去重時優先保留。
+    name: 'freeway-npa',
+    url: 'https://www.tgos.tw/tgos/VirtualDir/Product/c2dd3a68-cafc-48fc-8a4a-7215ddc24cd3/1150720-%E5%9C%8B%E9%81%93%E5%85%AC%E8%B7%AF%E5%9B%BA%E5%AE%9A%E5%BC%8F%E6%B8%AC%E9%80%9F%E7%85%A7%E7%9B%B8%E5%9C%B0%E9%BB%9E.zip',
+    parse: parseFreewayNpa,
+    fallbackUrls: [],
+  },
+  {
     // 警政署全國集「測速執法設置點」（data.gov.tw/dataset/7320）。parser 不依 CityName、
     // 縣市字尾或道路名稱排除任何有效座標；六都、其他縣市及國道／公路資料全部保留。
     // 與自建源的重複收錄只由 writeAll 的座標聯集去重處理（見 dedupeAgainstExisting）：
-    // 與本輪其他六個來源座標 haversine ≤30m 視為同一點才丟棄，其餘完整保留。
-    // 必須排在 SOURCES 陣列最後，writeAll 才能在處理它之前先收集完其他六源的座標。
+    // 與本輪前置來源座標 haversine ≤30m 視為同一點才丟棄，其餘完整保留。
+    // 必須排在 SOURCES 陣列最後，writeAll 才能先收集完前置來源（含 freeway-npa）的座標。
     name: 'national-npa',
-    url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/E42179E4-94DA-40D2-9230-6A9D33171A36/download',
+    url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/527BAB7B-7F3A-4DA2-BE84-75E0BE110975/download',
     parse: parseNationalNpa,
     fallbackUrls: [
       {
-        url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/8B41C4A6-9607-4E1C-9D86-148E6B3D68A5/download',
+        url: 'https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/D737B2D5-B478-42C9-BE8C-94A5FBB7D907/download',
       },
     ],
     dedupeAgainstOtherSources: true,
