@@ -6,6 +6,9 @@ const assert = require('node:assert/strict');
 const {
   classifySpeedStatus,
   classifyCameraType,
+  classifySpeedTaxonomy,
+  projectLegacyCameraType,
+  isSnowMountainTunnelRadarPoint,
   inferRoadClass,
   inferRoadLevel,
   parseDirection,
@@ -28,6 +31,10 @@ test('測速確認狀態與設備型態分離：固定設備不等於一定取�
     sourceContract: 'mixed',
     text: '測速警告標誌旁',
   }).status, 'rejected', '官方取締項目存在時，不得被地址中的「測速」字樣翻盤');
+  assert.equal(classifySpeedStatus({
+    sourceContract: 'mixed',
+    text: '測速警告標誌旁',
+  }).status, 'unknown', '地址或地名中的測速字樣不得替代官方逐筆取締證據');
   assert.equal(classifyCameraType({ explicitType: '固定式科技執法' }), 'fixed');
 });
 
@@ -36,6 +43,86 @@ test('來源契約明確限定測速時可直接確認，移動式仍只代表�
   assert.equal(classifySpeedStatus({ sourceContract: 'mobile_speed' }).status, 'confirmed');
   assert.equal(classifyCameraType({ explicitType: '移動式測速地點' }), 'mobile');
   assert.equal(classifyCameraType({ explicitType: '區間平均速率' }), 'section');
+});
+
+test('明示非測速項目優先於 speed_only 來源契約，避免把闖紅燈列誤收', () => {
+  assert.deepEqual(
+    classifySpeedStatus({ explicitItems: '闖紅燈、未依號誌', sourceContract: 'speed_only' }),
+    { status: 'rejected', basis: 'source_field:non_speed' }
+  );
+});
+
+test('taxonomy 證據不足時 fail-closed，科技執法不推測 radar/laser', () => {
+  assert.deepEqual(classifySpeedTaxonomy(), {
+    installation_class: 'unknown',
+    speed_measurement_mode: 'unknown',
+    sensor_technology: 'unknown',
+    taxonomy_basis: 'insufficient_evidence',
+    taxonomy_source_url: null,
+    taxonomy_observed_at: null,
+    camera_type: 'unknown',
+  });
+  const technology = classifySpeedTaxonomy({ address: '某路口科技執法' });
+  assert.equal(technology.installation_class, 'integrated_technology');
+  assert.equal(technology.sensor_technology, 'unknown');
+  assert.equal(technology.camera_type, 'unknown');
+});
+
+test('legacy camera_type 僅由正交 taxonomy 明確投影', () => {
+  assert.equal(projectLegacyCameraType({
+    installation_class: 'traditional_fixed',
+    speed_measurement_mode: 'point',
+  }), 'fixed');
+  assert.equal(projectLegacyCameraType({
+    installation_class: 'mobile',
+    speed_measurement_mode: 'unknown',
+  }), 'mobile');
+  assert.equal(projectLegacyCameraType({
+    installation_class: 'integrated_technology',
+    speed_measurement_mode: 'section_average',
+  }), 'section');
+  assert.equal(projectLegacyCameraType({
+    installation_class: 'integrated_technology',
+    speed_measurement_mode: 'point',
+  }), 'unknown');
+});
+
+test('雪山隧道 override 只接受南北向各八個精確里程', () => {
+  const kms = ['16.9', '18.3', '19.7', '21.1', '22.5', '23.9', '25.3', '26.7'];
+  for (const direction of ['南向', '北向']) {
+    for (const km of kms) {
+      assert.equal(isSnowMountainTunnelRadarPoint({
+        source: 'freeway-npa',
+        address: `國道五號${direction}${km}公里`,
+      }), true);
+    }
+  }
+  assert.equal(isSnowMountainTunnelRadarPoint({
+    source: 'freeway-npa',
+    address: '國道五號北向28.3公里',
+  }), false);
+  assert.equal(isSnowMountainTunnelRadarPoint({
+    source: 'national-npa',
+    city: '國道5號',
+    address: '國道5號南向16.9公里（雪山隧道科技執法）',
+  }), true);
+});
+
+test('雪山隧道 taxonomy 分開記錄 integrated 與 radar/point 官方依據', () => {
+  const taxonomy = classifySpeedTaxonomy({
+    source: 'freeway-npa',
+    address: '國道五號南向16.9公里',
+    enforcementItemsRaw: '超速',
+    equipmentTypeRaw: '雷達',
+  });
+  assert.equal(taxonomy.installation_class, 'integrated_technology');
+  assert.equal(taxonomy.speed_measurement_mode, 'point');
+  assert.equal(taxonomy.sensor_technology, 'radar');
+  assert.equal(taxonomy.camera_type, 'unknown');
+  assert.match(taxonomy.taxonomy_basis, /dataset_100857/);
+  assert.match(taxonomy.taxonomy_basis, /dataset_13940/);
+  assert.equal(taxonomy.taxonomy_source_url, 'https://data.gov.tw/dataset/13940');
+  assert.equal(taxonomy.taxonomy_observed_at, '2026-07-28T00:00:00.000+08:00');
 });
 
 test('道路類別只用可驗證文字判斷：國道、快速道路、一般道路分開', () => {
@@ -61,7 +148,7 @@ test('withCameraMetadata 產生 App 通報所需完整語意欄位', () => {
     direction: '南下',
   }, {
     sourceContract: 'speed_only',
-    explicitType: '固定式測速',
+    equipmentTypeRaw: '固定式測速',
   });
 
   assert.equal(record.speed_status, 'confirmed');

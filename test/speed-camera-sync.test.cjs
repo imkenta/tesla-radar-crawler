@@ -61,6 +61,11 @@ const TAICHUNG_MOBILE_CSV =
   '1,第一分局,西區,民權路近中華西街口,西往東,60,24.14342495,120.6737215\n' +
   '2,第一分局,西區,民權路近中華西街口,西往東,50,24.14342495,120.6737215\n';
 
+const FREEWAY_NPA_ZIP = Buffer.from(
+  fs.readFileSync(path.join(__dirname, 'fixtures', 'speed-camera-freeway-npa.zip.b64'), 'utf8').trim(),
+  'base64'
+);
+
 // 全國集：第 1 筆座標與 NTPC_CSV 那筆（新北市八里區，121.38151,25.14027）幾乎重合
 // （僅飄移數公尺，< 30m 門檻）→ 應被聯集去重丟棄；第 2 筆（金門縣）距離所有既有源都
 // 很遠 → 應保留。（刻意選新北市而非台北市：TAIPEI_CSV fixture 是 Big5 編碼樣本，若在此
@@ -183,7 +188,7 @@ function fetchReturning(csvBySourceName) {
   });
 }
 
-test('writeAll：九個 source 全部成功 → upsert 帶正確 onConflict、批次時間戳一致；全國集執行期聯集去重正確運作', async (t) => {
+test('writeAll：十個 source 全部成功 → source order、upsert 與全國集聯集去重正確運作', async (t) => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetchReturning({
     taipei: TAIPEI_CSV,
@@ -194,6 +199,7 @@ test('writeAll：九個 source 全部成功 → upsert 帶正確 onConflict、�
     tainan: TAINAN_CSV,
     taichung: TAICHUNG_PDF,
     'taichung-mobile': TAICHUNG_MOBILE_CSV,
+    'freeway-npa': FREEWAY_NPA_ZIP,
     'national-npa': NATIONAL_NPA_CSV,
   });
   t.after(() => {
@@ -208,18 +214,18 @@ test('writeAll：九個 source 全部成功 → upsert 帶正確 onConflict、�
 
   const summary = await writeAll(supabase, { geocoder });
 
-  assert.equal(summary.sourceResults.length, 9);
+  assert.equal(summary.sourceResults.length, 10);
   assert.ok(summary.sourceResults.every((r) => r.ok === true));
   assert.deepEqual(
     summary.sourceResults.map((r) => r.name),
-    ['taipei', 'new-taipei', 'new-taipei-section', 'kaohsiung', 'taoyuan', 'tainan', 'taichung', 'taichung-mobile', 'national-npa']
+    ['taipei', 'new-taipei', 'new-taipei-section', 'kaohsiung', 'taoyuan', 'tainan', 'taichung', 'taichung-mobile', 'freeway-npa', 'national-npa']
   );
   assert.deepEqual(
     summary.sourceResults.map((r) => r.written),
-    [1, 1, 2, 1, 1, 1, 31, 1, 1] // national-npa：2 筆解析出，1 筆與新北市重疊被去重丟棄
+    [1, 1, 2, 1, 1, 1, 31, 1, 4, 1] // freeway 保留 rejected 列供稽核；national 2 筆中 1 筆重疊
   );
 
-  assert.equal(calls.upsert.length, 9);
+  assert.equal(calls.upsert.length, 10);
   for (const c of calls.upsert) {
     assert.deepEqual(c.opts, { onConflict: 'source,address,direction' });
     // 每筆 payload 的 updated_at 都等於本輪批次時間戳
@@ -246,9 +252,10 @@ test('writeAll：九個 source 全部成功 → upsert 帶正確 onConflict、�
   assert.equal(nationalUpsertCall.payload[0].city, '金門縣');
 
   // stale 清除：每個 source 各呼叫一次 delete，條件為 source= 該名稱、fetched_at < 批次時間戳
-  assert.equal(calls.delete.length, 9);
+  assert.equal(calls.delete.length, 10);
   const deletedSourceNames = calls.delete.map((c) => c.eq.source).sort();
   assert.deepEqual(deletedSourceNames, [
+    'freeway-npa',
     'kaohsiung',
     'national-npa',
     'new-taipei',

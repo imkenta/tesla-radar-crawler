@@ -14,6 +14,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const iconv = require('iconv-lite');
 
 const {
   parseTaipei,
@@ -25,6 +26,7 @@ const {
   parseTainan,
   parseTaichung,
   parseTaichungMobile,
+  parseFreewayNpa,
   parseNationalNpa,
   cleanTainanLocation,
   toSpeedLimit,
@@ -321,6 +323,51 @@ test('parseTaoyuan：Big5 編碼 CSV，且「經度/緯度」欄位在不同設�
       fetched_at: FIXED_NOW,
     },
   ]);
+});
+
+test('parseTaoyuan：現行 schema 分開保留型式與取締項目，非測速列 fail-closed', () => {
+  const buffer = Buffer.from(
+    fixtureBuffer('speed-camera-taoyuan-v2.csv.b64').toString('utf8').trim(),
+    'base64'
+  );
+  const result = parseTaoyuan(buffer, FIXED_NOW);
+  assert.equal(result.length, 3);
+  assert.equal(result[0].equipment_id_raw, '1');
+  assert.equal(result[0].equipment_type_raw, '測速暨闖紅燈照相執法');
+  assert.equal(result[0].enforcement_items_raw, '超速');
+  assert.equal(result[0].speed_status, 'confirmed');
+  assert.equal(result[0].lat, 25.00729);
+  assert.equal(result[0].lng, 121.32475);
+  assert.equal(result[2].speed_measurement_mode, 'section_average');
+  assert.equal(result[2].sensor_technology, 'average_speed');
+  assert.equal(result[2].camera_type, 'section');
+  assert.equal(result[2].speed_status, 'confirmed');
+
+  const redLightOnly = iconv.encode(
+    '設備編號,型式,縣市,行政區,設置區域描述,設置地點_路口或路段,取締項目,座標緯度,座標經度,拍攝方向,速限,管轄單位,備註\n' +
+      '999,測速暨闖紅燈照相執法,桃園市,桃園區,,測試路口,闖紅燈、未依標誌標線號誌,25.0,121.3,南向北,50,測試單位,\n',
+    'big5'
+  );
+  assert.equal(parseTaoyuan(redLightOnly, FIXED_NOW)[0].speed_status, 'rejected');
+});
+
+test('parseFreewayNpa：記憶體內解 ZIP、排除 manifest，保留 raw 與無效座標列', async () => {
+  const buffer = Buffer.from(
+    fixtureBuffer('speed-camera-freeway-npa.zip.b64').toString('utf8').trim(),
+    'base64'
+  );
+  const result = await parseFreewayNpa(buffer, FIXED_NOW);
+  assert.equal(result.length, 4);
+  assert.equal(result[0].equipment_type_raw, '雷達');
+  assert.equal(result[0].enforcement_items_raw, '超速');
+  assert.equal(result[0].sensor_technology, 'radar');
+  assert.equal(result[1].installation_class, 'integrated_technology');
+  assert.equal(result[1].taxonomy_source_url, 'https://data.gov.tw/dataset/13940');
+  assert.equal(result[2].equipment_id_raw, '154');
+  assert.equal(result[2].lat, 25.03584);
+  assert.equal(result[2].lng, null);
+  assert.equal(result[3].speed_status, 'rejected');
+  assert.equal(result[3].sensor_technology, 'laser');
 });
 
 test('parseTainan：UTF-8 BOM CSV，行政區代碼轉區名、設置位置清理雜訊、lat/lng 一律 null（golden）', () => {

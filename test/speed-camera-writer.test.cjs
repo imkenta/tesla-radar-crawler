@@ -98,6 +98,33 @@ test('toUpsertPayload：測速確認、道路類別與方向語意完整寫入',
   assert.equal(payload.classification_basis, 'source_contract:speed_only');
 });
 
+test('toUpsertPayload：taxonomy 與 equipment raw 完整寫入，但 parser-only equipment id 不外送', () => {
+  const payload = toUpsertPayload({
+    city: '國道五號',
+    address: '國道五號南向16.9公里',
+    source: 'freeway-npa',
+    fetched_at: '2026-07-28T00:00:00.000Z',
+    equipment_type_raw: '雷達',
+    equipment_id_raw: '145',
+    installation_class: 'integrated_technology',
+    speed_measurement_mode: 'point',
+    sensor_technology: 'radar',
+    taxonomy_basis: 'official',
+    taxonomy_source_url: 'https://data.gov.tw/dataset/13940',
+    taxonomy_observed_at: '2026-07-28T00:00:00.000+08:00',
+    camera_type: 'unknown',
+  }, '2026-07-28T00:00:00.000Z');
+
+  assert.equal(payload.equipment_type_raw, '雷達');
+  assert.equal(payload.installation_class, 'integrated_technology');
+  assert.equal(payload.speed_measurement_mode, 'point');
+  assert.equal(payload.sensor_technology, 'radar');
+  assert.equal(payload.taxonomy_basis, 'official');
+  assert.equal(payload.taxonomy_source_url, 'https://data.gov.tw/dataset/13940');
+  assert.equal(payload.taxonomy_observed_at, '2026-07-28T00:00:00.000+08:00');
+  assert.equal(Object.hasOwn(payload, 'equipment_id_raw'), false);
+});
+
 test('toUpsertPayload：所有筆都帶上同一個本輪批次 updated_at', () => {
   const records = [
     { city: 'A', address: 'a', source: 's', fetched_at: 't1' },

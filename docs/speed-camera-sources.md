@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|---|---|
 | 台北市 | [固定測速照相地點表](https://data.taipei/dataset/detail?id=745b8808-061f-4f5b-9a62-da1590c049a9) | CSV | 有（緯度、經度） | 不定期 | **Big5**（需轉碼） | 144 筆 | ✅ |
 | 新北市 | [固定式測速照相（全市總表）](https://data.ntpc.gov.tw/datasets/99f3ff6e-0352-4399-a726-775ab765a1dc) | CSV | 有（longitude/latitude） | 不定期 | UTF-8 (BOM) | 190 筆 | ✅ |
-| 桃園市 | [桃園市固定式測速照相](https://data.gov.tw/dataset/25935) | CSV | 有（經度/緯度，⚠️部分列順序相反，見下） | 不定期 | **Big5**（需轉碼） | 171 筆 | ✅（R8） |
+| 桃園市 | [桃園市固定式測速照相](https://data.gov.tw/dataset/25935) | CSV | 有（現行 schema 為座標緯度/座標經度） | 不定期 | **Big5**（需轉碼） | 118 筆（2026-07-28） | ✅（現行與舊 schema） |
 | 高雄市 | [111年固定式違規照相設備及科技執法](https://data.gov.tw/dataset/148455) | CSV/JSON | 有（座標緯N度/座標經E度，非標準欄位命名） | 不定期 | UTF-8 (BOM) | 248 筆 | ✅ |
 | 台中市 | [固定式科學儀器執法設備取締地點一覽表](https://www.police.taichung.gov.tw/traffic/home.jsp?id=55&parentpath=0,5,53) | PDF（文字型） | 有（座標緯度/座標經度） | 不定期 | UTF-8（PDF 文字層） | 229 筆 | ✅（R8，PDF spike 判定為文字型，已實作） |
 | 台南市 | [智慧管理科技執法設備設置地點](https://data.tainan.gov.tw/Resource/1c7e82f0-d6b2-4b20-aeff-5c768100f82c) | CSV/JSON | 無（geocode 補值） | 最後更新 2025-12-26 | UTF-8 (BOM) | 72 筆 | ✅（R8，geocode） |
@@ -46,11 +46,11 @@
 
 ### 桃園市 —— 有座標（R8 已實作，source=`taoyuan`）
 - 資料集：`桃園市固定式測速照相`
-- 下載連結（CSV，Big5 編碼）：
-  `https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download`
-- 欄位：`設備類別,設置縣市代碼,設置行政區,設置行政區代碼,設置地址,管轄警局,管轄警局機關代碼,管轄分局,管轄分局機關代碼,經度,緯度,拍攝方向,速限`
-- 陷阱1：Big5 編碼；地址是片段（如「成功路三段235號前」），不含行政區全名，組完整地址需拼接「設置行政區」欄位。
-- 陷阱2（R8 實測發現，文件未記載）：表頭寫「經度,緯度」，但**只有「固定式測速照相設備」類型該兩欄順序與表頭一致**；「路口多功能測速照相設備」「區間平均速率測速照相設備」兩種類型（全檔 171 筆中 58 筆）該兩欄實際是「緯度,經度」（順序相反）。`parseTaoyuan`（`lib/speed-camera-parser.cjs`）改用數值大小判斷：台灣經度（~119-122）恆大於緯度（~21-27），取兩欄中較大者為經度，不依欄位名/順序假設。實測 171 筆全數落在台灣經緯度範圍內（lat 24.79-25.12、lng 121.01-121.41）。
+- 現行主下載連結（CSV，Big5 編碼）：`https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/36e77f60-dabe-4fd0-8f69-a99f9acfd6f4/download`
+- 舊資源 fallback：`https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download`
+- 現行欄位：`設備編號,型式,縣市,行政區,設置區域描述,設置地點_路口或路段,取締項目,座標緯度,座標經度,拍攝方向,速限,管轄單位,備註`。2026-07-28 實測 118 筆，118 筆座標皆有效。
+- 現行 `型式` 與 `取締項目` 必須分開保留；逐筆分類得到 confirmed 113、rejected 5。6 筆區間平均速率明確投影為 `section_average`／`average_speed`，其餘不得從資料集名稱推測固定式或感測器。
+- 舊 schema 仍由 fallback 支援：`設備類別,...,經度,緯度,...`。其欄名和值曾因設備類型互換，parser 僅對舊 schema 使用台灣經度大於緯度的數值範圍校正；現行 schema 直接依明確欄名解析。
 
 ### 台中市 —— 查無結構化開放資料，PDF spike（R8）判定文字型、已實作（source=`taichung`）
 - 台中市政府資料開放平台（opendata.taichung.gov.tw）搜尋「科技執法」「固定式測速照相」查無對應資料集，確認仍只有 PDF。
@@ -165,3 +165,33 @@ DB 總筆數：1053 → 2193（+1140，全部來自 national-npa 執行期聯集
 各 source：taipei 143／new-taipei 190／kaohsiung 248／taoyuan 171／tainan 72／taichung 229／**national-npa 1140**（解析 1698 筆，去重丟棄 558 筆）。
 
 national-npa 入庫後縣市分佈：臺南市 139、屏東縣 106、雲林縣 95、彰化縣 95、臺中市 80、基隆市 78、宜蘭縣 76、苗栗縣 68、新竹縣 59、新竹市 58、高雄市 47、南投縣 39、花蓮縣 37、金門縣 37、桃園市 35、澎湖縣 33、嘉義縣 26、臺東縣 16、嘉義市 11、臺北市 4、新北市 1。
+
+---
+
+# 測速 taxonomy 與國道專源（2026-07-28）
+
+## 正交欄位與 fail-closed 規則
+
+舊 `camera_type` 同時混合設備佈署、測量方式與感測器，無法誠實表達科技執法或區間測速。本輪新增三個正交欄位：
+
+- `installation_class`: `traditional_fixed | integrated_technology | mobile | unknown`
+- `speed_measurement_mode`: `point | section_average | unknown`
+- `sensor_technology`: `radar | laser | vision | inductive_loop | average_speed | mixed | unknown`
+
+逐筆保留 `equipment_type_raw`，並以 `taxonomy_basis`、`taxonomy_source_url`、`taxonomy_observed_at` 記錄依據。未命中明確逐筆文字、來源契約或窄範圍官方點位 override 時維持 `unknown`；「科技執法」只足以判斷 `integrated_technology`，不得推測雷達或雷射。相容欄位 `camera_type` 僅由 taxonomy 投影：區間為 `section`、移動式為 `mobile`、明確傳統固定且點測速為 `fixed`，其餘為 `unknown`。
+
+測速資格先看逐筆 `enforcement_items_raw`：含超速／測速／平均速率才確認；明示闖紅燈、違停、安全距離等非測速項目則排除。只有逐筆欄位缺失時，才允許 `speed_only`、`mobile_speed`、`section_speed` 來源契約補足，避免來源名稱把混合資料中的非測速列誤收。
+
+## `freeway-npa` 國道固定式專源
+
+- 資料集：國道公路固定式測速照相地點（[data.gov.tw/dataset/13940](https://data.gov.tw/dataset/13940)）。
+- 格式：TGOS ZIP，內含一個資料 CSV 與 `manifest.csv`。parser 使用直接依賴 `yauzl` 在記憶體中讀取唯一非 manifest CSV，不把 ZIP entry 解壓到檔案系統。
+- 欄位：`設備編號,型式,縣市,行政區,設置區域描述,設置地點,取締項目,座標緯度,座標經度,拍攝方向,速限,管轄單位,備註`。
+- `SOURCES` 順序固定為 `taipei → new-taipei → new-taipei-section → kaohsiung → taoyuan → tainan → taichung → taichung-mobile → freeway-npa → national-npa`。國道專源先進入座標聯集，最後的全國集才做 30 公尺座標去重，因此同點優先保留 raw 欄位較完整的國道專源。
+- 無效座標不導致整列消失：例如經度髒字串會保留該筆、該維度為 `null`，便於稽核與由其他來源補位。
+
+雪山隧道只對官方逐點核對的 16 個國五點位套用窄 override：南向、北向各 8 個，里程集合固定為 `16.9, 18.3, 19.7, 21.1, 22.5, 23.9, 25.3, 26.7` 公里。設備佈署依據來自 dataset 100857，點測速與雷達依據來自 dataset 13940；其他國五、其他隧道或近似文字均不得泛化。
+
+## 桃園現行資源
+
+主資源更新為 `36e77f60-dabe-4fd0-8f69-a99f9acfd6f4`，舊 `6feee4ed-0221-40f2-bca1-980669e8d554` 保留為 fallback。現行 Big5 schema 分開提供 `型式`、`取締項目` 與明確 `座標緯度／座標經度`；parser 同時支援舊 schema 的經緯度錯置修復。現行混合資料的紅燈專用列會依逐筆取締項目排除，不會被資料集的測速來源契約翻盤。
