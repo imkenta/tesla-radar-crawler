@@ -133,6 +133,31 @@ test('道路類別只用可驗證文字判斷：國道、快速道路、一般�
   assert.equal(inferRoadLevel('國道五號南下'), 'unknown');
 });
 
+test('inferRoadClass：freeway-npa 縣市留白時仍能從 road 判斷國道（2026-08-03 雪隧對向測速誤放行事故回歸測試）', () => {
+  // data.gov.tw/dataset/13940（freeway-npa）的「縣市」「行政區」欄位固定留白，路名只
+  // 出現在「設置地點」（parser 對應到 road 欄，例：「國道五號北向16.9公里」）。
+  // 2026-08-02 全量重建後這批國道五號記錄的 road_class 全掉成 unknown，
+  // iOS 端對向測速排除的第一道閘門 roadClass=='freeway' 因此失效直接放行，
+  // 8/3 雪山隧道實車整路收到對向測速重複通報。
+  assert.equal(
+    inferRoadClass({ city: '', road: '國道五號北向16.9公里', address: '國道五號北向16.9公里' }),
+    'freeway'
+  );
+  assert.equal(
+    inferRoadClass({ city: '', road: '國道一號南向2公里', address: '國道一號南向2公里' }),
+    'freeway'
+  );
+  // 反向守門：省道與市區路名不得因縣市留白就被國道規則誤判
+  assert.notEqual(
+    inferRoadClass({ city: '', road: '台9線79k+550m環市東路與192甲線路口', address: '' }),
+    'freeway'
+  );
+  assert.equal(
+    inferRoadClass({ city: '宜蘭縣', road: '台9線78k中山路五段南下', address: '' }),
+    'ordinary'
+  );
+});
+
 test('方向標準化保留單向、雙向與無法換算方位的地標方向', () => {
   assert.deepEqual(parseDirection('南下'), { mode: 'single', bearing: 180 });
   assert.deepEqual(parseDirection('南向北(超速)'), { mode: 'single', bearing: 0 });

@@ -368,6 +368,13 @@ test('parseFreewayNpa：記憶體內解 ZIP、排除 manifest，保留 raw 與�
   assert.equal(result[2].lng, null);
   assert.equal(result[3].speed_status, 'rejected');
   assert.equal(result[3].sensor_technology, 'laser');
+
+  // road_class 回歸守門：freeway-npa 的縣市／行政區欄位固定留白，
+  // 只有 road（設置地點）帶「國道」字樣，2026-08-03 雪隧對向測速誤放行事故即源於此。
+  assert.equal(result[0].road_class, 'freeway', '國道一號南向2公里');
+  assert.equal(result[1].road_class, 'freeway', '國道五號南向16.9公里（雪隧科技執法點）');
+  assert.equal(result[2].road_class, 'freeway', '國道五號北向接國3南向南港系統公里');
+  assert.equal(result[3].road_class, 'ordinary', '測試縣有實際行政區字尾，不得被國道規則誤判');
 });
 
 test('parseTainan：UTF-8 BOM CSV，行政區代碼轉區名、設置位置清理雜訊、lat/lng 一律 null（golden）', () => {
@@ -599,6 +606,11 @@ test('parseNationalNpa：只跳過無效座標說明列，縣市與國道路段�
     assert.ok(r.lat > 21 && r.lat < 26, `lat 超出範圍：${r.lat}`);
     assert.ok(r.lng > 118 && r.lng < 123, `lng 超出範圍：${r.lng}`);
   }
+
+  // road_class 守門：national-npa 的 CityName 直接是「國道一號」時要能推導 freeway，
+  // 台9線省道即使掛在真實縣市（宜蘭縣）底下也不得被誤判成國道或快速道路。
+  assert.equal(result[2].road_class, 'ordinary', '宜蘭縣 台9線78k中山路五段南下');
+  assert.equal(result[4].road_class, 'freeway', '國道一號南向306.1公里');
 });
 
 test('parseNationalNpa：CityName 空白或任意內容都不構成排除條件', () => {
