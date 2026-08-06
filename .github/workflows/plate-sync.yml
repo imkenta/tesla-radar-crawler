@@ -12,44 +12,30 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read # checkout 需要
-  actions: read  # guard 需要查詢執行中的 run
+  contents: read # checkout 需要（actions: read 隨 guard 一併移除，2026-08-07）
 
 jobs:
-  # 「跳過重複觸發」閘門（2026-06-19 新增）：
-  # cron-job.org 固定每 20 分觸發一次，正常 run 約 10~15 分跑完、不會重疊。
-  # 但偶爾單次 run 會超過 20 分鐘，這時下一輪觸發進來，若放任排隊就會互相取消（連鎖癱瘓）。
-  # 解法：每個新 run 先檢查是否已有另一個 run 正在執行；有的話這一輪直接跳過——
-  # 不排隊、也不打斷正在跑的（保護 staging table），等下一個 20 分週期即可。
-  # 注意：每次觸發仍會建立一個 run（可確認觸發正常），只是重複的那個會秒跳過。
-  guard:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-    steps:
-      - name: Skip if another run is already in progress
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          COUNT=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/plate-sync.yml/runs?status=in_progress&per_page=100" \
-            --jq '.total_count' 2>/dev/null || echo "")
-          echo "目前 in_progress 的 run 數（含自己）：${COUNT:-查詢失敗}"
-          if [ -z "$COUNT" ]; then
-            echo "::warning::無法查詢執行中的 run（API 失敗），保險起見照常執行。"
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$COUNT" -gt 1 ]; then
-            echo "::notice::已有另一輪 plate-sync 在執行，跳過這一輪以避免互踩。"
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          fi
-
+  # 2026-08-07: 移除 guard job（原「跳過重複觸發」閘門，2026-06-19 加入）。
+  #
+  # 移除理由一：它從來沒生效過（死碼）。
+  #   guard 的邏輯是「查到有另一輪 in_progress 就跳過這一輪」，但上方 workflow-level
+  #   concurrency 已經先把新 run 擋在鎖外；等 guard 真的開始執行時，前一輪按定義必然已經
+  #   結束，所以它查到的 in_progress 永遠只有自己，永遠回 should_run=true。
+  #   實證（2026-08-06）：連續三輪的 guard 建立時刻＝前一輪的完成時刻，一秒不差
+  #   （#7771 21:37:18 / #7772 21:58:45 / #7773 22:12:18）。
+  #
+  # 移除理由二：它是失敗放大器，正是 2026-08-06 雪崩的元凶。
+  #   guard 實跑只要 4 秒，卻設了 timeout-minutes: 2。當 GitHub runner 池擁塞時它分不到
+  #   runner，卡 7~19 分鐘後被以「exceeded maximum execution time of 2m0s」砍掉；
+  #   而 sync-plates 有 needs: guard，於是五個 shard 全部 skipped——該輪一筆資料都沒爬，
+  #   卻仍佔著 plate-sync-workflow 這把鎖十幾分鐘，把下一輪擋在門外，接力雪崩。
+  #   實證：#7755 / #7761 / #7764 / #7770 四輪皆為 guard cancelled → sync-plates skipped。
+  #
+  # 移除理由三：少一個 job 就少搶一個並行 job 額度（該額度為帳號層級、跨 repo 共用）。
+  #
+  # 防重疊保護不受影響：真正在做互斥的一直是上方的 workflow-level concurrency
+  # （group: plate-sync-workflow, cancel-in-progress: false），staging table 仍受保護。
   sync-plates:
-    needs: guard
-    if: needs.guard.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     # 卡死的 shard 最多跑 45 分鐘就被砍，避免霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。
     # 45 分是依歷史成功耗時（11~49 分）抓的上限：不誤殺正常慢 run，又能及早終結 hang。
