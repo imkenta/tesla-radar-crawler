@@ -16,11 +16,37 @@ const {
     selectAliveCombo,
     LadderState,
     classifyQuotaError,
+    isUnsupportedLocationError,
     isServerError,
     QUOTA_PER_MINUTE,
     QUOTA_PER_DAY,
     QUOTA_UNKNOWN,
 } = require('../lib/ai-model-ladder.cjs');
+
+// --- 不支援地區：基礎設施 fatal，不得污染模型階梯 ---
+
+test('isUnsupportedLocationError：Gemini 實戰 400 地區錯誤 → true', () => {
+    const err = new Error('[400 Bad Request] User location is not supported for the API use.');
+    err.status = 400;
+    assert.equal(isUnsupportedLocationError(err), true);
+});
+
+test('isUnsupportedLocationError：SDK 未提供 status 時仍由精確訊息判定 → true', () => {
+    const err = new Error('Error fetching from generativelanguage.googleapis.com: User location is not supported for the API use.');
+    assert.equal(isUnsupportedLocationError(err), true);
+});
+
+test('isUnsupportedLocationError：其他 400 請求錯誤不得誤判', () => {
+    const err = new Error('[400 Bad Request] API key not valid.');
+    err.status = 400;
+    assert.equal(isUnsupportedLocationError(err), false);
+});
+
+test('isUnsupportedLocationError：429 配額錯誤不得誤判', () => {
+    const err = new Error('[429 Too Many Requests] User quota exceeded.');
+    err.status = 429;
+    assert.equal(isUnsupportedLocationError(err), false);
+});
 
 test('階梯定義：四層模型與升級門檻符合規格（2026-07-05 依實測配額擴充）', () => {
     assert.equal(MODEL_LADDER.length, 4);
@@ -334,6 +360,28 @@ test('LadderState：同層兩把 key 先後判死 → 跳層，且已死 combo �
     assert.deepEqual(next, { tierIndex: 1, model: 'gemma-4-31b-it', keyName: 'GEMINI_API_KEY_CENTRAL' });
     assert.equal(s.deadCombos.has(comboId('GEMINI_API_KEY_CENTRAL', 'gemma-4-26b-a4b-it')), true);
     assert.equal(s.deadCombos.has(comboId('GEMINI_API_KEY', 'gemma-4-26b-a4b-it')), true);
+});
+
+test('LadderState：最後一層兩把 key 判死但前層仍活著 → 回到第一個存活 combo，不得誤報全階梯耗盡', () => {
+    const s = new LadderState(KEYS);
+    s.tierIndex = MODEL_LADDER.length - 1;
+    s.keyName = KEYS[0];
+
+    const sameTierFallback = s.markCurrentComboDead();
+    assert.deepEqual(sameTierFallback, {
+        tierIndex: MODEL_LADDER.length - 1,
+        model: 'gemini-3-flash-preview',
+        keyName: 'GEMINI_API_KEY',
+    });
+
+    const wrapped = s.markCurrentComboDead();
+    assert.deepEqual(wrapped, {
+        tierIndex: 0,
+        model: 'gemma-4-26b-a4b-it',
+        keyName: 'GEMINI_API_KEY_CENTRAL',
+    });
+    assert.equal(s.deadCombos.size, 2);
+    assert.equal(s.isCurrentComboDead(), false);
 });
 
 test('LadderState：門檻升級時自動跳過已判死的層（今日實戰：31B 已死應零成本被跳過）', () => {

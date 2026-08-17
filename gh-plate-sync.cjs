@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isServerError, QUOTA_PER_DAY, resolveShardKeys } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -80,7 +80,7 @@ class RateLimiter {
 
         if (this.tokens <= 0) {
             const waitTime = this.interval - (now - this.lastRefill) + 1000;
-            console.log(`    [RateLimit] Quota exhausted. Waiting ${Math.ceil(waitTime/1000)}s...`);
+            console.log(`    [LocalPacing] 本機 ${this.limit} 次/分鐘節流窗口已滿，等待 ${Math.ceil(waitTime/1000)}s（不代表 Google 配額耗盡）...`);
             await new Promise(r => setTimeout(r, waitTime));
             this.tokens = this.limit;
             this.lastRefill = Date.now();
@@ -124,8 +124,9 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 //
 // 狀態機純邏輯在 lib/ai-model-ladder.cjs 的 LadderState（可測）；此處只做 I/O（API 呼叫、
 // 退避 sleep、log、SDK 重建）。2026-07-05 三次修正，依三 shard 實戰 log：
-// - 階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemma-4-31b-it(敗2)
-//   → gemini-3.1-flash-lite(敗2) → gemini-3-flash-preview(敗1) → EXHAUSTED。
+// - 一般失敗階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemma-4-31b-it(敗2)
+//   → gemini-3.1-flash-lite(敗2) → gemini-3-flash-preview(敗1)。PerDay 死亡卡在末層時
+//   可回找仍存活的前層；只有全部 key×model 都有明確 PerDay 429 才是 EXHAUSTED。
 // - 連續失敗才升級：成功呼叫重置當前層失敗計數（v1 累計語義讓中區在多次成功之間
 //   累積零星 500 也升級到已死的 31B——已修）。
 // - key 協同：同一層先試 shard key（GEMINI_API_KEY_{SHARD}），該 (key, model) 被日配額
@@ -136,7 +137,8 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 //   PerMinute 或無 PerDay 字樣 → 退避（RetryInfo.retryDelay 或 20s）同 combo 重試 1 次，
 //   成功不計數。
 // - 5xx → 退避 5-10 秒同 combo 重試 1 次，成功不計數，再失敗才計入升級門檻。
-// 狀態 per-instance/per-process：三個 shard 各自獨立，不共用不寫檔。
+// - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
+// 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
 class AIManager {
     constructor(shard) {
         this.shard = shard;
@@ -188,13 +190,19 @@ class AIManager {
         for (;;) {
             // EXHAUSTED 之後 ladder 仍指向最後一個（已死）combo：快速失敗，絕不再打已標死組合。
             if (this.ladder.isCurrentComboDead()) {
-                throw new Error(`[AI] 階梯耗盡：所有 (key, model) 組合本輪已標死（最後停在 ${this.currentKeyName}/${this.modelName}）`);
+                throw new Error(`[AI] 本輪所有 key/model 組合均已收到明確 PerDay 429（最後停在 ${this.currentKeyName}/${this.modelName}）`);
             }
             try {
                 const result = await this.model.generateContent(payload);
                 this.ladder.recordSuccess(); // 連續失敗語義：任何成功都重置當前層失敗計數
                 return result;
             } catch (e) {
+                // 出口地區不支援是基礎設施錯誤：切模型、切 key 都仍走同一出口，
+                // 不得累計一般失敗或污染死亡矩陣。
+                if (isUnsupportedLocationError(e)) {
+                    throw e;
+                }
+
                 const quota = classifyQuotaError(e);
 
                 // 日配額耗盡（quotaId 含 PerDay）→ 該 (key, model) 本輪標死、立即跳選。
@@ -205,10 +213,11 @@ class AIManager {
                     const next = this.ladder.markCurrentComboDead();
                     console.log(`💀 [AI] 日配額耗盡，標死 ${deadCombo}（本輪不再嘗試）`);
                     if (next === EXHAUSTED) {
-                        console.log('🛑 [AI] 所有 (key, model) 組合皆已標死，交回既有失敗處理。');
+                        console.log('🛑 [AI] 全部 key/model 組合均已由明確 PerDay 429 確認不可用，立即中止本輪。');
                         throw e;
                     }
-                    const kind = next.tierIndex === prevTier ? '同層換 key' : '跳層';
+                    const kind = next.tierIndex === prevTier ? '同層換 key' :
+                        (next.tierIndex > prevTier ? '跳層' : '回到仍存活的前層');
                     console.log(`🔀 [AI] ${kind} → ${this.currentKeyName}/${this.modelName}`);
                     this.init();
                     continue;
@@ -502,6 +511,11 @@ async function solveCaptcha(page) {
         return text;
     } catch (e) {
         console.error('    [AI] Error:', e.message);
+        // 這兩種錯誤在同一個 runner/process 內重試沒有意義；往下吞成 null 只會讓
+        // 每站跑滿 10 次並洗出數百行假「配額耗盡」。交給外層以正確根因快速失敗。
+        if (isUnsupportedLocationError(e) || aiManager.ladder.isCurrentComboDead()) {
+            throw e;
+        }
         return null;
     }
 }
@@ -1059,13 +1073,17 @@ async function processStation(page, deptId, station) {
                 try {
                     await processStation(page, deptId, station);
                 } catch (stationErr) {
+                    if (isUnsupportedLocationError(stationErr) || aiManager.ladder.isCurrentComboDead()) {
+                        console.error(`    [AI] 不可在本 runner 內恢復，立即中止 shard：${stationErr.message}`);
+                        throw stationErr;
+                    }
                     const duration = (Date.now() - stationAttemptStart) / 1000;
                     console.error(`    [Station] ${station.name} 發生未攔截錯誤，跳過本站：${stationErr.message}`);
                     stats.stationsFailed++;
                     stats.addError('STATION:' + station.name, stationErr.message);
                     stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: 0, retries: 0, status: 'FAILED' });
                 }
-                console.log('☕ Quota protection break (2-4s)...');
+                console.log('☕ Local AI pacing break (2-4s，非 Google 配額狀態)...');
                 await randomSleep(1000, 2000);
             }
             console.log('☕☕ Dept finished. Short break...');
