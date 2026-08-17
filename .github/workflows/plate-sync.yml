@@ -98,6 +98,23 @@ jobs:
           sudo warp-cli registration new --accept-tos 2>/dev/null || \
           sudo warp-cli --accept-tos registration new 2>/dev/null || true
 
+          # Gemini API must bypass consumer WARP. Free WARP does not guarantee a
+          # supported-country egress, which makes Gemini return location 400s.
+          # api.ipify.org is excluded as a canary so we can prove the original
+          # GitHub runner route is still reachable after WARP connects.
+          DIRECT_IP_BEFORE=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+          echo "GitHub direct IPv4 before WARP: $DIRECT_IP_BEFORE"
+
+          for HOST in generativelanguage.googleapis.com api.ipify.org; do
+            if sudo warp-cli tunnel host add "$HOST" 2>/dev/null || \
+               sudo warp-cli --accept-tos tunnel host add "$HOST" 2>/dev/null; then
+              echo "Excluded from WARP: $HOST"
+            else
+              echo "::error::Failed to exclude $HOST from WARP; refusing an unverified Gemini route."
+              exit 1
+            fi
+          done
+
           # Ultimate Stability: Resolve and Hardcode Supabase IP in /etc/hosts
           SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
           SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
@@ -121,6 +138,20 @@ jobs:
           # Verify connection status
           sudo warp-cli status 2>/dev/null || \
           sudo warp-cli --accept-tos status 2>/dev/null || true
+
+          WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
+          if ! grep -q '^warp=on$' <<< "$WARP_TRACE"; then
+            echo "::error::Cloudflare trace did not confirm warp=on."
+            echo "$WARP_TRACE"
+            exit 1
+          fi
+
+          DIRECT_IP_AFTER=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+          echo "GitHub direct IPv4 after WARP exclusion: $DIRECT_IP_AFTER"
+          if [ "$DIRECT_IP_AFTER" != "$DIRECT_IP_BEFORE" ]; then
+            echo "::error::Split-tunnel canary changed IP; Gemini bypass is not proven."
+            exit 1
+          fi
 
       - name: Verify IP and MVDIS Connectivity
         run: |
@@ -158,6 +189,57 @@ jobs:
           for i in {1..5}; do
             curl -I -s --max-time 15 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
           done || echo "Supabase direct connection failed"
+
+      - name: Verify Gemini API Direct Egress
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
+          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
+          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
+          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
+          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
+        run: |
+          case "${{ matrix.shard }}" in
+            NORTH) PRIMARY_KEY="$GEMINI_API_KEY_NORTH" ;;
+            CENTRAL) PRIMARY_KEY="$GEMINI_API_KEY_CENTRAL" ;;
+            SOUTH) PRIMARY_KEY="$GEMINI_API_KEY_SOUTH" ;;
+            SHARD4) PRIMARY_KEY="$GEMINI_API_KEY_SHARD4" ;;
+            SHARD5) PRIMARY_KEY="$GEMINI_API_KEY_SHARD5" ;;
+            *) echo "::error::Unknown shard: ${{ matrix.shard }}"; exit 1 ;;
+          esac
+
+          if [ -z "$PRIMARY_KEY" ]; then
+            echo "::error::Primary Gemini key is empty for shard ${{ matrix.shard }}."
+            exit 1
+          fi
+
+          DIRECT_IP=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+          echo "Gemini direct egress IPv4: $DIRECT_IP"
+
+          set +e
+          HTTP_STATUS=$(curl -sS --max-time 30 \
+            -o /tmp/gemini-preflight.json \
+            -w "%{http_code}" \
+            -H "x-goog-api-key: $PRIMARY_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"contents":[{"parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":1}}' \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent")
+          CURL_EXIT=$?
+          set -e
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Gemini preflight transport failed (curl exit $CURL_EXIT)."
+            exit 1
+          fi
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Gemini preflight failed with HTTP $HTTP_STATUS."
+            head -c 2000 /tmp/gemini-preflight.json || true
+            echo
+            exit 1
+          fi
+
+          echo "Gemini generateContent preflight passed via direct GitHub egress."
 
       - name: Run Crawler Shard ${{ matrix.shard }}
         run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
