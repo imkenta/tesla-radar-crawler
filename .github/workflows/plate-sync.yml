@@ -67,15 +67,37 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.warp-apt-cache
-          key: warp-apt-${{ runner.os }}-v1
+          # actions/cache entries are immutable. Include the workflow hash so
+          # dependency changes refresh the cache instead of restoring the same
+          # permanently partial v1 archive.
+          key: warp-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/plate-sync.yml') }}
           restore-keys: |
             warp-apt-${{ runner.os }}-
 
       - name: Install and Configure Cloudflare WARP
+        # A stalled Ubuntu mirror must not occupy a shard for the job-level
+        # 45-minute timeout and cascade into cancelled scheduled runs.
+        timeout-minutes: 10
         run: |
           # Import GPG key and add repository
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 \
+            https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          # GitHub-hosted Ubuntu runners normally prefer Azure's HTTP mirror.
+          # Multiple shards have stalled there until the 45-minute job timeout,
+          # so use Ubuntu's HTTPS archive explicitly and bound every apt call.
+          for SOURCE_FILE in \
+            /etc/apt/apt-mirrors.txt \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$SOURCE_FILE" ]; then
+              sudo sed -i -E \
+                's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' \
+                "$SOURCE_FILE"
+            fi
+          done
 
           # 快取命中：把 .deb 複製進 apt archives，讓 apt-get install 跳過 119MB 下載
           # 快取未命中：此命令靜默失敗，走正常下載路徑
@@ -86,8 +108,44 @@ jobs:
           # 保留 .deb 檔以供 actions/cache 在 job 結束時儲存
           echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
 
-          # Install WARP（快取命中時 apt-get install 略過下載，只驗證 + 解壓縮，約 30s）
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+          # Install WARP. apt has its own per-request retries/timeouts, while
+          # coreutils timeout caps the entire command (including mirror stalls).
+          APT_UPDATED=false
+          for ATTEMPT in 1 2; do
+            echo "apt-get update attempt $ATTEMPT/2..."
+            if sudo timeout --signal=TERM --kill-after=15s 90s \
+              apt-get \
+                -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=20 \
+                -o Dpkg::Use-Pty=0 \
+                update; then
+              APT_UPDATED=true
+              break
+            fi
+
+            echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
+            if [ "$ATTEMPT" -lt 2 ]; then
+              sleep 5
+            fi
+          done
+
+          if [ "$APT_UPDATED" != "true" ]; then
+            echo "::error::Unable to refresh apt indexes after bounded retries."
+            exit 1
+          fi
+
+          if ! sudo timeout --signal=TERM --kill-after=15s 240s \
+            env DEBIAN_FRONTEND=noninteractive \
+            apt-get \
+              -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=20 \
+              -o Dpkg::Use-Pty=0 \
+              install -y cloudflare-warp; then
+            echo "::error::Cloudflare WARP package installation failed or timed out."
+            exit 1
+          fi
 
           # 將安裝好的 .deb 存到使用者可讀的目錄，供下一輪快取
           mkdir -p "$HOME/.warp-apt-cache"
@@ -216,30 +274,98 @@ jobs:
           DIRECT_IP=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
           echo "Gemini direct egress IPv4: $DIRECT_IP"
 
-          set +e
-          HTTP_STATUS=$(curl -sS --max-time 30 \
-            -o /tmp/gemini-preflight.json \
-            -w "%{http_code}" \
-            -H "x-goog-api-key: $PRIMARY_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{"contents":[{"parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent")
-          CURL_EXIT=$?
-          set -e
+          MAX_ATTEMPTS=3
+          PREFLIGHT_OUTCOME=""
 
-          if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "::error::Gemini preflight transport failed (curl exit $CURL_EXIT)."
-            exit 1
-          fi
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+            rm -f /tmp/gemini-preflight.json
 
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "::error::Gemini preflight failed with HTTP $HTTP_STATUS."
-            head -c 2000 /tmp/gemini-preflight.json || true
-            echo
-            exit 1
-          fi
+            set +e
+            CURL_META=$(curl -4 -sS --connect-timeout 10 --max-time 30 \
+              -o /tmp/gemini-preflight.json \
+              -w "%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s first_byte=%{time_starttransfer}s total=%{time_total}s" \
+              -H "x-goog-api-key: $PRIMARY_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{"contents":[{"parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":1}}' \
+              "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent")
+            CURL_EXIT=$?
+            set -e
 
-          echo "Gemini generateContent preflight passed via direct GitHub egress."
+            HTTP_STATUS=$(awk '{print $1}' <<< "$CURL_META")
+            HTTP_STATUS=${HTTP_STATUS:-000}
+            echo "Gemini preflight attempt $ATTEMPT/$MAX_ATTEMPTS: curl=$CURL_EXIT $CURL_META"
+
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              case "$CURL_EXIT" in
+                6|7|18|28|35|52|55|56|92)
+                  if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                    WAIT_SECONDS=$((ATTEMPT * 5))
+                    echo "::warning::Transient Gemini transport error (curl $CURL_EXIT); retrying in ${WAIT_SECONDS}s."
+                    sleep "$WAIT_SECONDS"
+                    continue
+                  fi
+
+                  PREFLIGHT_OUTCOME="transient-exhausted"
+                  break
+                  ;;
+                *)
+                  echo "::error::Non-retryable Gemini transport error (curl $CURL_EXIT)."
+                  exit 1
+                  ;;
+              esac
+            fi
+
+            case "$HTTP_STATUS" in
+              200)
+                PREFLIGHT_OUTCOME="passed"
+                break
+                ;;
+              400|401|403|404)
+                echo "::error::Gemini preflight failed with permanent HTTP $HTTP_STATUS."
+                head -c 2000 /tmp/gemini-preflight.json || true
+                echo
+                exit 1
+                ;;
+              429)
+                echo "::warning::Gemini preflight received HTTP 429; deferring quota handling to the crawler key/model ladder."
+                PREFLIGHT_OUTCOME="deferred-to-crawler"
+                break
+                ;;
+              408|425|500|502|503|504)
+                if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                  WAIT_SECONDS=$((ATTEMPT * 5))
+                  echo "::warning::Transient Gemini HTTP $HTTP_STATUS; retrying in ${WAIT_SECONDS}s."
+                  sleep "$WAIT_SECONDS"
+                  continue
+                fi
+
+                PREFLIGHT_OUTCOME="transient-exhausted"
+                break
+                ;;
+              *)
+                echo "::error::Gemini preflight failed with unexpected HTTP $HTTP_STATUS."
+                head -c 2000 /tmp/gemini-preflight.json || true
+                echo
+                exit 1
+                ;;
+            esac
+          done
+
+          case "$PREFLIGHT_OUTCOME" in
+            passed)
+              echo "Gemini generateContent preflight passed via direct GitHub egress."
+              ;;
+            deferred-to-crawler)
+              echo "Gemini route/auth preflight was inconclusive due to quota; crawler safeguards remain authoritative."
+              ;;
+            transient-exhausted)
+              echo "::warning::Gemini preflight transient failure after $MAX_ATTEMPTS attempts; allowing the crawler retry ladder to decide availability."
+              ;;
+            *)
+              echo "::error::Gemini preflight ended without a classified outcome."
+              exit 1
+              ;;
+          esac
 
       - name: Run Crawler Shard ${{ matrix.shard }}
         run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
