@@ -1,375 +1,50 @@
 name: Daily Plate Sync (Live) v2.1
 
 on:
-  # 2026-06-19: 移除 GitHub 內建 schedule，改由外部 cronjob 經 workflow_dispatch 觸發（時間較準）。
-  # 原因：GitHub schedule 會延遲數小時，且與外部 cronjob 雙重觸發同一 concurrency group，
-  # 造成「Canceling since a higher priority waiting request」連鎖取消、全面癱瘓。
+  # 20-minute cadence remains owned by the external workflow_dispatch scheduler.
   workflow_dispatch: {}
 
-# Prevent multiple workflow runs from overlapping and corrupting the staging table
 concurrency:
   group: plate-sync-workflow
   cancel-in-progress: false
 
 permissions:
-  contents: read # checkout 需要（actions: read 隨 guard 一併移除，2026-08-07）
+  contents: read
 
 jobs:
-  # 2026-08-07: 移除 guard job（原「跳過重複觸發」閘門，2026-06-19 加入）。
-  #
-  # 移除理由一：它從來沒生效過（死碼）。
-  #   guard 的邏輯是「查到有另一輪 in_progress 就跳過這一輪」，但上方 workflow-level
-  #   concurrency 已經先把新 run 擋在鎖外；等 guard 真的開始執行時，前一輪按定義必然已經
-  #   結束，所以它查到的 in_progress 永遠只有自己，永遠回 should_run=true。
-  #   實證（2026-08-06）：連續三輪的 guard 建立時刻＝前一輪的完成時刻，一秒不差
-  #   （#7771 21:37:18 / #7772 21:58:45 / #7773 22:12:18）。
-  #
-  # 移除理由二：它是失敗放大器，正是 2026-08-06 雪崩的元凶。
-  #   guard 實跑只要 4 秒，卻設了 timeout-minutes: 2。當 GitHub runner 池擁塞時它分不到
-  #   runner，卡 7~19 分鐘後被以「exceeded maximum execution time of 2m0s」砍掉；
-  #   而 sync-plates 有 needs: guard，於是五個 shard 全部 skipped——該輪一筆資料都沒爬，
-  #   卻仍佔著 plate-sync-workflow 這把鎖十幾分鐘，把下一輪擋在門外，接力雪崩。
-  #   實證：#7755 / #7761 / #7764 / #7770 四輪皆為 guard cancelled → sync-plates skipped。
-  #
-  # 移除理由三：少一個 job 就少搶一個並行 job 額度（該額度為帳號層級、跨 repo 共用）。
-  #
-  # 防重疊保護不受影響：真正在做互斥的一直是上方的 workflow-level concurrency
-  # （group: plate-sync-workflow, cancel-in-progress: false），staging table 仍受保護。
   sync-plates:
     runs-on: ubuntu-latest
-    # 卡死的 shard 最多跑 45 分鐘就被砍，避免霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。
-    # 45 分是依歷史成功耗時（11~49 分）抓的上限：不誤殺正常慢 run，又能及早終結 hang。
     timeout-minutes: 45
     strategy:
       matrix:
-        # 2026-07-05: 3→5 分片重構，站點配載見 lib/shard-config.cjs / supabase/migrations-draft/shard_5way_mvdis_stations.sql
         shard: [NORTH, CENTRAL, SOUTH, SHARD4, SHARD5]
-      fail-fast: false # Let other shards finish even if one fails
-    
+      fail-fast: false
     concurrency:
       group: plate-sync-shard-${{ matrix.shard }}
       cancel-in-progress: false
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup crawler runner
+        uses: ./.github/actions/setup-plate-runner
+        timeout-minutes: 15
         with:
-          node-version: '20'
+          shards: ${{ matrix.shard }}
+          supabase-url: ${{ secrets.VITE_SUPABASE_URL }}
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          gemini-api-key-north: ${{ secrets.GEMINI_API_KEY_NORTH }}
+          gemini-api-key-central: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
+          gemini-api-key-south: ${{ secrets.GEMINI_API_KEY_SOUTH }}
+          gemini-api-key-shard4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
+          gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
 
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Cache Cloudflare WARP apt packages
-        id: cache-warp-apt
-        uses: actions/cache@v4
-        with:
-          path: ~/.warp-apt-cache
-          # actions/cache entries are immutable. Include the workflow hash so
-          # dependency changes refresh the cache instead of restoring the same
-          # permanently partial v1 archive.
-          key: warp-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/plate-sync.yml') }}
-          restore-keys: |
-            warp-apt-${{ runner.os }}-
-
-      - name: Install and Configure Cloudflare WARP
-        # A stalled Ubuntu mirror must not occupy a shard for the job-level
-        # 45-minute timeout and cascade into cancelled scheduled runs.
-        timeout-minutes: 10
-        run: |
-          # Import GPG key and add repository
-          curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 \
-            https://pkg.cloudflareclient.com/pubkey.gpg \
-            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-
-          # GitHub-hosted Ubuntu runners normally prefer Azure's HTTP mirror.
-          # Multiple shards have stalled there until the 45-minute job timeout,
-          # so use Ubuntu's HTTPS archive explicitly and bound every apt call.
-          for SOURCE_FILE in \
-            /etc/apt/apt-mirrors.txt \
-            /etc/apt/sources.list \
-            /etc/apt/sources.list.d/ubuntu.sources; do
-            if [ -f "$SOURCE_FILE" ]; then
-              sudo sed -i -E \
-                's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' \
-                "$SOURCE_FILE"
-            fi
-          done
-
-          # 快取命中：把 .deb 複製進 apt archives，讓 apt-get install 跳過 119MB 下載
-          # 快取未命中：此命令靜默失敗，走正常下載路徑
-          sudo cp "$HOME/.warp-apt-cache/"*.deb /var/cache/apt/archives/ 2>/dev/null \
-            && echo "Cache hit: restored .deb packages to apt archives." \
-            || echo "Cache miss: packages will be downloaded fresh this run."
-
-          # 保留 .deb 檔以供 actions/cache 在 job 結束時儲存
-          echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
-
-          # Install WARP. apt has its own per-request retries/timeouts, while
-          # coreutils timeout caps the entire command (including mirror stalls).
-          APT_UPDATED=false
-          for ATTEMPT in 1 2; do
-            echo "apt-get update attempt $ATTEMPT/2..."
-            if sudo timeout --signal=TERM --kill-after=15s 90s \
-              apt-get \
-                -o Acquire::Retries=2 \
-                -o Acquire::http::Timeout=15 \
-                -o Acquire::https::Timeout=20 \
-                -o Dpkg::Use-Pty=0 \
-                update; then
-              APT_UPDATED=true
-              break
-            fi
-
-            echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
-            if [ "$ATTEMPT" -lt 2 ]; then
-              sleep 5
-            fi
-          done
-
-          if [ "$APT_UPDATED" != "true" ]; then
-            echo "::error::Unable to refresh apt indexes after bounded retries."
-            exit 1
-          fi
-
-          if ! sudo timeout --signal=TERM --kill-after=15s 240s \
-            env DEBIAN_FRONTEND=noninteractive \
-            apt-get \
-              -o Acquire::Retries=2 \
-              -o Acquire::http::Timeout=15 \
-              -o Acquire::https::Timeout=20 \
-              -o Dpkg::Use-Pty=0 \
-              install -y cloudflare-warp; then
-            echo "::error::Cloudflare WARP package installation failed or timed out."
-            exit 1
-          fi
-
-          # 將安裝好的 .deb 存到使用者可讀的目錄，供下一輪快取
-          mkdir -p "$HOME/.warp-apt-cache"
-          sudo cp /var/cache/apt/archives/*.deb "$HOME/.warp-apt-cache/" 2>/dev/null || true
-          sudo chown -R "$(id -u):$(id -g)" "$HOME/.warp-apt-cache"
-
-          # Register (handle both old and new warp-cli syntax across versions)
-          sudo warp-cli registration new --accept-tos 2>/dev/null || \
-          sudo warp-cli --accept-tos registration new 2>/dev/null || true
-
-          # Gemini API must bypass consumer WARP. Free WARP does not guarantee a
-          # supported-country egress, which makes Gemini return location 400s.
-          # api.ipify.org is excluded as a canary so we can prove the original
-          # GitHub runner route is still reachable after WARP connects.
-          DIRECT_IP_BEFORE=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
-          echo "GitHub direct IPv4 before WARP: $DIRECT_IP_BEFORE"
-
-          for HOST in generativelanguage.googleapis.com api.ipify.org; do
-            if sudo warp-cli tunnel host add "$HOST" 2>/dev/null || \
-               sudo warp-cli --accept-tos tunnel host add "$HOST" 2>/dev/null; then
-              echo "Excluded from WARP: $HOST"
-            else
-              echo "::error::Failed to exclude $HOST from WARP; refusing an unverified Gemini route."
-              exit 1
-            fi
-          done
-
-          # Ultimate Stability: Resolve and Hardcode Supabase IP in /etc/hosts
-          SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
-          SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
-          if [ ! -z "$SUB_IP" ]; then
-            echo "Hardcoding Supabase IP: $SUB_IP for $SUB_DOMAIN in /etc/hosts"
-            echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
-
-            echo "Excluding Supabase IP: $SUB_IP from WARP"
-            sudo warp-cli add-excluded-route $SUB_IP/32 2>/dev/null || \
-            sudo warp-cli --accept-tos add-excluded-route $SUB_IP/32 2>/dev/null || true
-          fi
-
-          # Connect
-          sudo warp-cli connect 2>/dev/null || \
-          sudo warp-cli --accept-tos connect 2>/dev/null || true
-
-          # Wait for connection to stabilize
-          echo "Waiting for WARP connection..."
-          sleep 30
-
-          # Verify connection status
-          sudo warp-cli status 2>/dev/null || \
-          sudo warp-cli --accept-tos status 2>/dev/null || true
-
-          WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
-          if ! grep -q '^warp=on$' <<< "$WARP_TRACE"; then
-            echo "::error::Cloudflare trace did not confirm warp=on."
-            echo "$WARP_TRACE"
-            exit 1
-          fi
-
-          DIRECT_IP_AFTER=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
-          echo "GitHub direct IPv4 after WARP exclusion: $DIRECT_IP_AFTER"
-          if [ "$DIRECT_IP_AFTER" != "$DIRECT_IP_BEFORE" ]; then
-            echo "::error::Split-tunnel canary changed IP; Gemini bypass is not proven."
-            exit 1
-          fi
-
-      - name: Verify IP and MVDIS Connectivity
-        run: |
-          echo "=== IP / WARP Check ==="
-          CURRENT_IP=$(curl -s --max-time 15 ifconfig.me || echo "FAILED")
-          echo "Current IP: $CURRENT_IP"
-
-          COUNTRY=$(curl -s --max-time 10 "https://ipinfo.io/${CURRENT_IP}/country" 2>/dev/null | tr -d '[:space:]' || echo "UNKNOWN")
-          echo "IP Country: $COUNTRY"
-          if [ "$COUNTRY" = "TW" ]; then
-            echo "WARP verified: IP is from Taiwan"
-          else
-            echo "WARNING: IP country is $COUNTRY (expected TW). MVDIS may block requests."
-          fi
-
-          echo ""
-          echo "=== MVDIS Connectivity Test ==="
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -H "Accept-Language: zh-TW,zh;q=0.9" \
-            "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo" 2>/dev/null || echo "0")
-          echo "MVDIS HTTP Status: $HTTP_STATUS"
-
-          if [ "$HTTP_STATUS" = "0" ] || [ "$HTTP_STATUS" = "000" ]; then
-            echo "::error::Cannot reach MVDIS (TCP failed). WARP may not be routing. Aborting."
-            exit 1
-          elif [ "$HTTP_STATUS" = "403" ] || [ "$HTTP_STATUS" = "429" ] || [ "$HTTP_STATUS" = "503" ]; then
-            echo "::warning::MVDIS returned $HTTP_STATUS — IP may be blocked. curl passes but Chrome may be rejected."
-          else
-            echo "MVDIS is reachable (HTTP $HTTP_STATUS)"
-          fi
-
-          echo ""
-          echo "=== Supabase Connectivity ==="
-          for i in {1..5}; do
-            curl -I -s --max-time 15 ${{ secrets.VITE_SUPABASE_URL }} && break || (echo "Retry $i failed..." && sleep 5)
-          done || echo "Supabase direct connection failed"
-
-      - name: Verify Gemini API Direct Egress
+      - name: Run Crawler Shard ${{ matrix.shard }} with local recovery
+        id: crawl
+        shell: bash
+        run: bash scripts/run-plate-shard-with-recovery.sh "${{ matrix.shard }}"
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
-          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
-          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
-          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
-          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
-        run: |
-          case "${{ matrix.shard }}" in
-            NORTH) PRIMARY_KEY="$GEMINI_API_KEY_NORTH" ;;
-            CENTRAL) PRIMARY_KEY="$GEMINI_API_KEY_CENTRAL" ;;
-            SOUTH) PRIMARY_KEY="$GEMINI_API_KEY_SOUTH" ;;
-            SHARD4) PRIMARY_KEY="$GEMINI_API_KEY_SHARD4" ;;
-            SHARD5) PRIMARY_KEY="$GEMINI_API_KEY_SHARD5" ;;
-            *) echo "::error::Unknown shard: ${{ matrix.shard }}"; exit 1 ;;
-          esac
-
-          if [ -z "$PRIMARY_KEY" ]; then
-            echo "::error::Primary Gemini key is empty for shard ${{ matrix.shard }}."
-            exit 1
-          fi
-
-          DIRECT_IP=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
-          echo "Gemini direct egress IPv4: $DIRECT_IP"
-
-          MAX_ATTEMPTS=3
-          PREFLIGHT_OUTCOME=""
-
-          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
-            rm -f /tmp/gemini-preflight.json
-
-            set +e
-            CURL_META=$(curl -4 -sS --connect-timeout 10 --max-time 30 \
-              -o /tmp/gemini-preflight.json \
-              -w "%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s first_byte=%{time_starttransfer}s total=%{time_total}s" \
-              -H "x-goog-api-key: $PRIMARY_KEY" \
-              -H "Content-Type: application/json" \
-              -d '{"contents":[{"parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":1}}' \
-              "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent")
-            CURL_EXIT=$?
-            set -e
-
-            HTTP_STATUS=$(awk '{print $1}' <<< "$CURL_META")
-            HTTP_STATUS=${HTTP_STATUS:-000}
-            echo "Gemini preflight attempt $ATTEMPT/$MAX_ATTEMPTS: curl=$CURL_EXIT $CURL_META"
-
-            if [ "$CURL_EXIT" -ne 0 ]; then
-              case "$CURL_EXIT" in
-                6|7|18|28|35|52|55|56|92)
-                  if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
-                    WAIT_SECONDS=$((ATTEMPT * 5))
-                    echo "::warning::Transient Gemini transport error (curl $CURL_EXIT); retrying in ${WAIT_SECONDS}s."
-                    sleep "$WAIT_SECONDS"
-                    continue
-                  fi
-
-                  PREFLIGHT_OUTCOME="transient-exhausted"
-                  break
-                  ;;
-                *)
-                  echo "::error::Non-retryable Gemini transport error (curl $CURL_EXIT)."
-                  exit 1
-                  ;;
-              esac
-            fi
-
-            case "$HTTP_STATUS" in
-              200)
-                PREFLIGHT_OUTCOME="passed"
-                break
-                ;;
-              400|401|403|404)
-                echo "::error::Gemini preflight failed with permanent HTTP $HTTP_STATUS."
-                head -c 2000 /tmp/gemini-preflight.json || true
-                echo
-                exit 1
-                ;;
-              429)
-                echo "::warning::Gemini preflight received HTTP 429; deferring quota handling to the crawler key/model ladder."
-                PREFLIGHT_OUTCOME="deferred-to-crawler"
-                break
-                ;;
-              408|425|500|502|503|504)
-                if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
-                  WAIT_SECONDS=$((ATTEMPT * 5))
-                  echo "::warning::Transient Gemini HTTP $HTTP_STATUS; retrying in ${WAIT_SECONDS}s."
-                  sleep "$WAIT_SECONDS"
-                  continue
-                fi
-
-                PREFLIGHT_OUTCOME="transient-exhausted"
-                break
-                ;;
-              *)
-                echo "::error::Gemini preflight failed with unexpected HTTP $HTTP_STATUS."
-                head -c 2000 /tmp/gemini-preflight.json || true
-                echo
-                exit 1
-                ;;
-            esac
-          done
-
-          case "$PREFLIGHT_OUTCOME" in
-            passed)
-              echo "Gemini generateContent preflight passed via direct GitHub egress."
-              ;;
-            deferred-to-crawler)
-              echo "Gemini route/auth preflight was inconclusive due to quota; crawler safeguards remain authoritative."
-              ;;
-            transient-exhausted)
-              echo "::warning::Gemini preflight transient failure after $MAX_ATTEMPTS attempts; allowing the crawler retry ladder to decide availability."
-              ;;
-            *)
-              echo "::error::Gemini preflight ended without a classified outcome."
-              exit 1
-              ;;
-          esac
-
-      - name: Run Crawler Shard ${{ matrix.shard }}
-        run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
-        env:
+          RESULT_PATH: ${{ runner.temp }}/plate-sync-result-${{ matrix.shard }}.json
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -380,11 +55,170 @@ jobs:
           GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
-  finalize-sync:
+      - name: Upload shard outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plate-sync-result-${{ matrix.shard }}
+          path: ${{ runner.temp }}/plate-sync-result-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Enforce non-retryable crawler failure
+        if: steps.crawl.outputs.status == 'HARD_FAILURE'
+        shell: bash
+        run: |
+          echo "::error::${{ matrix.shard }} failed outside the retryable MVDIS preflight boundary."
+          exit 1
+
+  collect-results:
     needs: sync-plates
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      retry_matrix: ${{ steps.analyze.outputs.retry_matrix }}
+      has_retries: ${{ steps.analyze.outputs.has_retries }}
+      hard_failure: ${{ steps.analyze.outputs.hard_failure }}
+      primary_result: ${{ steps.analyze.outputs.primary_result }}
+    steps:
+      - name: Download primary shard outcomes
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: plate-sync-result-*
+          path: ${{ runner.temp }}/plate-sync-results
+          merge-multiple: true
+
+      - name: Classify primary shard outcomes
+        id: analyze
+        shell: bash
+        env:
+          PRIMARY_RESULT: ${{ needs.sync-plates.result }}
+          RESULT_DIR: ${{ runner.temp }}/plate-sync-results
+        run: |
+          retry_shards=()
+          hard_failure=false
+
+          for shard in NORTH CENTRAL SOUTH SHARD4 SHARD5; do
+            result_file="$RESULT_DIR/plate-sync-result-${shard}.json"
+            if [ ! -f "$result_file" ]; then
+              echo "::error::Missing primary outcome artifact for $shard."
+              hard_failure=true
+              continue
+            fi
+
+            artifact_shard=$(jq -r '.shard // ""' "$result_file")
+            status=$(jq -r '.status // ""' "$result_file")
+            if [ "$artifact_shard" != "$shard" ]; then
+              echo "::error::Outcome artifact identity mismatch: expected $shard, got $artifact_shard."
+              hard_failure=true
+              continue
+            fi
+            case "$status" in
+              SUCCESS)
+                echo "$shard completed during the primary runner."
+                ;;
+              RETRY)
+                echo "::warning::$shard requested a fresh-runner recovery."
+                retry_shards+=("$shard")
+                ;;
+              HARD_FAILURE)
+                echo "::error::$shard reported a non-retryable crawler failure."
+                hard_failure=true
+                ;;
+              *)
+                echo "::error::$shard produced an invalid outcome: $status"
+                hard_failure=true
+                ;;
+            esac
+          done
+
+          retry_matrix=$(printf '%s\n' "${retry_shards[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | {shard: .}')
+          if [ "${#retry_shards[@]}" -gt 0 ]; then
+            has_retries=true
+          else
+            has_retries=false
+          fi
+
+          echo "retry_matrix=$retry_matrix" >> "$GITHUB_OUTPUT"
+          echo "has_retries=$has_retries" >> "$GITHUB_OUTPUT"
+          echo "hard_failure=$hard_failure" >> "$GITHUB_OUTPUT"
+          echo "primary_result=$PRIMARY_RESULT" >> "$GITHUB_OUTPUT"
+
+  recovery-sync:
+    needs: collect-results
+    if: needs.collect-results.outputs.hard_failure == 'false' && needs.collect-results.outputs.has_retries == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.collect-results.outputs.retry_matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup fresh recovery runner
+        uses: ./.github/actions/setup-plate-runner
+        timeout-minutes: 15
+        with:
+          shards: ${{ matrix.shard }}
+          supabase-url: ${{ secrets.VITE_SUPABASE_URL }}
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          gemini-api-key-north: ${{ secrets.GEMINI_API_KEY_NORTH }}
+          gemini-api-key-central: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
+          gemini-api-key-south: ${{ secrets.GEMINI_API_KEY_SOUTH }}
+          gemini-api-key-shard4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
+          gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
+
+      - name: Retry Crawler Shard ${{ matrix.shard }} on fresh runner
+        run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
+        env:
+          SKIP_SHARD_JITTER: '1'
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
+          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
+          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
+          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
+          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
+
+  recovery-gate:
+    needs: [collect-results, recovery-sync]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Enforce complete shard coverage
+        shell: bash
+        env:
+          COLLECT_RESULT: ${{ needs.collect-results.result }}
+          PRIMARY_RESULT: ${{ needs.collect-results.outputs.primary_result }}
+          HARD_FAILURE: ${{ needs.collect-results.outputs.hard_failure }}
+          HAS_RETRIES: ${{ needs.collect-results.outputs.has_retries }}
+          RECOVERY_RESULT: ${{ needs.recovery-sync.result }}
+        run: |
+          if [ "$COLLECT_RESULT" != "success" ]; then
+            echo "::error::Unable to classify all primary shard outcomes."
+            exit 1
+          fi
+          if [ "$PRIMARY_RESULT" != "success" ] || [ "$HARD_FAILURE" = "true" ]; then
+            echo "::error::At least one primary shard had a non-retryable or infrastructure failure."
+            exit 1
+          fi
+          if [ "$HAS_RETRIES" = "true" ] && [ "$RECOVERY_RESULT" != "success" ]; then
+            echo "::error::At least one fresh-runner shard recovery failed."
+            exit 1
+          fi
+          echo "All five shards completed either on the primary runner or an approved fresh-runner recovery."
+
+  finalize-sync:
+    needs: recovery-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: success() # Only run if all shards succeeded
+    if: success()
     concurrency:
       group: plate-sync-finalize
       cancel-in-progress: false

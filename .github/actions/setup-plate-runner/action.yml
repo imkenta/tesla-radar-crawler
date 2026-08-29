@@ -1,0 +1,324 @@
+name: Setup Plate Runner
+description: Install the crawler runtime, configure WARP, and verify external dependencies.
+
+inputs:
+  shards:
+    description: One shard or a comma-separated shard list whose Gemini keys must be verified.
+    required: true
+  supabase-url:
+    description: Supabase project URL used for split-tunnel routing and connectivity checks.
+    required: true
+  gemini-api-key:
+    description: Default Gemini API key.
+    required: true
+  gemini-api-key-north:
+    description: NORTH Gemini API key.
+    required: true
+  gemini-api-key-central:
+    description: CENTRAL Gemini API key.
+    required: true
+  gemini-api-key-south:
+    description: SOUTH Gemini API key.
+    required: true
+  gemini-api-key-shard4:
+    description: SHARD4 Gemini API key.
+    required: true
+  gemini-api-key-shard5:
+    description: SHARD5 Gemini API key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Cache Cloudflare WARP apt packages
+      id: cache-warp-apt
+      uses: actions/cache@v4
+      with:
+        path: ~/.warp-apt-cache
+        key: warp-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/plate-sync.yml') }}-${{ hashFiles('.github/actions/setup-plate-runner/action.yml') }}
+        restore-keys: |
+          warp-apt-${{ runner.os }}-
+
+    - name: Install and Configure Cloudflare WARP
+      shell: bash
+      env:
+        SUPABASE_URL: ${{ inputs.supabase-url }}
+      run: |
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 \
+          https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+        for SOURCE_FILE in \
+          /etc/apt/apt-mirrors.txt \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/ubuntu.sources; do
+          if [ -f "$SOURCE_FILE" ]; then
+            sudo sed -i -E \
+              's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' \
+              "$SOURCE_FILE"
+          fi
+        done
+
+        sudo cp "$HOME/.warp-apt-cache/"*.deb /var/cache/apt/archives/ 2>/dev/null \
+          && echo "Cache hit: restored .deb packages to apt archives." \
+          || echo "Cache miss: packages will be downloaded fresh this run."
+        echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
+
+        APT_UPDATED=false
+        for ATTEMPT in 1 2; do
+          echo "apt-get update attempt $ATTEMPT/2..."
+          if sudo timeout --signal=TERM --kill-after=15s 90s \
+            apt-get \
+              -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=20 \
+              -o Dpkg::Use-Pty=0 \
+              update; then
+            APT_UPDATED=true
+            break
+          fi
+
+          echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
+          if [ "$ATTEMPT" -lt 2 ]; then sleep 5; fi
+        done
+
+        if [ "$APT_UPDATED" != "true" ]; then
+          echo "::error::Unable to refresh apt indexes after bounded retries."
+          exit 1
+        fi
+
+        if ! sudo timeout --signal=TERM --kill-after=15s 240s \
+          env DEBIAN_FRONTEND=noninteractive \
+          apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=20 \
+            -o Dpkg::Use-Pty=0 \
+            install -y cloudflare-warp; then
+          echo "::error::Cloudflare WARP package installation failed or timed out."
+          exit 1
+        fi
+
+        mkdir -p "$HOME/.warp-apt-cache"
+        sudo cp /var/cache/apt/archives/*.deb "$HOME/.warp-apt-cache/" 2>/dev/null || true
+        sudo chown -R "$(id -u):$(id -g)" "$HOME/.warp-apt-cache"
+
+        sudo warp-cli registration new --accept-tos 2>/dev/null || \
+        sudo warp-cli --accept-tos registration new 2>/dev/null || true
+
+        DIRECT_IP_BEFORE=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+        echo "GitHub direct IPv4 before WARP: $DIRECT_IP_BEFORE"
+
+        for HOST in generativelanguage.googleapis.com api.ipify.org; do
+          if sudo warp-cli tunnel host add "$HOST" 2>/dev/null || \
+             sudo warp-cli --accept-tos tunnel host add "$HOST" 2>/dev/null; then
+            echo "Excluded from WARP: $HOST"
+          else
+            echo "::error::Failed to exclude $HOST from WARP; refusing an unverified Gemini route."
+            exit 1
+          fi
+        done
+
+        SUB_DOMAIN=$(sed -E 's#https?://([^/]+).*#\1#' <<< "$SUPABASE_URL")
+        SUB_IP=$(getent ahostsv4 "$SUB_DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        if [ -n "$SUB_IP" ]; then
+          echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
+          sudo warp-cli add-excluded-route "$SUB_IP/32" 2>/dev/null || \
+          sudo warp-cli --accept-tos add-excluded-route "$SUB_IP/32" 2>/dev/null || true
+        fi
+
+        sudo warp-cli connect 2>/dev/null || \
+        sudo warp-cli --accept-tos connect 2>/dev/null || true
+
+        echo "Waiting for WARP connection..."
+        sleep 30
+        sudo warp-cli status 2>/dev/null || \
+        sudo warp-cli --accept-tos status 2>/dev/null || true
+
+        WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
+        if ! grep -q '^warp=on$' <<< "$WARP_TRACE"; then
+          echo "::error::Cloudflare trace did not confirm warp=on."
+          echo "$WARP_TRACE"
+          exit 1
+        fi
+
+        DIRECT_IP_AFTER=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+        echo "GitHub direct IPv4 after WARP exclusion: $DIRECT_IP_AFTER"
+        if [ "$DIRECT_IP_AFTER" != "$DIRECT_IP_BEFORE" ]; then
+          echo "::error::Split-tunnel canary changed IP; Gemini bypass is not proven."
+          exit 1
+        fi
+
+    - name: Verify IP and MVDIS Connectivity
+      shell: bash
+      env:
+        SUPABASE_URL: ${{ inputs.supabase-url }}
+      run: |
+        echo "=== IPv4 / WARP Check ==="
+        WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
+        CURRENT_IP=$(awk -F= '$1 == "ip" { print $2 }' <<< "$WARP_TRACE")
+        COUNTRY=$(awk -F= '$1 == "loc" { print $2 }' <<< "$WARP_TRACE")
+        echo "Current IPv4: ${CURRENT_IP:-UNKNOWN}"
+        echo "Cloudflare location: ${COUNTRY:-UNKNOWN}"
+        if [ "$COUNTRY" != "TW" ]; then
+          echo "::warning::WARP location is ${COUNTRY:-UNKNOWN}; Chromium MVDIS preflight remains authoritative."
+        fi
+
+        echo "=== Advisory MVDIS shell probe ==="
+        set +e
+        CURL_META=$(curl -4 -sS --connect-timeout 10 --max-time 30 \
+          -o /dev/null \
+          -w "%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s first_byte=%{time_starttransfer}s total=%{time_total}s" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+          -H "Accept-Language: zh-TW,zh;q=0.9" \
+          "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo")
+        CURL_EXIT=$?
+        set -e
+        HTTP_STATUS=$(awk '{ print $1 }' <<< "$CURL_META")
+        HTTP_STATUS=${HTTP_STATUS:-000}
+        echo "MVDIS shell probe: curl=$CURL_EXIT $CURL_META"
+
+        if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_STATUS" = "000" ]; then
+          echo "::warning::MVDIS shell preflight inconclusive: curl=$CURL_EXIT HTTP=$HTTP_STATUS; Chromium preflight remains authoritative."
+        elif [ "$HTTP_STATUS" = "403" ] || [ "$HTTP_STATUS" = "429" ] || [ "$HTTP_STATUS" = "503" ]; then
+          echo "::warning::MVDIS returned HTTP $HTTP_STATUS; Chromium recovery will classify the actual browser path."
+        else
+          echo "MVDIS shell path is reachable (HTTP $HTTP_STATUS); Chromium still performs the authoritative probe."
+        fi
+
+        echo "=== Supabase Connectivity ==="
+        for ATTEMPT in 1 2 3 4 5; do
+          if curl -4 -I -sS --max-time 15 "$SUPABASE_URL" > /dev/null; then break; fi
+          echo "Retry $ATTEMPT failed..."
+          sleep 5
+        done
+
+    - name: Verify Gemini API Direct Egress
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        GEMINI_API_KEY_NORTH: ${{ inputs.gemini-api-key-north }}
+        GEMINI_API_KEY_CENTRAL: ${{ inputs.gemini-api-key-central }}
+        GEMINI_API_KEY_SOUTH: ${{ inputs.gemini-api-key-south }}
+        GEMINI_API_KEY_SHARD4: ${{ inputs.gemini-api-key-shard4 }}
+        GEMINI_API_KEY_SHARD5: ${{ inputs.gemini-api-key-shard5 }}
+      run: |
+        IFS=',' read -r -a SHARD_LIST <<< "${{ inputs.shards }}"
+        for SHARD in "${SHARD_LIST[@]}"; do
+          case "$SHARD" in
+            NORTH) PRIMARY_KEY="$GEMINI_API_KEY_NORTH" ;;
+            CENTRAL) PRIMARY_KEY="$GEMINI_API_KEY_CENTRAL" ;;
+            SOUTH) PRIMARY_KEY="$GEMINI_API_KEY_SOUTH" ;;
+            SHARD4) PRIMARY_KEY="$GEMINI_API_KEY_SHARD4" ;;
+            SHARD5) PRIMARY_KEY="$GEMINI_API_KEY_SHARD5" ;;
+            *) echo "::error::Unknown shard: $SHARD"; exit 1 ;;
+          esac
+
+          if [ -z "$PRIMARY_KEY" ]; then
+            echo "::error::Primary Gemini key is empty for shard $SHARD."
+            exit 1
+          fi
+
+          DIRECT_IP=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+          echo "Gemini direct egress IPv4 for $SHARD: $DIRECT_IP"
+          MAX_ATTEMPTS=3
+          PREFLIGHT_OUTCOME=""
+          PREFLIGHT_FILE="/tmp/gemini-preflight-${SHARD}.json"
+
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+            rm -f "$PREFLIGHT_FILE"
+            set +e
+            CURL_META=$(curl -4 -sS --connect-timeout 10 --max-time 30 \
+              -o "$PREFLIGHT_FILE" \
+              -w "%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s first_byte=%{time_starttransfer}s total=%{time_total}s" \
+              -H "x-goog-api-key: $PRIMARY_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{"contents":[{"parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":1}}' \
+              "https://generativelanguage.googleapis.com/v1beta/models/gemma-4-26b-a4b-it:generateContent")
+            CURL_EXIT=$?
+            set -e
+
+            HTTP_STATUS=$(awk '{print $1}' <<< "$CURL_META")
+            HTTP_STATUS=${HTTP_STATUS:-000}
+            echo "Gemini preflight $SHARD attempt $ATTEMPT/$MAX_ATTEMPTS: curl=$CURL_EXIT $CURL_META"
+
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              case "$CURL_EXIT" in
+                6|7|18|28|35|52|55|56|92)
+                  if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                    WAIT_SECONDS=$((ATTEMPT * 5))
+                    echo "::warning::Transient Gemini transport error (curl $CURL_EXIT); retrying in ${WAIT_SECONDS}s."
+                    sleep "$WAIT_SECONDS"
+                    continue
+                  fi
+                  PREFLIGHT_OUTCOME="transient-exhausted"
+                  break
+                  ;;
+                *)
+                  echo "::error::Non-retryable Gemini transport error (curl $CURL_EXIT)."
+                  exit 1
+                  ;;
+              esac
+            fi
+
+            case "$HTTP_STATUS" in
+              200)
+                PREFLIGHT_OUTCOME="passed"
+                break
+                ;;
+              400|401|403|404)
+                echo "::error::Gemini preflight failed with permanent HTTP $HTTP_STATUS."
+                head -c 2000 "$PREFLIGHT_FILE" || true
+                echo
+                exit 1
+                ;;
+              429)
+                echo "::warning::Gemini preflight received HTTP 429; deferring quota handling to the crawler key/model ladder."
+                PREFLIGHT_OUTCOME="deferred-to-crawler"
+                break
+                ;;
+              408|425|500|502|503|504)
+                if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+                  WAIT_SECONDS=$((ATTEMPT * 5))
+                  echo "::warning::Transient Gemini HTTP $HTTP_STATUS; retrying in ${WAIT_SECONDS}s."
+                  sleep "$WAIT_SECONDS"
+                  continue
+                fi
+                PREFLIGHT_OUTCOME="transient-exhausted"
+                break
+                ;;
+              *)
+                echo "::error::Gemini preflight failed with unexpected HTTP $HTTP_STATUS."
+                head -c 2000 "$PREFLIGHT_FILE" || true
+                echo
+                exit 1
+                ;;
+            esac
+          done
+
+          case "$PREFLIGHT_OUTCOME" in
+            passed)
+              echo "Gemini generateContent preflight passed via direct GitHub egress."
+              ;;
+            deferred-to-crawler)
+              echo "Gemini route/auth preflight was inconclusive due to quota; crawler safeguards remain authoritative."
+              ;;
+            transient-exhausted)
+              echo "::warning::Gemini preflight transient failure after $MAX_ATTEMPTS attempts; allowing the crawler retry ladder to decide availability."
+              ;;
+            *)
+              echo "::error::Gemini preflight ended without a classified outcome."
+              exit 1
+              ;;
+          esac
+        done

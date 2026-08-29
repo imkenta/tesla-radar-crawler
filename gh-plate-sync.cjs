@@ -103,6 +103,7 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PROXY_URL = process.env.PROXY_URL;
 const MODEL_NAME = MODEL_LADDER[0].model; // 僅供啟動 log 顯示用，實際模型由 AIManager 階梯狀態決定
+const MVDIS_PREFLIGHT_EXIT_CODE = 75; // EX_TEMPFAIL：workflow 只補跑此類網路失敗
 
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
@@ -712,22 +713,25 @@ async function preflightCheck(page) {
         console.log(`[IP Check] Could not determine Chrome IP: ${e.message}`);
     }
 
-    // Stage 2: Verify MVDIS is reachable
+    // Stage 2: Verify MVDIS is reachable. Workflow-level recovery owns retries
+    // that rebuild the entire Chrome process and WARP session; repeated goto()
+    // calls here would keep using the same poisoned network stack.
     console.log('🔍 Pre-flight [2/2]: Testing MVDIS connectivity...');
-    for (let i = 0; i < 3; i++) {
-        try {
-            const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-            if (response) {
-                console.log(`✅ MVDIS reachable (HTTP ${response.status()})`);
+    try {
+        const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (response) {
+            const status = response.status();
+            if (status >= 200 && status < 400) {
+                console.log(`✅ MVDIS reachable (HTTP ${status})`);
                 return true;
             }
-        } catch (e) {
-            console.log(`❌ MVDIS attempt ${i + 1}/3 failed: ${e.message}`);
-            if (i < 2) await sleep(8000);
+            console.log(`❌ MVDIS Chrome preflight returned retryable HTTP ${status}.`);
         }
+    } catch (e) {
+        console.log(`❌ MVDIS Chrome preflight failed: ${e.message}`);
     }
     console.error('   → Chrome reached example.com but NOT MVDIS.');
-    console.error('   → MVDIS requires Taiwan IP for browser connections. Set PROXY_URL secret.');
+    console.error('   → Treating this as transient so the workflow can rebuild WARP and Chrome.');
     return false;
 }
 
@@ -968,10 +972,10 @@ async function processStation(page, deptId, station) {
     console.log('⏳ Waiting 5s for network to stabilize...');
     await new Promise(r => setTimeout(r, 5000));
 
-    // Add wider jitter based on shard to avoid simultaneous hits to Supabase
-    if (TARGET_SHARD) {
-        // 2026-07-05：3→5 分片，5 個 shard 錯開 20s 間隔避免同時打 Supabase。
-        const jitterMap = { 'NORTH': 0, 'CENTRAL': 20000, 'SOUTH': 40000, 'SHARD4': 60000, 'SHARD5': 80000 };
+    // Keep the external 20-minute cadence, but spread the five browser starts
+    // enough to avoid a simultaneous MVDIS connection burst.
+    if (TARGET_SHARD && process.env.SKIP_SHARD_JITTER !== '1') {
+        const jitterMap = { 'NORTH': 0, 'CENTRAL': 45000, 'SOUTH': 90000, 'SHARD4': 135000, 'SHARD5': 180000 };
         const shardJitter = jitterMap[TARGET_SHARD.toUpperCase()] || 0;
         if (shardJitter > 0) {
             console.log(`⏳ Adding ${shardJitter/1000}s jitter for shard ${TARGET_SHARD} to prevent parallel collision...`);
@@ -1051,12 +1055,14 @@ async function processStation(page, deptId, station) {
         // Pre-flight: verify MVDIS is reachable before processing any station
         const preflight = await preflightCheck(page);
         if (!preflight) {
-            const errMsg = 'Pre-flight failed: MVDIS unreachable after 3 attempts. WARP may not be routing Taiwan traffic.';
+            const errMsg = 'Pre-flight failed: Chromium cannot reach MVDIS through the current WARP session.';
             console.error(`❌ ${errMsg}`);
             stats.status = 'FAILED';
             stats.addError('PREFLIGHT', errMsg);
             await reportStatus('FAILED', errMsg, syncKey);
-            throw new Error(errMsg);
+            const preflightError = new Error(errMsg);
+            preflightError.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+            throw preflightError;
         }
 
         // ONLY clear if explicitly NOT in shard mode
@@ -1121,6 +1127,7 @@ async function processStation(page, deptId, station) {
     } catch (e) {
         console.error('Fatal Error:', e);
         stats.status = 'FAILED';
+        stats.exitCode = e.exitCode === MVDIS_PREFLIGHT_EXIT_CODE ? MVDIS_PREFLIGHT_EXIT_CODE : 1;
         stats.addError('GLOBAL', e.message);
         const syncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
         await reportStatus('FAILED', e.message, syncKey);
@@ -1146,6 +1153,6 @@ async function processStation(page, deptId, station) {
             // Ignore kill errors
         }
         
-        process.exit(stats.status === 'FAILED' ? 1 : 0);
+        process.exit(stats.status === 'FAILED' ? (stats.exitCode || 1) : 0);
     }
 })();
