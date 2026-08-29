@@ -704,18 +704,17 @@ async function preflightCheck(page) {
         if (ipData) {
             console.log(`🌐 Chrome outbound IP: ${ipData.ip} (${ipData.country || '?'} / ${ipData.org || '?'})`);
             if (ipData.country !== 'TW') {
-                console.warn(`⚠️  Chrome IP is ${ipData.country}, NOT TW — MVDIS may block browser connections.`);
-                console.warn('   → Fix: set PROXY_URL secret to a Taiwan HTTP/SOCKS5 proxy.');
-                console.warn('   → e.g. PROXY_URL=http://user:pass@tw-proxy-host:port');
+                console.warn(`⚠️  Chrome IP country is ${ipData.country || 'UNKNOWN'}; this is telemetry only, not an MVDIS pass/fail signal.`);
+                console.warn('   → Actual Chromium navigation to MVDIS remains authoritative.');
             }
         }
     } catch (e) {
         console.log(`[IP Check] Could not determine Chrome IP: ${e.message}`);
     }
 
-    // Stage 2: Verify MVDIS is reachable. Workflow-level recovery owns retries
-    // that rebuild the entire Chrome process and WARP session; repeated goto()
-    // calls here would keep using the same poisoned network stack.
+    // Stage 2: Verify MVDIS is reachable. The wrapper owns bounded cooldowns,
+    // fresh Chrome processes, and WARP tunnel refreshes; repeated goto() calls
+    // here would keep using the same poisoned browser network stack.
     console.log('🔍 Pre-flight [2/2]: Testing MVDIS connectivity...');
     try {
         const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -975,7 +974,7 @@ async function processStation(page, deptId, station) {
     // Keep the external 20-minute cadence, but spread the five browser starts
     // enough to avoid a simultaneous MVDIS connection burst.
     if (TARGET_SHARD && process.env.SKIP_SHARD_JITTER !== '1') {
-        const jitterMap = { 'NORTH': 0, 'CENTRAL': 45000, 'SOUTH': 90000, 'SHARD4': 135000, 'SHARD5': 180000 };
+        const jitterMap = { 'NORTH': 0, 'CENTRAL': 90000, 'SOUTH': 180000, 'SHARD4': 270000, 'SHARD5': 360000 };
         const shardJitter = jitterMap[TARGET_SHARD.toUpperCase()] || 0;
         if (shardJitter > 0) {
             console.log(`⏳ Adding ${shardJitter/1000}s jitter for shard ${TARGET_SHARD} to prevent parallel collision...`);

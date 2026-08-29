@@ -134,7 +134,14 @@ jobs:
             esac
           done
 
-          retry_matrix=$(printf '%s\n' "${retry_shards[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | {shard: .}')
+          retry_matrix=$(printf '%s\n' "${retry_shards[@]}" | jq -Rsc --argjson slot 90 '
+            split("\n") | map(select(length > 0)) as $shards
+            | {include: ($shards | to_entries | map({
+                shard: .value,
+                initial_delay_seconds: (.key * $slot),
+                retry_cooldown_seconds: (($shards | length) * $slot)
+              }))}
+          ')
           if [ "${#retry_shards[@]}" -gt 0 ]; then
             has_retries=true
           else
@@ -172,9 +179,11 @@ jobs:
           gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
 
       - name: Retry Crawler Shard ${{ matrix.shard }} on fresh runner
-        run: node gh-plate-sync.cjs --shard=${{ matrix.shard }}
+        run: bash scripts/run-plate-shard-with-recovery.sh "${{ matrix.shard }}" fresh
         env:
-          SKIP_SHARD_JITTER: '1'
+          INITIAL_DELAY_SECONDS: ${{ matrix.initial_delay_seconds }}
+          RETRY_COOLDOWN_SECONDS: ${{ matrix.retry_cooldown_seconds }}
+          MAX_PREFLIGHT_ATTEMPTS: '3'
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -58,6 +58,11 @@ test('初始 shard、fresh-runner recovery matrix 與 atomic-swap gate 完整串
     assert.match(recovery.if, /has_retries/);
     assert.equal(recovery['timeout-minutes'], 45);
     assert.match(recovery.strategy.matrix, /fromJSON/);
+    const recoveryStep = recovery.steps.find((step) => step.name.includes('Retry Crawler Shard'));
+    assert.match(recoveryStep.run, /run-plate-shard-with-recovery\.sh.*fresh/);
+    assert.match(recoveryStep.env.INITIAL_DELAY_SECONDS, /matrix\.initial_delay_seconds/);
+    assert.match(recoveryStep.env.RETRY_COOLDOWN_SECONDS, /matrix\.retry_cooldown_seconds/);
+    assert.equal(recoveryStep.env.MAX_PREFLIGHT_ATTEMPTS, '3');
     assert.equal(gate.if, 'always()');
     assert.deepEqual(gate.needs, ['collect-results', 'recovery-sync']);
     assert.equal(finalizer.needs, 'recovery-gate');
@@ -89,7 +94,7 @@ function runOutcomeCollector(statuses, primaryResult = 'success') {
     };
 }
 
-test('collector 只把 RETRY shard 放進 fresh-runner matrix', () => {
+test('collector 只把 RETRY shard 放進帶錯峰欄位的 fresh-runner matrix', () => {
     const scenario = runOutcomeCollector({
         NORTH: 'SUCCESS',
         CENTRAL: 'SUCCESS',
@@ -102,7 +107,32 @@ test('collector 只把 RETRY shard 放進 fresh-runner matrix', () => {
     assert.equal(scenario.result.status, 0, output);
     assert.equal(scenario.outputs.has_retries, 'true');
     assert.equal(scenario.outputs.hard_failure, 'false');
-    assert.deepEqual(JSON.parse(scenario.outputs.retry_matrix), { shard: ['SHARD4'] });
+    assert.deepEqual(JSON.parse(scenario.outputs.retry_matrix), {
+        include: [{
+            shard: 'SHARD4',
+            initial_delay_seconds: 0,
+            retry_cooldown_seconds: 90,
+        }],
+    });
+});
+
+test('collector 為多個 recovery shard 配置互斥時間槽與共同冷卻週期', () => {
+    const scenario = runOutcomeCollector({
+        NORTH: 'SUCCESS',
+        CENTRAL: 'RETRY',
+        SOUTH: 'SUCCESS',
+        SHARD4: 'SUCCESS',
+        SHARD5: 'RETRY',
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(JSON.parse(scenario.outputs.retry_matrix), {
+        include: [
+            { shard: 'CENTRAL', initial_delay_seconds: 0, retry_cooldown_seconds: 180 },
+            { shard: 'SHARD5', initial_delay_seconds: 90, retry_cooldown_seconds: 180 },
+        ],
+    });
 });
 
 test('collector 遇到缺少 artifact 時 fail-closed，不臆測該 shard 成功', () => {
@@ -340,14 +370,15 @@ test('Gemini transport error 三次後降為 warning，由 crawler 安全機制�
     assert.match(output, /transient failure after 3 attempts/);
 });
 
-test('crawler 將 MVDIS preflight 分類為暫時性 exit 75，並擴大五 shard jitter', () => {
+test('crawler 將 MVDIS preflight 分類為暫時性 exit 75，並以 90 秒分隔五 shard', () => {
     const source = fs.readFileSync(crawlerPath, 'utf8');
 
     assert.match(source, /MVDIS_PREFLIGHT_EXIT_CODE\s*=\s*75/);
     assert.match(source, /preflightError\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
-    assert.match(source, /'CENTRAL': 45000/);
-    assert.match(source, /'SOUTH': 90000/);
-    assert.match(source, /'SHARD4': 135000/);
-    assert.match(source, /'SHARD5': 180000/);
+    assert.match(source, /'CENTRAL': 90000/);
+    assert.match(source, /'SOUTH': 180000/);
+    assert.match(source, /'SHARD4': 270000/);
+    assert.match(source, /'SHARD5': 360000/);
     assert.match(source, /process\.env\.SKIP_SHARD_JITTER !== '1'/);
+    assert.doesNotMatch(source, /Fix: set PROXY_URL secret/);
 });
