@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   sync-plates:
+    name: primary-attempt (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -55,6 +56,49 @@ jobs:
           GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
+      - name: Summarize primary crawler outcome
+        if: always()
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+          CRAWL_STATUS: ${{ steps.crawl.outputs.status }}
+        run: |
+          status="${CRAWL_STATUS:-MISSING}"
+          {
+            echo "## Primary attempt: $SHARD"
+            echo
+            echo "- Outcome: \`$status\`"
+            case "$status" in
+              SUCCESS)
+                echo "- The crawler and all configured stations completed during the primary runner."
+                ;;
+              RETRY)
+                echo "- The primary runner did not complete the crawl; fresh-runner recovery is required."
+                ;;
+              HARD_FAILURE)
+                echo "- The crawler hit a non-retryable failure; recovery is not allowed."
+                ;;
+              *)
+                echo "- The primary outcome is missing or invalid; the completeness gate will fail closed."
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$status" in
+            SUCCESS)
+              echo "Primary crawler completed for $SHARD."
+              ;;
+            RETRY)
+              echo "::warning::Primary crawler did not complete for $SHARD; this shard requires fresh-runner recovery."
+              ;;
+            HARD_FAILURE)
+              echo "::error::Primary crawler reported a non-retryable failure for $SHARD."
+              ;;
+            *)
+              echo "::error::Primary crawler outcome is missing or invalid for $SHARD."
+              ;;
+          esac
+
       - name: Upload shard outcome
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,6 +116,7 @@ jobs:
           exit 1
 
   collect-results:
+    name: classify-primary-outcomes
     needs: sync-plates
     if: always()
     runs-on: ubuntu-latest
@@ -154,6 +199,7 @@ jobs:
           echo "primary_result=$PRIMARY_RESULT" >> "$GITHUB_OUTPUT"
 
   recovery-sync:
+    name: recovery-attempt (${{ matrix.shard }})
     needs: collect-results
     if: needs.collect-results.outputs.hard_failure == 'false' && needs.collect-results.outputs.has_retries == 'true'
     runs-on: ubuntu-latest
@@ -195,6 +241,7 @@ jobs:
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
   recovery-gate:
+    name: verify-all-shards-complete
     needs: [collect-results, recovery-sync]
     if: always()
     runs-on: ubuntu-latest
@@ -224,6 +271,7 @@ jobs:
           echo "All five shards completed either on the primary runner or an approved fresh-runner recovery."
 
   finalize-sync:
+    name: finalize-atomic-swap
     needs: recovery-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10

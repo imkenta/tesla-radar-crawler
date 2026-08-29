@@ -47,6 +47,11 @@ test('初始 shard、fresh-runner recovery matrix 與 atomic-swap gate 完整串
     const gate = workflow.jobs['recovery-gate'];
     const finalizer = workflow.jobs['finalize-sync'];
 
+    assert.equal(primary.name, 'primary-attempt (${{ matrix.shard }})');
+    assert.equal(collect.name, 'classify-primary-outcomes');
+    assert.equal(recovery.name, 'recovery-attempt (${{ matrix.shard }})');
+    assert.equal(gate.name, 'verify-all-shards-complete');
+    assert.equal(finalizer.name, 'finalize-atomic-swap');
     assert.deepEqual(primary.strategy.matrix.shard, ['NORTH', 'CENTRAL', 'SOUTH', 'SHARD4', 'SHARD5']);
     assert.equal(primary.strategy['fail-fast'], false);
     assert.match(primary.steps.find((step) => step.id === 'crawl').run, /run-plate-shard-with-recovery\.sh/);
@@ -67,6 +72,42 @@ test('初始 shard、fresh-runner recovery matrix 與 atomic-swap gate 完整串
     assert.deepEqual(gate.needs, ['collect-results', 'recovery-sync']);
     assert.equal(finalizer.needs, 'recovery-gate');
     assert.equal(finalizer.if, 'success()');
+});
+
+function runPrimaryOutcomeSummary(status) {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-primary-summary-'));
+    const summaryPath = path.join(tempDir, 'summary.md');
+    const step = getWorkflowStep('sync-plates', 'Summarize primary crawler outcome');
+    const result = spawnSync('/bin/bash', ['-e'], {
+        input: step.run,
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            SHARD: 'CENTRAL',
+            CRAWL_STATUS: status,
+            GITHUB_STEP_SUMMARY: summaryPath,
+        },
+    });
+
+    return {
+        result,
+        summary: fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, 'utf8') : '',
+    };
+}
+
+test('primary job summary 明確區分資料成功與等待 recovery', () => {
+    const retry = runPrimaryOutcomeSummary('RETRY');
+    const success = runPrimaryOutcomeSummary('SUCCESS');
+
+    assert.equal(retry.result.status, 0, `${retry.result.stdout}${retry.result.stderr}`);
+    assert.match(retry.summary, /Primary attempt: CENTRAL/);
+    assert.match(retry.summary, /Outcome: `RETRY`/);
+    assert.match(retry.summary, /did not complete the crawl/);
+    assert.match(`${retry.result.stdout}${retry.result.stderr}`, /requires fresh-runner recovery/);
+
+    assert.equal(success.result.status, 0, `${success.result.stdout}${success.result.stderr}`);
+    assert.match(success.summary, /Outcome: `SUCCESS`/);
+    assert.match(success.summary, /completed during the primary runner/);
 });
 
 function runOutcomeCollector(statuses, primaryResult = 'success') {
