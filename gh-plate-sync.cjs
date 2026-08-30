@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -138,6 +138,8 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 //   PerMinute 或無 PerDay 字樣 → 退避（RetryInfo.retryDelay 或 20s）同 combo 重試 1 次，
 //   成功不計數。
 // - 5xx → 退避 5-10 秒同 combo 重試 1 次，成功不計數，再失敗才計入升級門檻。
+//   另計滑動窗風暴偵測（2026-08-30 四次修正）：同 combo 5 分鐘內累積 3 次 5xx
+//   → 判定模型端過載風暴，直接升級（成功不歸零風暴窗，見 lib/ai-model-ladder.cjs）。
 // - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
 // 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
 class AIManager {
@@ -234,14 +236,26 @@ class AIManager {
                     continue;
                 }
 
-                // 5xx 暫時性錯誤 → 退避 5-10 秒同 combo 重試 1 次；重試成功不計數
-                // （26B 間歇性 500 不該讓它被踢下主力層），再失敗落入下方一般計數。
-                if (isServerError(e) && !serverRetried) {
-                    serverRetried = true;
-                    const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
-                    console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
-                    await new Promise((resolve) => setTimeout(resolve, waitMs));
-                    continue;
+                // 5xx 暫時性錯誤：先計入滑動窗風暴偵測（成功不歸零——503 過載風暴
+                // 與零星成功交錯時，「連續失敗」門檻會被 recordSuccess 一直歸零而
+                // 永遠升不了級；2026-08-30 SOUTH 分片因此把 18 分鐘 lane 預算整段
+                // 耗在過載的 26B 上）。未達風暴門檻才退避 5-10 秒同 combo 重試 1 次
+                // （26B 間歇性 500 仍不會被踢下主力層），再失敗落入下方一般計數。
+                if (isServerError(e)) {
+                    const stormBefore = `${this.currentKeyName}/${this.modelName}`;
+                    const storm = this.ladder.recordServerError(Date.now());
+                    if (storm.escalated) {
+                        console.log(`⚠️  [AI] ${stormBefore} 5xx 風暴（${SERVER_ERROR_STORM_WINDOW_MS / 60000} 分鐘內達 ${SERVER_ERROR_STORM_THRESHOLD} 次，模型端過載），升級 → ${this.currentKeyName}/${this.modelName}`);
+                        this.init();
+                        continue;
+                    }
+                    if (!serverRetried) {
+                        serverRetried = true;
+                        const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
+                        console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
+                        await new Promise((resolve) => setTimeout(resolve, waitMs));
+                        continue;
+                    }
                 }
 
                 // 一般 API 層失敗：連續失敗計數 +1，達門檻升級（自動跳過已標死 combo）。
