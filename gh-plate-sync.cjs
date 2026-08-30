@@ -105,6 +105,12 @@ const PROXY_URL = process.env.PROXY_URL;
 const MODEL_NAME = MODEL_LADDER[0].model; // 僅供啟動 log 顯示用，實際模型由 AIManager 階梯狀態決定
 const MVDIS_PREFLIGHT_EXIT_CODE = 75; // EX_TEMPFAIL：workflow 只補跑此類網路失敗
 
+// 2026-08-30：Gemini 503 過載期，SDK 呼叫會被 Google 端 hold 40-120 秒才回錯，
+// 是 18 分鐘 lane 預算的最大時間小偷，也讓 MVDIS 頁面在乾等期間 session 過期、
+// frame 脫離（05:23/05:43 兩輪的 detached Frame 皆發生在長掛起之後）。健康呼叫
+// 3-15 秒，25 秒硬逾時只切病態長尾；逾時視同 5xx 計入風暴偵測。
+const AI_CALL_TIMEOUT_MS = 25000;
+
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
     process.exit(1);
@@ -185,6 +191,29 @@ class AIManager {
         console.log(`[AI] Initialized using: ${this.currentKeyName} / model: ${this.modelName}`);
     }
 
+    // 25 秒硬逾時包裝：輸掉 race 的原始 promise 掛 no-op catch，避免它稍後
+    // reject 時炸出 unhandledRejection。逾時錯誤帶 status=503，讓既有的
+    // isServerError / 風暴偵測路徑自然接手。
+    async generateContentWithTimeout(payload) {
+        let timer;
+        const inflight = this.model.generateContent(payload);
+        inflight.catch(() => {});
+        try {
+            return await Promise.race([
+                inflight,
+                new Promise((_resolve, reject) => {
+                    timer = setTimeout(() => {
+                        const err = new Error(`[AI] generateContent 本地硬逾時 ${AI_CALL_TIMEOUT_MS / 1000}s（視同暫時性 5xx）`);
+                        err.status = 503;
+                        reject(err);
+                    }, AI_CALL_TIMEOUT_MS);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     async generateContent(payload) {
         // 迴圈有界：日配額死亡矩陣單調成長（≤ keys×tiers 個組合）、分鐘級/5xx 退避
         // 各限重試 1 次（per-call 旗標）、一般失敗要嘛升級（≤ 層數次）要嘛 throw。
@@ -196,7 +225,7 @@ class AIManager {
                 throw new Error(`[AI] 本輪所有 key/model 組合均已收到明確 PerDay 429（最後停在 ${this.currentKeyName}/${this.modelName}）`);
             }
             try {
-                const result = await this.model.generateContent(payload);
+                const result = await this.generateContentWithTimeout(payload);
                 this.ladder.recordSuccess(); // 連續失敗語義：任何成功都重置當前層失敗計數
                 return result;
             } catch (e) {

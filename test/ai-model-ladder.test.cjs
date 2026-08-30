@@ -11,6 +11,7 @@ const assert = require('node:assert/strict');
 const {
     MODEL_LADDER,
     EXHAUSTED,
+    SERVER_ERROR_STORM_THRESHOLD,
     SERVER_ERROR_STORM_WINDOW_MS,
     nextLadderState,
     comboId,
@@ -424,19 +425,20 @@ test('LadderState：keyNames 為空 → 建構時拋 RangeError', () => {
 test('recordServerError：窗內未達門檻 → 不升級、停留原 combo', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     const t0 = 1_000_000;
-    assert.deepEqual(s.recordServerError(t0), { escalated: false });
-    assert.deepEqual(s.recordServerError(t0 + 60_000), { escalated: false });
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD - 1; i++) {
+        assert.deepEqual(s.recordServerError(t0 + i * 30_000), { escalated: false });
+    }
     assert.equal(s.model, 'gemma-4-26b-a4b-it');
 });
 
 test('recordServerError：窗內達門檻 → 升級到下一層，且「中間夾成功」不歸零風暴窗（核心回歸）', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     const t0 = 1_000_000;
-    s.recordServerError(t0);
-    s.recordSuccess(); // 實戰情境：503 之間夾雜成功的 CAPTCHA 解答
-    s.recordServerError(t0 + 90_000);
-    s.recordSuccess();
-    const out = s.recordServerError(t0 + 180_000); // 5 分鐘窗內第 3 次 5xx
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
+        out = s.recordServerError(t0 + i * 90_000);
+        s.recordSuccess(); // 實戰情境：503 之間夾雜成功的 CAPTCHA 解答
+    }
     assert.equal(out.escalated, true);
     assert.equal(s.model, 'gemma-4-31b-it');
     assert.equal(s.failureCount, 0); // combo 變更後計數歸零
@@ -446,9 +448,11 @@ test('recordServerError：窗內達門檻 → 升級到下一層，且「中間�
 test('recordServerError：事件散落在窗外（間歇性 500）→ 永遠達不到門檻、26B 主力層不動', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     const t0 = 1_000_000;
-    s.recordServerError(t0);
-    s.recordServerError(t0 + SERVER_ERROR_STORM_WINDOW_MS + 1_000);
-    const out = s.recordServerError(t0 + 2 * (SERVER_ERROR_STORM_WINDOW_MS + 1_000));
+    const spacing = SERVER_ERROR_STORM_WINDOW_MS + 1_000;
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD + 2; i++) {
+        out = s.recordServerError(t0 + i * spacing);
+    }
     assert.equal(out.escalated, false);
     assert.equal(s.model, 'gemma-4-26b-a4b-it');
 });
@@ -457,9 +461,10 @@ test('recordServerError：升級時跳過 PerDay 已標死的層', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', 'gemma-4-31b-it'));
     const t0 = 1_000_000;
-    s.recordServerError(t0);
-    s.recordServerError(t0 + 1_000);
-    const out = s.recordServerError(t0 + 2_000);
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
+        out = s.recordServerError(t0 + i * 1_000);
+    }
     assert.equal(out.escalated, true);
     assert.equal(s.model, 'gemini-3.1-flash-lite');
 });
@@ -468,9 +473,10 @@ test('recordServerError：已在最末存活層 → escalated:false + exhausted:
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     s.tierIndex = MODEL_LADDER.length - 1;
     const t0 = 1_000_000;
-    s.recordServerError(t0);
-    s.recordServerError(t0 + 1_000);
-    const out = s.recordServerError(t0 + 2_000);
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
+        out = s.recordServerError(t0 + i * 1_000);
+    }
     assert.equal(out.escalated, false);
     assert.equal(out.exhausted, true);
     assert.equal(s.model, 'gemini-3-flash-preview'); // 停留原層，不污染狀態
