@@ -141,11 +141,18 @@ runs:
         sudo warp-cli --accept-tos connect 2>/dev/null || true
 
         echo "Waiting for WARP connection..."
-        sleep 30
+        WARP_TRACE=""
+        for WARP_WAIT in 1 2 3 4 5 6; do
+          sleep 5
+          WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+          if grep -q '^warp=on$' <<< "$WARP_TRACE"; then
+            echo "WARP confirmed on after $((WARP_WAIT * 5))s."
+            break
+          fi
+        done
         sudo warp-cli status 2>/dev/null || \
         sudo warp-cli --accept-tos status 2>/dev/null || true
 
-        WARP_TRACE=$(curl -4 -fsS --max-time 15 https://www.cloudflare.com/cdn-cgi/trace)
         if ! grep -q '^warp=on$' <<< "$WARP_TRACE"; then
           echo "::error::Cloudflare trace did not confirm warp=on."
           echo "$WARP_TRACE"

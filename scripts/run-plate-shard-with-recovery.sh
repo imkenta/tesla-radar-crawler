@@ -10,6 +10,9 @@ readonly INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-0}"
 readonly RETRY_COOLDOWN_SECONDS="${RETRY_COOLDOWN_SECONDS:-15}"
 readonly MAX_PREFLIGHT_ATTEMPTS="${MAX_PREFLIGHT_ATTEMPTS:-2}"
 readonly DEADLINE_EPOCH="${DEADLINE_EPOCH:-0}"
+# primary 原地重抽 WARP 身分的預算門檻：600s（recovery gate 下限）＋重抽與一次
+# preflight 失敗的最壞耗時（~180s）＋餘裕（60s）。低於此值直接交棒，不賭。
+readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-840}"
 
 if [ -z "$SHARD" ]; then
   echo "::error::Missing shard argument."
@@ -24,7 +27,7 @@ case "$MODE" in
     ;;
 esac
 
-for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH"; do
+for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS"; do
   if ! [[ "$numeric_value" =~ ^[0-9]+$ ]]; then
     echo "::error::Recovery timing values must be non-negative integers."
     exit 2
@@ -98,33 +101,75 @@ wait_before_retry() {
   return 0
 }
 
-refresh_warp_session() {
+# 2026-08-30：MVDIS 擋的是個別出口 IP，不是「非台灣 IP」（過去每天 70/72 輪從美國
+# 出口成功）。單純 disconnect/connect 沿用同一 registration，常拿回同一顆出口 IP，
+# 等於浪費一次重試；重註冊（registration delete → new）才是重抽出口 IP 的樂透票，
+# 成本 ~40 秒，遠低於交棒 fresh runner 的 2-3 分鐘 setup。
+reroll_warp_identity() {
   local warp_attempt
   local trace
+  local host
 
-  echo "Refreshing the current WARP tunnel without recycling its registration."
+  echo "Re-rolling WARP identity: new registration = new exit-IP lottery ticket."
 
   warp_cli disconnect || true
+  warp_cli registration delete || true
+  if ! warp_cli registration new; then
+    echo "::warning::Unable to obtain a fresh WARP registration."
+    return 1
+  fi
+
+  # registration 重置可能清掉 split-tunnel 名單；Gemini 若被捲回 WARP 隧道會變
+  # unsupported-location 400 → HARD_FAILURE，所以重抽後一律重建排除清單。
+  # 重複加入既有排除項在部分 warp-cli 版本會報錯，因此失敗僅告警，
+  # 由下方的 split-tunnel 實測（ipify 直連 IP ≠ WARP 出口 IP）做最終裁決。
+  for host in generativelanguage.googleapis.com api.ipify.org; do
+    warp_cli tunnel host add "$host" || \
+      echo "::warning::Could not re-add $host to the WARP exclusion list (may already be excluded)."
+  done
+  if [ -n "${VITE_SUPABASE_URL:-}" ]; then
+    local supabase_host
+    local supabase_ip
+    supabase_host=$(sed -E 's#https?://([^/]+).*#\1#' <<< "$VITE_SUPABASE_URL")
+    supabase_ip=$(getent ahostsv4 "$supabase_host" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    if [ -n "$supabase_ip" ]; then
+      warp_cli add-excluded-route "${supabase_ip}/32" || true
+    fi
+  fi
+
   if ! warp_cli connect; then
-    echo "::warning::Unable to reconnect WARP."
+    echo "::warning::Unable to reconnect WARP after re-registration."
     return 1
   fi
 
   for warp_attempt in 1 2 3 4 5 6; do
     trace=$(curl -4 -fsS --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
     if grep -q '^warp=on$' <<< "$trace"; then
-      echo "WARP tunnel refreshed and verified on attempt $warp_attempt/6."
+      echo "WARP identity re-rolled and verified on attempt $warp_attempt/6."
+
+      # split-tunnel 實測：ipify 在排除清單內應走 runner 直連 IP，與 WARP 出口
+      # IP 相同代表排除清單失效（Gemini 也會被捲進隧道）。
+      local warp_ip
+      local direct_ip
+      warp_ip=$(awk -F= '$1 == "ip" { print $2 }' <<< "$trace")
+      direct_ip=$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+      if [ -n "$warp_ip" ] && [ -n "$direct_ip" ] && [ "$warp_ip" = "$direct_ip" ]; then
+        echo "::warning::Split-tunnel exclusion appears broken after re-registration (direct IP == WARP exit IP)."
+        return 1
+      fi
       return 0
     fi
     sleep 5
   done
 
-  echo "::warning::Cloudflare trace did not confirm warp=on after refreshing the tunnel."
+  echo "::warning::Cloudflare trace did not confirm warp=on after re-registration."
   return 1
 }
 
 run_primary() {
   local first_exit
+  local second_exit
+  local remaining_seconds
 
   run_crawler 0
   first_exit=$?
@@ -135,7 +180,32 @@ run_primary() {
       return 0
       ;;
     "$MVDIS_PREFLIGHT_EXIT_CODE")
-      echo "::warning::Shard $SHARD is leaving the primary runner immediately for isolated fresh-runner recovery."
+      # WARP 出口樂透沒中：交棒 fresh runner 要再花 2-3 分鐘 setup；原地重抽
+      # registration 只要 ~40 秒。預算仍足（重抽＋一次 preflight 失敗後，交棒時
+      # recovery gate 的 600 秒門檻必須仍過）才原地重抽一張，否則維持立即交棒。
+      # DEADLINE_EPOCH 未設（無預算資訊）時不賭，直接交棒。
+      if [ "$DEADLINE_EPOCH" -gt 0 ]; then
+        remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
+        if [ "$remaining_seconds" -ge "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" ] && reroll_warp_identity; then
+          echo "Shard $SHARD retrying once on the primary runner with a fresh WARP identity."
+          run_crawler 1
+          second_exit=$?
+          case "$second_exit" in
+            0)
+              write_outcome SUCCESS
+              return 0
+              ;;
+            "$MVDIS_PREFLIGHT_EXIT_CODE")
+              ;;
+            *)
+              echo "::error::Shard $SHARD failed with non-retryable exit code $second_exit."
+              write_outcome HARD_FAILURE
+              return 0
+              ;;
+          esac
+        fi
+      fi
+      echo "::warning::Shard $SHARD is leaving the primary runner for isolated fresh-runner recovery."
       write_outcome RETRY
       return 0
       ;;
@@ -185,8 +255,8 @@ run_fresh() {
       write_outcome RETRY
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi
-    if ! refresh_warp_session; then
-      echo "::error::Unable to refresh WARP between fresh-runner attempts for shard $SHARD."
+    if ! reroll_warp_identity; then
+      echo "::error::Unable to re-roll the WARP identity between fresh-runner attempts for shard $SHARD."
       write_outcome RETRY
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi

@@ -91,7 +91,7 @@ test('第一次成功時不重建 WARP', () => {
     assert.equal(scenario.warpLog, '');
 });
 
-test('primary exit 75 立即交給 fresh runner，不在正常 runner 增加 90 秒與第二次完整 crawl', () => {
+test('primary exit 75 且無 deadline 資訊 → 立即交給 fresh runner，不原地重抽', () => {
     const scenario = runScenario([75, 0]);
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
@@ -100,6 +100,51 @@ test('primary exit 75 立即交給 fresh runner，不在正常 runner 增加 90 
     assert.equal(scenario.nodeCalls, 1);
     assert.equal(scenario.warpLog, '');
     assert.deepEqual(scenario.sleeps, []);
+});
+
+test('primary exit 75 且預算充足 → 原地重抽 WARP 身分後再試一次，成功則 SUCCESS', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 1000; // 剩 1000s ≥ 840s 門檻
+    const scenario = runScenario([75, 0], { deadlineEpoch });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'SUCCESS' });
+    assert.equal(scenario.nodeCalls, 2);
+    const warpCommands = scenario.warpLog.trim().split('\n');
+    assert.equal(warpCommands.filter((c) => c === 'registration delete').length, 1);
+    assert.equal(warpCommands.filter((c) => c === 'registration new').length, 1);
+    assert.equal(warpCommands.filter((c) => c.startsWith('tunnel host add')).length, 2);
+});
+
+test('primary exit 75 且預算充足但重抽後 preflight 仍失敗 → 交出 RETRY', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 1000;
+    const scenario = runScenario([75, 75], { deadlineEpoch });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
+    assert.equal(scenario.nodeCalls, 2);
+});
+
+test('primary exit 75 但預算不足 840s → 不重抽、立即交棒（守住 recovery gate 600s 門檻）', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 700; // 剩 ~700s < 840s
+    const scenario = runScenario([75, 0], { deadlineEpoch });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
+    assert.equal(scenario.nodeCalls, 1);
+    assert.equal(scenario.warpLog, '');
+});
+
+test('primary 重抽失敗（WARP 註冊拿不到）→ 不再試第二次 crawl，直接交棒', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 1000;
+    const scenario = runScenario([75, 0], { deadlineEpoch, warpExit: 1 });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
+    assert.equal(scenario.nodeCalls, 1);
 });
 
 test('非 preflight 錯誤不重試，保留 HARD_FAILURE 給 fail-closed gate', () => {
@@ -122,7 +167,7 @@ test('primary 在 lane deadline 耗盡後不再啟動 crawler，並 fail-closed 
     assert.match(output, /exhausted its end-to-end lane budget/);
 });
 
-test('fresh runner 只做兩次短冷卻嘗試，避免跨過下一個 20 分鐘排程', () => {
+test('fresh runner 短冷卻嘗試之間重抽 WARP 身分（重註冊，非單純重連）', () => {
     const scenario = runScenario([75, 0], {
         mode: 'fresh',
         initialDelaySeconds: 20,
@@ -138,6 +183,8 @@ test('fresh runner 只做兩次短冷卻嘗試，避免跨過下一個 20 分鐘
     const warpCommands = scenario.warpLog.trim().split('\n');
     assert.equal(warpCommands.filter((command) => command === 'disconnect').length, 1);
     assert.equal(warpCommands.filter((command) => command === 'connect').length, 1);
+    assert.equal(warpCommands.filter((command) => command === 'registration delete').length, 1);
+    assert.equal(warpCommands.filter((command) => command === 'registration new').length, 1);
 });
 
 test('fresh runner 兩次 exit 75 後仍失敗，不讓 recovery gate 假綠燈', () => {
