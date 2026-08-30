@@ -9,9 +9,11 @@ const path = require('node:path');
 const yaml = require('js-yaml');
 
 const workflowPath = path.join(__dirname, '..', '.github', 'workflows', 'plate-sync.yml');
+const laneWorkflowPath = path.join(__dirname, '..', '.github', 'workflows', 'plate-shard-lane.yml');
 const setupActionPath = path.join(__dirname, '..', '.github', 'actions', 'setup-plate-runner', 'action.yml');
 const crawlerPath = path.join(__dirname, '..', 'gh-plate-sync.cjs');
 const workflow = yaml.load(fs.readFileSync(workflowPath, 'utf8'));
+const laneWorkflow = yaml.load(fs.readFileSync(laneWorkflowPath, 'utf8'));
 const setupAction = yaml.load(fs.readFileSync(setupActionPath, 'utf8'));
 const setupSteps = setupAction.runs.steps;
 
@@ -21,17 +23,10 @@ function getStep(name) {
     return step;
 }
 
-function getWorkflowStep(jobName, stepName) {
-    const step = workflow.jobs[jobName].steps.find((candidate) => candidate.name === stepName);
-    assert.ok(step, `找不到 workflow step: ${jobName}/${stepName}`);
+function getLaneStep(jobName, stepName) {
+    const step = laneWorkflow.jobs[jobName].steps.find((candidate) => candidate.name === stepName);
+    assert.ok(step, `找不到 shard lane step: ${jobName}/${stepName}`);
     return step;
-}
-
-function parseGithubOutput(outputPath) {
-    return Object.fromEntries(fs.readFileSync(outputPath, 'utf8').trim().split('\n').map((line) => {
-        const separator = line.indexOf('=');
-        return [line.slice(0, separator), line.slice(separator + 1)];
-    }));
 }
 
 test('維持 20 分鐘外部觸發契約，且 workflow 不新增內建 schedule', () => {
@@ -40,44 +35,52 @@ test('維持 20 分鐘外部觸發契約，且 workflow 不新增內建 schedule
     assert.equal(workflow.concurrency['cancel-in-progress'], false);
 });
 
-test('初始 shard、fresh-runner recovery matrix 與 atomic-swap gate 完整串接', () => {
-    const primary = workflow.jobs['sync-plates'];
-    const collect = workflow.jobs['collect-results'];
-    const recovery = workflow.jobs['recovery-sync'];
-    const gate = workflow.jobs['recovery-gate'];
-    const finalizer = workflow.jobs['finalize-sync'];
+test('每個 shard 使用獨立 recovery lane，不再等待全部 primary 完成後才補跑', () => {
+    const lane = workflow.jobs['shard-lane'];
 
-    assert.equal(primary.name, 'primary-attempt (${{ matrix.shard }})');
-    assert.equal(collect.name, 'classify-primary-outcomes');
-    assert.equal(recovery.name, 'recovery-attempt (${{ matrix.shard }})');
-    assert.equal(gate.name, 'verify-all-shards-complete');
-    assert.equal(finalizer.name, 'finalize-atomic-swap');
-    assert.deepEqual(primary.strategy.matrix.shard, ['NORTH', 'CENTRAL', 'SOUTH', 'SHARD4', 'SHARD5']);
-    assert.equal(primary.strategy['fail-fast'], false);
-    assert.match(primary.steps.find((step) => step.id === 'crawl').run, /run-plate-shard-with-recovery\.sh/);
-    assert.equal(primary.steps.find((step) => step.name === 'Upload shard outcome').uses, 'actions/upload-artifact@v4');
-    assert.match(primary.steps.find((step) => step.name === 'Enforce non-retryable crawler failure').if, /HARD_FAILURE/);
+    assert.ok(lane, '缺少 shard-lane reusable workflow matrix');
+    assert.equal(workflow.jobs['collect-results'], undefined);
+    assert.equal(workflow.jobs['recovery-sync'], undefined);
+    assert.match(lane.uses, /plate-shard-lane\.yml/);
+    assert.deepEqual(lane.strategy.matrix.shard, ['NORTH', 'CENTRAL', 'SOUTH', 'SHARD4', 'SHARD5']);
+    assert.equal(lane.strategy['fail-fast'], false);
+});
 
-    assert.equal(collect.if, 'always()');
-    assert.match(collect.outputs.retry_matrix, /retry_matrix/);
-    assert.match(recovery.if, /has_retries/);
-    assert.equal(recovery['timeout-minutes'], 45);
-    assert.match(recovery.strategy.matrix, /fromJSON/);
-    const recoveryStep = recovery.steps.find((step) => step.name.includes('Retry Crawler Shard'));
-    assert.match(recoveryStep.run, /run-plate-shard-with-recovery\.sh.*fresh/);
-    assert.match(recoveryStep.env.INITIAL_DELAY_SECONDS, /matrix\.initial_delay_seconds/);
-    assert.match(recoveryStep.env.RETRY_COOLDOWN_SECONDS, /matrix\.retry_cooldown_seconds/);
-    assert.equal(recoveryStep.env.MAX_PREFLIGHT_ATTEMPTS, '3');
+test('shard lane 共用 18 分鐘 deadline，recovery 直接依賴自己的 primary', () => {
+    const primary = laneWorkflow.jobs.primary;
+    const recovery = laneWorkflow.jobs.recovery;
+    const gate = laneWorkflow.jobs['lane-gate'];
+
+    assert.equal(primary.name, 'primary-attempt (${{ inputs.shard }})');
+    assert.equal(primary['timeout-minutes'], 19);
+    assert.match(primary.outputs.deadline_epoch, /steps\.budget\.outputs\.deadline_epoch/);
+    const budgetStep = getLaneStep('primary', 'Start 18-minute shard lane budget');
+    assert.match(budgetStep.run, /\+ 1080/);
+    assert.equal(getLaneStep('primary', 'Setup primary crawler runner')['timeout-minutes'], 10);
+    const primaryCrawl = getLaneStep('primary', 'Run primary crawler once');
+    assert.match(primaryCrawl.run, /run-plate-shard-with-recovery\.sh/);
+    assert.doesNotMatch(primaryCrawl.run, /fresh/);
+    assert.match(primaryCrawl.env.DEADLINE_EPOCH, /steps\.budget\.outputs\.deadline_epoch/);
+
+    assert.equal(recovery.needs, 'primary');
+    assert.match(recovery.if, /needs\.primary\.outputs\.status == 'RETRY'/);
+    assert.equal(recovery['timeout-minutes'], 16);
+    assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 5);
+    const recoveryCrawl = getLaneStep('recovery', 'Retry crawler on fresh runner within lane budget');
+    assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*fresh/);
+    assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '15');
+    assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '2');
+    assert.match(recoveryCrawl.env.DEADLINE_EPOCH, /needs\.primary\.outputs\.deadline_epoch/);
+    assert.deepEqual(gate.needs, ['primary', 'recovery']);
     assert.equal(gate.if, 'always()');
-    assert.deepEqual(gate.needs, ['collect-results', 'recovery-sync']);
-    assert.equal(finalizer.needs, 'recovery-gate');
-    assert.equal(finalizer.if, 'success()');
+    assert.equal(workflow.jobs['finalize-sync'].needs, 'recovery-gate');
+    assert.equal(workflow.jobs['finalize-sync'].if, 'success()');
 });
 
 function runPrimaryOutcomeSummary(status) {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-primary-summary-'));
     const summaryPath = path.join(tempDir, 'summary.md');
-    const step = getWorkflowStep('sync-plates', 'Summarize primary crawler outcome');
+    const step = getLaneStep('primary', 'Summarize primary crawler outcome');
     const result = spawnSync('/bin/bash', ['-e'], {
         input: step.run,
         encoding: 'utf8',
@@ -102,117 +105,15 @@ test('primary job summary 明確區分資料成功與等待 recovery', () => {
     assert.equal(retry.result.status, 0, `${retry.result.stdout}${retry.result.stderr}`);
     assert.match(retry.summary, /Primary attempt: CENTRAL/);
     assert.match(retry.summary, /Outcome: `RETRY`/);
-    assert.match(retry.summary, /did not complete the crawl/);
-    assert.match(`${retry.result.stdout}${retry.result.stderr}`, /requires fresh-runner recovery/);
+    assert.match(retry.summary, /immediately moved to its isolated recovery runner/);
 
     assert.equal(success.result.status, 0, `${success.result.stdout}${success.result.stderr}`);
     assert.match(success.summary, /Outcome: `SUCCESS`/);
     assert.match(success.summary, /completed during the primary runner/);
 });
 
-function runOutcomeCollector(statuses, primaryResult = 'success') {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-result-collector-'));
-    const outputPath = path.join(tempDir, 'github-output.txt');
-    for (const [shard, status] of Object.entries(statuses)) {
-        fs.writeFileSync(path.join(tempDir, `plate-sync-result-${shard}.json`), JSON.stringify({ shard, status }));
-    }
-
-    const step = getWorkflowStep('collect-results', 'Classify primary shard outcomes');
-    const result = spawnSync('/bin/bash', ['-e'], {
-        input: step.run,
-        encoding: 'utf8',
-        env: {
-            ...process.env,
-            RESULT_DIR: tempDir,
-            PRIMARY_RESULT: primaryResult,
-            GITHUB_OUTPUT: outputPath,
-        },
-    });
-
-    return {
-        result,
-        outputs: fs.existsSync(outputPath) ? parseGithubOutput(outputPath) : {},
-    };
-}
-
-test('collector 只把 RETRY shard 放進帶錯峰欄位的 fresh-runner matrix', () => {
-    const scenario = runOutcomeCollector({
-        NORTH: 'SUCCESS',
-        CENTRAL: 'SUCCESS',
-        SOUTH: 'SUCCESS',
-        SHARD4: 'RETRY',
-        SHARD5: 'SUCCESS',
-    });
-    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
-
-    assert.equal(scenario.result.status, 0, output);
-    assert.equal(scenario.outputs.has_retries, 'true');
-    assert.equal(scenario.outputs.hard_failure, 'false');
-    assert.deepEqual(JSON.parse(scenario.outputs.retry_matrix), {
-        include: [{
-            shard: 'SHARD4',
-            initial_delay_seconds: 0,
-            retry_cooldown_seconds: 90,
-        }],
-    });
-});
-
-test('collector 為多個 recovery shard 配置互斥時間槽與共同冷卻週期', () => {
-    const scenario = runOutcomeCollector({
-        NORTH: 'SUCCESS',
-        CENTRAL: 'RETRY',
-        SOUTH: 'SUCCESS',
-        SHARD4: 'SUCCESS',
-        SHARD5: 'RETRY',
-    });
-    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
-
-    assert.equal(scenario.result.status, 0, output);
-    assert.deepEqual(JSON.parse(scenario.outputs.retry_matrix), {
-        include: [
-            { shard: 'CENTRAL', initial_delay_seconds: 0, retry_cooldown_seconds: 180 },
-            { shard: 'SHARD5', initial_delay_seconds: 90, retry_cooldown_seconds: 180 },
-        ],
-    });
-});
-
-test('collector 遇到缺少 artifact 時 fail-closed，不臆測該 shard 成功', () => {
-    const scenario = runOutcomeCollector({
-        NORTH: 'SUCCESS',
-        CENTRAL: 'SUCCESS',
-        SOUTH: 'SUCCESS',
-        SHARD4: 'SUCCESS',
-    });
-    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
-
-    assert.equal(scenario.result.status, 0, output);
-    assert.equal(scenario.outputs.hard_failure, 'true');
-    assert.match(output, /Missing primary outcome artifact for SHARD5/);
-});
-
-test('collector 拒絕檔名與內容 shard 身分不一致的 artifact', () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-result-mismatch-'));
-    const outputPath = path.join(tempDir, 'github-output.txt');
-    for (const shard of ['NORTH', 'CENTRAL', 'SOUTH', 'SHARD4', 'SHARD5']) {
-        const artifactShard = shard === 'SHARD5' ? 'NORTH' : shard;
-        fs.writeFileSync(path.join(tempDir, `plate-sync-result-${shard}.json`), JSON.stringify({ shard: artifactShard, status: 'SUCCESS' }));
-    }
-    const step = getWorkflowStep('collect-results', 'Classify primary shard outcomes');
-    const result = spawnSync('/bin/bash', ['-e'], {
-        input: step.run,
-        encoding: 'utf8',
-        env: { ...process.env, RESULT_DIR: tempDir, PRIMARY_RESULT: 'success', GITHUB_OUTPUT: outputPath },
-    });
-    const output = `${result.stdout}${result.stderr}`;
-    const outputs = parseGithubOutput(outputPath);
-
-    assert.equal(result.status, 0, output);
-    assert.equal(outputs.hard_failure, 'true');
-    assert.match(output, /identity mismatch: expected SHARD5, got NORTH/);
-});
-
-function runRecoveryGate(env) {
-    const step = getWorkflowStep('recovery-gate', 'Enforce complete shard coverage');
+function runLaneGate(env) {
+    const step = getLaneStep('lane-gate', 'Verify shard lane outcome');
     return spawnSync('/bin/bash', ['-e'], {
         input: step.run,
         encoding: 'utf8',
@@ -220,39 +121,47 @@ function runRecoveryGate(env) {
     });
 }
 
-test('recovery gate 只有在需要補跑且 fresh-runner 成功時放行', () => {
-    const passed = runRecoveryGate({
-        COLLECT_RESULT: 'success',
+test('shard lane gate 只有在 primary 成功或 bounded recovery 完成時放行', () => {
+    const primaryPassed = runLaneGate({
+        SHARD: 'CENTRAL',
         PRIMARY_RESULT: 'success',
-        HARD_FAILURE: 'false',
-        HAS_RETRIES: 'true',
-        RECOVERY_RESULT: 'success',
+        PRIMARY_STATUS: 'SUCCESS',
+        RECOVERY_RESULT: 'skipped',
+        RECOVERY_STATUS: '',
     });
-    const failed = runRecoveryGate({
-        COLLECT_RESULT: 'success',
+    const recoveryPassed = runLaneGate({
+        SHARD: 'CENTRAL',
         PRIMARY_RESULT: 'success',
-        HARD_FAILURE: 'false',
-        HAS_RETRIES: 'true',
-        RECOVERY_RESULT: 'failure',
+        PRIMARY_STATUS: 'RETRY',
+        RECOVERY_RESULT: 'success',
+        RECOVERY_STATUS: 'SUCCESS',
+    });
+    const recoveryFailed = runLaneGate({
+        SHARD: 'CENTRAL',
+        PRIMARY_RESULT: 'success',
+        PRIMARY_STATUS: 'RETRY',
+        RECOVERY_RESULT: 'success',
+        RECOVERY_STATUS: 'RETRY',
     });
 
-    assert.equal(passed.status, 0, `${passed.stdout}${passed.stderr}`);
-    assert.equal(failed.status, 1, `${failed.stdout}${failed.stderr}`);
-    assert.match(`${failed.stdout}${failed.stderr}`, /fresh-runner shard recovery failed/);
+    assert.equal(primaryPassed.status, 0, `${primaryPassed.stdout}${primaryPassed.stderr}`);
+    assert.equal(recoveryPassed.status, 0, `${recoveryPassed.stdout}${recoveryPassed.stderr}`);
+    assert.equal(recoveryFailed.status, 1, `${recoveryFailed.stdout}${recoveryFailed.stderr}`);
+    assert.match(`${recoveryFailed.stdout}${recoveryFailed.stderr}`, /did not complete CENTRAL/);
 });
 
 test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries', () => {
-    const setupStep = workflow.jobs['sync-plates'].steps.find((step) => step.name === 'Setup crawler runner');
+    const setupStep = getLaneStep('primary', 'Setup primary crawler runner');
     const cacheStep = getStep('Cache Cloudflare WARP apt packages');
     const installStep = getStep('Install and Configure Cloudflare WARP');
 
-    assert.equal(setupStep['timeout-minutes'], 15);
+    assert.equal(setupStep['timeout-minutes'], 10);
     assert.match(installStep.run, /https:\/\/archive\.ubuntu\.com\/ubuntu/);
     assert.match(installStep.run, /timeout --signal=TERM --kill-after=15s 90s/);
     assert.match(installStep.run, /timeout --signal=TERM --kill-after=15s 240s/);
     assert.match(installStep.run, /Acquire::Retries=2/);
     assert.doesNotMatch(installStep.run, /sudo apt-get update &&/);
-    assert.match(cacheStep.with.key, /hashFiles\('\.github\/workflows\/plate-sync\.yml'\)/);
+    assert.match(cacheStep.with.key, /plate-shard-lane\.yml/);
 });
 
 function runMvdisShellPreflightScenario(scenario) {
@@ -411,15 +320,15 @@ test('Gemini transport error 三次後降為 warning，由 crawler 安全機制�
     assert.match(output, /transient failure after 3 attempts/);
 });
 
-test('crawler 將 MVDIS preflight 分類為暫時性 exit 75，並以 90 秒分隔五 shard', () => {
+test('crawler 將 MVDIS preflight 分類為暫時性 exit 75，正常路徑最多只錯峰 80 秒', () => {
     const source = fs.readFileSync(crawlerPath, 'utf8');
 
     assert.match(source, /MVDIS_PREFLIGHT_EXIT_CODE\s*=\s*75/);
     assert.match(source, /preflightError\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
-    assert.match(source, /'CENTRAL': 90000/);
-    assert.match(source, /'SOUTH': 180000/);
-    assert.match(source, /'SHARD4': 270000/);
-    assert.match(source, /'SHARD5': 360000/);
+    assert.match(source, /'CENTRAL': 20000/);
+    assert.match(source, /'SOUTH': 40000/);
+    assert.match(source, /'SHARD4': 60000/);
+    assert.match(source, /'SHARD5': 80000/);
     assert.match(source, /process\.env\.SKIP_SHARD_JITTER !== '1'/);
     assert.doesNotMatch(source, /Fix: set PROXY_URL secret/);
 });

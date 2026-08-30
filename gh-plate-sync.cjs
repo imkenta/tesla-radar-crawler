@@ -971,10 +971,11 @@ async function processStation(page, deptId, station) {
     console.log('⏳ Waiting 5s for network to stabilize...');
     await new Promise(r => setTimeout(r, 5000));
 
-    // Keep the external 20-minute cadence, but spread the five browser starts
-    // enough to avoid a simultaneous MVDIS connection burst.
+    // Preserve the proven sub-15-minute healthy-path baseline while avoiding a
+    // simultaneous five-browser burst. Recovery now runs in an isolated lane,
+    // so the normal path must not pay multi-minute retry spacing.
     if (TARGET_SHARD && process.env.SKIP_SHARD_JITTER !== '1') {
-        const jitterMap = { 'NORTH': 0, 'CENTRAL': 90000, 'SOUTH': 180000, 'SHARD4': 270000, 'SHARD5': 360000 };
+        const jitterMap = { 'NORTH': 0, 'CENTRAL': 20000, 'SOUTH': 40000, 'SHARD4': 60000, 'SHARD5': 80000 };
         const shardJitter = jitterMap[TARGET_SHARD.toUpperCase()] || 0;
         if (shardJitter > 0) {
             console.log(`⏳ Adding ${shardJitter/1000}s jitter for shard ${TARGET_SHARD} to prevent parallel collision...`);

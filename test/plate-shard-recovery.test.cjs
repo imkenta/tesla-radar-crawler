@@ -18,8 +18,9 @@ function runScenario(exitCodes, options = {}) {
         mode = 'primary',
         warpExit = 0,
         initialDelaySeconds = 0,
-        retryCooldownSeconds = 90,
-        maxPreflightAttempts = 3,
+        retryCooldownSeconds = 15,
+        maxPreflightAttempts = 2,
+        deadlineEpoch = 0,
     } = options;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-shard-recovery-'));
     const fakeBin = path.join(tempDir, 'bin');
@@ -65,6 +66,7 @@ exit "$code"
             INITIAL_DELAY_SECONDS: String(initialDelaySeconds),
             RETRY_COOLDOWN_SECONDS: String(retryCooldownSeconds),
             MAX_PREFLIGHT_ATTEMPTS: String(maxPreflightAttempts),
+            DEADLINE_EPOCH: String(deadlineEpoch),
         },
     });
 
@@ -89,26 +91,15 @@ test('第一次成功時不重建 WARP', () => {
     assert.equal(scenario.warpLog, '');
 });
 
-test('primary exit 75 會冷卻、重連 WARP，並用全新 Node／Chrome process 重試', () => {
+test('primary exit 75 立即交給 fresh runner，不在正常 runner 增加 90 秒與第二次完整 crawl', () => {
     const scenario = runScenario([75, 0]);
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
     assert.equal(scenario.result.status, 0, output);
-    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'SUCCESS' });
-    assert.equal(scenario.nodeCalls, 2);
-    assert.match(scenario.warpLog, /disconnect/);
-    assert.match(scenario.warpLog, /connect/);
-    assert.doesNotMatch(scenario.warpLog, /registration (delete|new)/);
-    assert.deepEqual(scenario.sleeps, [90]);
-});
-
-test('同 runner 冷卻重連後仍 exit 75，交給 fresh-runner recovery matrix', () => {
-    const scenario = runScenario([75, 75]);
-    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
-
-    assert.equal(scenario.result.status, 0, output);
     assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
-    assert.equal(scenario.nodeCalls, 2);
+    assert.equal(scenario.nodeCalls, 1);
+    assert.equal(scenario.warpLog, '');
+    assert.deepEqual(scenario.sleeps, []);
 });
 
 test('非 preflight 錯誤不重試，保留 HARD_FAILURE 給 fail-closed gate', () => {
@@ -121,31 +112,41 @@ test('非 preflight 錯誤不重試，保留 HARD_FAILURE 給 fail-closed gate',
     assert.equal(scenario.warpLog, '');
 });
 
-test('fresh runner 先套用 recovery slot，並對 exit 75 做三次有界冷卻重試', () => {
-    const scenario = runScenario([75, 75, 0], {
+test('primary 在 lane deadline 耗盡後不再啟動 crawler，並 fail-closed 交出 RETRY', () => {
+    const scenario = runScenario([0], { deadlineEpoch: 1 });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
+    assert.equal(scenario.nodeCalls, 0);
+    assert.match(output, /exhausted its end-to-end lane budget/);
+});
+
+test('fresh runner 只做兩次短冷卻嘗試，避免跨過下一個 20 分鐘排程', () => {
+    const scenario = runScenario([75, 0], {
         mode: 'fresh',
-        initialDelaySeconds: 90,
-        retryCooldownSeconds: 180,
-        maxPreflightAttempts: 3,
+        initialDelaySeconds: 20,
+        retryCooldownSeconds: 15,
+        maxPreflightAttempts: 2,
     });
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
     assert.equal(scenario.result.status, 0, output);
     assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'SUCCESS' });
-    assert.equal(scenario.nodeCalls, 3);
-    assert.deepEqual(scenario.sleeps, [90, 180, 180]);
+    assert.equal(scenario.nodeCalls, 2);
+    assert.deepEqual(scenario.sleeps, [20, 15]);
     const warpCommands = scenario.warpLog.trim().split('\n');
-    assert.equal(warpCommands.filter((command) => command === 'disconnect').length, 2);
-    assert.equal(warpCommands.filter((command) => command === 'connect').length, 2);
+    assert.equal(warpCommands.filter((command) => command === 'disconnect').length, 1);
+    assert.equal(warpCommands.filter((command) => command === 'connect').length, 1);
 });
 
-test('fresh runner 三次 exit 75 後仍失敗，不讓 recovery gate 假綠燈', () => {
-    const scenario = runScenario([75, 75, 75], { mode: 'fresh' });
+test('fresh runner 兩次 exit 75 後仍失敗，不讓 recovery gate 假綠燈', () => {
+    const scenario = runScenario([75, 75], { mode: 'fresh' });
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
     assert.equal(scenario.result.status, 75, output);
     assert.deepEqual(scenario.outcome, { shard: 'NORTH', status: 'RETRY' });
-    assert.equal(scenario.nodeCalls, 3);
+    assert.equal(scenario.nodeCalls, 2);
 });
 
 test('fresh runner 遇到非 preflight 錯誤立即失敗且不重試', () => {

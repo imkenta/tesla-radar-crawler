@@ -12,237 +12,20 @@ permissions:
   contents: read
 
 jobs:
-  sync-plates:
-    name: primary-attempt (${{ matrix.shard }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  shard-lane:
+    name: shard-lane (${{ matrix.shard }})
     strategy:
+      fail-fast: false
       matrix:
         shard: [NORTH, CENTRAL, SOUTH, SHARD4, SHARD5]
-      fail-fast: false
-    concurrency:
-      group: plate-sync-shard-${{ matrix.shard }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup crawler runner
-        uses: ./.github/actions/setup-plate-runner
-        timeout-minutes: 15
-        with:
-          shards: ${{ matrix.shard }}
-          supabase-url: ${{ secrets.VITE_SUPABASE_URL }}
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
-          gemini-api-key-north: ${{ secrets.GEMINI_API_KEY_NORTH }}
-          gemini-api-key-central: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
-          gemini-api-key-south: ${{ secrets.GEMINI_API_KEY_SOUTH }}
-          gemini-api-key-shard4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
-          gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
-
-      - name: Run Crawler Shard ${{ matrix.shard }} with local recovery
-        id: crawl
-        shell: bash
-        run: bash scripts/run-plate-shard-with-recovery.sh "${{ matrix.shard }}"
-        env:
-          RESULT_PATH: ${{ runner.temp }}/plate-sync-result-${{ matrix.shard }}.json
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
-          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
-          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
-          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
-          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
-          NODE_OPTIONS: '--dns-result-order=ipv4first'
-
-      - name: Summarize primary crawler outcome
-        if: always()
-        shell: bash
-        env:
-          SHARD: ${{ matrix.shard }}
-          CRAWL_STATUS: ${{ steps.crawl.outputs.status }}
-        run: |
-          status="${CRAWL_STATUS:-MISSING}"
-          {
-            echo "## Primary attempt: $SHARD"
-            echo
-            echo "- Outcome: \`$status\`"
-            case "$status" in
-              SUCCESS)
-                echo "- The crawler and all configured stations completed during the primary runner."
-                ;;
-              RETRY)
-                echo "- The primary runner did not complete the crawl; fresh-runner recovery is required."
-                ;;
-              HARD_FAILURE)
-                echo "- The crawler hit a non-retryable failure; recovery is not allowed."
-                ;;
-              *)
-                echo "- The primary outcome is missing or invalid; the completeness gate will fail closed."
-                ;;
-            esac
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          case "$status" in
-            SUCCESS)
-              echo "Primary crawler completed for $SHARD."
-              ;;
-            RETRY)
-              echo "::warning::Primary crawler did not complete for $SHARD; this shard requires fresh-runner recovery."
-              ;;
-            HARD_FAILURE)
-              echo "::error::Primary crawler reported a non-retryable failure for $SHARD."
-              ;;
-            *)
-              echo "::error::Primary crawler outcome is missing or invalid for $SHARD."
-              ;;
-          esac
-
-      - name: Upload shard outcome
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: plate-sync-result-${{ matrix.shard }}
-          path: ${{ runner.temp }}/plate-sync-result-${{ matrix.shard }}.json
-          if-no-files-found: ignore
-          retention-days: 1
-
-      - name: Enforce non-retryable crawler failure
-        if: steps.crawl.outputs.status == 'HARD_FAILURE'
-        shell: bash
-        run: |
-          echo "::error::${{ matrix.shard }} failed outside the retryable MVDIS preflight boundary."
-          exit 1
-
-  collect-results:
-    name: classify-primary-outcomes
-    needs: sync-plates
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      retry_matrix: ${{ steps.analyze.outputs.retry_matrix }}
-      has_retries: ${{ steps.analyze.outputs.has_retries }}
-      hard_failure: ${{ steps.analyze.outputs.hard_failure }}
-      primary_result: ${{ steps.analyze.outputs.primary_result }}
-    steps:
-      - name: Download primary shard outcomes
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: plate-sync-result-*
-          path: ${{ runner.temp }}/plate-sync-results
-          merge-multiple: true
-
-      - name: Classify primary shard outcomes
-        id: analyze
-        shell: bash
-        env:
-          PRIMARY_RESULT: ${{ needs.sync-plates.result }}
-          RESULT_DIR: ${{ runner.temp }}/plate-sync-results
-        run: |
-          retry_shards=()
-          hard_failure=false
-
-          for shard in NORTH CENTRAL SOUTH SHARD4 SHARD5; do
-            result_file="$RESULT_DIR/plate-sync-result-${shard}.json"
-            if [ ! -f "$result_file" ]; then
-              echo "::error::Missing primary outcome artifact for $shard."
-              hard_failure=true
-              continue
-            fi
-
-            artifact_shard=$(jq -r '.shard // ""' "$result_file")
-            status=$(jq -r '.status // ""' "$result_file")
-            if [ "$artifact_shard" != "$shard" ]; then
-              echo "::error::Outcome artifact identity mismatch: expected $shard, got $artifact_shard."
-              hard_failure=true
-              continue
-            fi
-            case "$status" in
-              SUCCESS)
-                echo "$shard completed during the primary runner."
-                ;;
-              RETRY)
-                echo "::warning::$shard requested a fresh-runner recovery."
-                retry_shards+=("$shard")
-                ;;
-              HARD_FAILURE)
-                echo "::error::$shard reported a non-retryable crawler failure."
-                hard_failure=true
-                ;;
-              *)
-                echo "::error::$shard produced an invalid outcome: $status"
-                hard_failure=true
-                ;;
-            esac
-          done
-
-          retry_matrix=$(printf '%s\n' "${retry_shards[@]}" | jq -Rsc --argjson slot 90 '
-            split("\n") | map(select(length > 0)) as $shards
-            | {include: ($shards | to_entries | map({
-                shard: .value,
-                initial_delay_seconds: (.key * $slot),
-                retry_cooldown_seconds: (($shards | length) * $slot)
-              }))}
-          ')
-          if [ "${#retry_shards[@]}" -gt 0 ]; then
-            has_retries=true
-          else
-            has_retries=false
-          fi
-
-          echo "retry_matrix=$retry_matrix" >> "$GITHUB_OUTPUT"
-          echo "has_retries=$has_retries" >> "$GITHUB_OUTPUT"
-          echo "hard_failure=$hard_failure" >> "$GITHUB_OUTPUT"
-          echo "primary_result=$PRIMARY_RESULT" >> "$GITHUB_OUTPUT"
-
-  recovery-sync:
-    name: recovery-attempt (${{ matrix.shard }})
-    needs: collect-results
-    if: needs.collect-results.outputs.hard_failure == 'false' && needs.collect-results.outputs.has_retries == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.collect-results.outputs.retry_matrix) }}
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup fresh recovery runner
-        uses: ./.github/actions/setup-plate-runner
-        timeout-minutes: 15
-        with:
-          shards: ${{ matrix.shard }}
-          supabase-url: ${{ secrets.VITE_SUPABASE_URL }}
-          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
-          gemini-api-key-north: ${{ secrets.GEMINI_API_KEY_NORTH }}
-          gemini-api-key-central: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
-          gemini-api-key-south: ${{ secrets.GEMINI_API_KEY_SOUTH }}
-          gemini-api-key-shard4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
-          gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
-
-      - name: Retry Crawler Shard ${{ matrix.shard }} on fresh runner
-        run: bash scripts/run-plate-shard-with-recovery.sh "${{ matrix.shard }}" fresh
-        env:
-          INITIAL_DELAY_SECONDS: ${{ matrix.initial_delay_seconds }}
-          RETRY_COOLDOWN_SECONDS: ${{ matrix.retry_cooldown_seconds }}
-          MAX_PREFLIGHT_ATTEMPTS: '3'
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEY_NORTH: ${{ secrets.GEMINI_API_KEY_NORTH }}
-          GEMINI_API_KEY_CENTRAL: ${{ secrets.GEMINI_API_KEY_CENTRAL }}
-          GEMINI_API_KEY_SOUTH: ${{ secrets.GEMINI_API_KEY_SOUTH }}
-          GEMINI_API_KEY_SHARD4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
-          GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
-          NODE_OPTIONS: '--dns-result-order=ipv4first'
+    uses: ./.github/workflows/plate-shard-lane.yml
+    with:
+      shard: ${{ matrix.shard }}
+    secrets: inherit
 
   recovery-gate:
     name: verify-all-shards-complete
-    needs: [collect-results, recovery-sync]
+    needs: shard-lane
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -250,25 +33,13 @@ jobs:
       - name: Enforce complete shard coverage
         shell: bash
         env:
-          COLLECT_RESULT: ${{ needs.collect-results.result }}
-          PRIMARY_RESULT: ${{ needs.collect-results.outputs.primary_result }}
-          HARD_FAILURE: ${{ needs.collect-results.outputs.hard_failure }}
-          HAS_RETRIES: ${{ needs.collect-results.outputs.has_retries }}
-          RECOVERY_RESULT: ${{ needs.recovery-sync.result }}
+          SHARD_LANES_RESULT: ${{ needs.shard-lane.result }}
         run: |
-          if [ "$COLLECT_RESULT" != "success" ]; then
-            echo "::error::Unable to classify all primary shard outcomes."
+          if [ "$SHARD_LANES_RESULT" != "success" ]; then
+            echo "::error::At least one shard lane failed primary and bounded fresh-runner recovery."
             exit 1
           fi
-          if [ "$PRIMARY_RESULT" != "success" ] || [ "$HARD_FAILURE" = "true" ]; then
-            echo "::error::At least one primary shard had a non-retryable or infrastructure failure."
-            exit 1
-          fi
-          if [ "$HAS_RETRIES" = "true" ] && [ "$RECOVERY_RESULT" != "success" ]; then
-            echo "::error::At least one fresh-runner shard recovery failed."
-            exit 1
-          fi
-          echo "All five shards completed either on the primary runner or an approved fresh-runner recovery."
+          echo "All five shard lanes completed within the bounded workflow window."
 
   finalize-sync:
     name: finalize-atomic-swap

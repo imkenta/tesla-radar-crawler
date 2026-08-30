@@ -44,7 +44,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.warp-apt-cache
-        key: warp-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/plate-sync.yml') }}-${{ hashFiles('.github/actions/setup-plate-runner/action.yml') }}
+        key: warp-apt-${{ runner.os }}-${{ hashFiles('.github/workflows/plate-sync.yml', '.github/workflows/plate-shard-lane.yml') }}-${{ hashFiles('.github/actions/setup-plate-runner/action.yml') }}
         restore-keys: |
           warp-apt-${{ runner.os }}-
 
