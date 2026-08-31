@@ -332,3 +332,15 @@ test('crawler 將 MVDIS preflight 分類為暫時性 exit 75，正常路徑最�
     assert.match(source, /process\.env\.SKIP_SHARD_JITTER !== '1'/);
     assert.doesNotMatch(source, /Fix: set PROXY_URL secret/);
 });
+
+test('crawler 將連環驗證碼被拒分類為出口 IP 軟封鎖，丟 exit 75 交回 workflow 重抽身分', () => {
+    const source = fs.readFileSync(crawlerPath, 'utf8');
+
+    // 門檻常數存在且為跨站累計、成功歸零的語義
+    assert.match(source, /CAPTCHA_REJECT_BAILOUT_THRESHOLD\s*=\s*4/);
+    assert.match(source, /consecutiveCaptchaRejects\s*=\s*0/);
+    // bail 錯誤必須帶 MVDIS_PREFLIGHT_EXIT_CODE 才會被 wrapper 視為可重抽
+    assert.match(source, /bailErr\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
+    // 站點層 catch 必須把 exit 75 類錯誤往上拋，不得吞掉降級成「跳過本站」
+    assert.match(source, /stationErr\.exitCode\s*===\s*MVDIS_PREFLIGHT_EXIT_CODE/);
+});

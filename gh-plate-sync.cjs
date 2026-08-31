@@ -111,6 +111,15 @@ const MVDIS_PREFLIGHT_EXIT_CODE = 75; // EX_TEMPFAIL：workflow 只補跑此類�
 // 3-15 秒，25 秒硬逾時只切病態長尾；逾時視同 5xx 計入風暴偵測。
 const AI_CALL_TIMEOUT_MS = 25000;
 
+// 2026-08-31：MVDIS 對個別出口 IP 的「軟封鎖/降級」——preflight GET 正常、提交
+// 卻連環回「驗證碼錯誤」（00:43 CENTRAL 一顆 IP 8 連拒、01:03 NORTH 5 連拒，
+// 同時段其他 shard 全數通過＝按 IP 降級，台北週一早尖峰）。健康拒絕率 <5%，
+// 連續 4 拒的自然發生率 <1e-5，視為 IP 層問題而非 OCR 運氣：丟 exit 75 讓
+// wrapper 重抽 WARP 身分（新 IP＋新 session）重來，別在被降級的 IP 上磨光
+// lane 預算。任一次提交成功即歸零（跨站累計）。
+const CAPTCHA_REJECT_BAILOUT_THRESHOLD = 4;
+let consecutiveCaptchaRejects = 0;
+
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
     process.exit(1);
@@ -891,6 +900,7 @@ async function processStation(page, deptId, station) {
             await sleep(1000);
 
             let alertMsg = null;
+            let captchaRejected = false;
             const dialogHandler = async d => { alertMsg = d.message(); await d.dismiss(); };
             page.on('dialog', dialogHandler);
             
@@ -925,7 +935,8 @@ async function processStation(page, deptId, station) {
 
                 if (alertMsg || pageInfo.isError) {
                     console.log(`    [Fail] Captcha Error detected.`);
-                    break; 
+                    captchaRejected = true;
+                    break;
                 }
                 if (pageInfo.isResult || pageInfo.isNoData) {
                     console.log(`    [Success] Results rendered (IsResult: ${pageInfo.isResult}, NoData: ${pageInfo.isNoData})`);
@@ -936,6 +947,20 @@ async function processStation(page, deptId, station) {
             }
 
             page.off('dialog', dialogHandler);
+
+            // 軟封鎖偵測：成功提交歸零；連續被拒達門檻＝IP 層問題，丟回 workflow
+            // 重抽 WARP 身分，別把 lane 預算磨在被降級的出口 IP 上。
+            if (success) {
+                consecutiveCaptchaRejects = 0;
+            } else if (captchaRejected) {
+                consecutiveCaptchaRejects++;
+                if (consecutiveCaptchaRejects >= CAPTCHA_REJECT_BAILOUT_THRESHOLD) {
+                    const bailErr = new Error(`連續 ${consecutiveCaptchaRejects} 次驗證碼提交被拒（跨站累計）：疑似本出口 IP 遭 MVDIS 軟封鎖/降級，交回 workflow 重抽 WARP 身分。`);
+                    bailErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+                    throw bailErr;
+                }
+            }
+
             if (!success) console.log('\n    [Wait] No confirmed state found, retrying...');
         }
 
@@ -1122,6 +1147,12 @@ async function processStation(page, deptId, station) {
                 try {
                     await processStation(page, deptId, station);
                 } catch (stationErr) {
+                    if (stationErr.exitCode === MVDIS_PREFLIGHT_EXIT_CODE) {
+                        // 軟封鎖 bail：整個出口 IP 已不可信，跳站沒有意義，
+                        // 上拋讓 main catch 帶 exit 75 收場 → wrapper 重抽身分。
+                        console.error(`    [Bailout] ${stationErr.message}`);
+                        throw stationErr;
+                    }
                     if (isUnsupportedLocationError(stationErr) || aiManager.ladder.isCurrentComboDead()) {
                         console.error(`    [AI] 不可在本 runner 內恢復，立即中止 shard：${stationErr.message}`);
                         throw stationErr;
