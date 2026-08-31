@@ -6,6 +6,8 @@ readonly MVDIS_PREFLIGHT_EXIT_CODE=75
 readonly SHARD="${1:-}"
 readonly MODE="${2:-primary}"
 readonly RESULT_PATH="${RESULT_PATH:-${RUNNER_TEMP:-/tmp}/plate-sync-result-${SHARD}.json}"
+# 同 run 站點續爬記錄：同一 runner 上跨 crawler process 存活，換 runner 自然歸零。
+readonly COMPLETED_STATIONS_FILE="${COMPLETED_STATIONS_FILE:-${RUNNER_TEMP:-/tmp}/plate-completed-stations-${SHARD}.json}"
 readonly INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-0}"
 readonly RETRY_COOLDOWN_SECONDS="${RETRY_COOLDOWN_SECONDS:-15}"
 readonly MAX_PREFLIGHT_ATTEMPTS="${MAX_PREFLIGHT_ATTEMPTS:-2}"
@@ -62,7 +64,8 @@ run_crawler() {
     fi
 
     echo "Shard $SHARD has ${remaining_seconds}s remaining in its end-to-end lane budget."
-    SKIP_SHARD_JITTER="$skip_jitter" timeout --signal=TERM --kill-after=15s \
+    SKIP_SHARD_JITTER="$skip_jitter" COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+      timeout --signal=TERM --kill-after=15s \
       "${remaining_seconds}s" node gh-plate-sync.cjs "--shard=$SHARD"
     exit_code=$?
     if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ] || [ "$exit_code" -eq 143 ]; then
@@ -70,7 +73,8 @@ run_crawler() {
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi
   else
-    SKIP_SHARD_JITTER="$skip_jitter" node gh-plate-sync.cjs "--shard=$SHARD"
+    SKIP_SHARD_JITTER="$skip_jitter" COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+      node gh-plate-sync.cjs "--shard=$SHARD"
     exit_code=$?
   fi
 

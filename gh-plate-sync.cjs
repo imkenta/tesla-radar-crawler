@@ -120,6 +120,30 @@ const AI_CALL_TIMEOUT_MS = 25000;
 const CAPTCHA_REJECT_BAILOUT_THRESHOLD = 4;
 let consecutiveCaptchaRejects = 0;
 
+// 2026-08-31：同 run 站點續爬。尖峰期常要抽多張 IP 樂透票才中，但每張新票都
+// 從頭爬整個 shard，預算不夠分。成功完成的站寫進 COMPLETED_STATIONS_FILE
+// （同一 runner 上跨 process 存活，跨 job 不共享＝跨 run 自然歸零），下一張票
+// 直接跳過：該站 staging 資料仍在（staging delete 只發生在真正重爬該站時），
+// swap 的站數守門不受影響。僅 shard 模式啟用。
+function loadCompletedStations(filePath) {
+    if (!filePath) return new Set();
+    try {
+        return new Set(JSON.parse(fs.readFileSync(filePath, 'utf8')).map(String));
+    } catch {
+        return new Set();
+    }
+}
+
+function recordCompletedStation(filePath, completedSet, stationId) {
+    if (!filePath) return;
+    completedSet.add(String(stationId));
+    try {
+        fs.writeFileSync(filePath, JSON.stringify([...completedSet]));
+    } catch (e) {
+        console.log(`[Resume] 無法寫入續爬記錄（${e.message}），不影響本輪。`);
+    }
+}
+
 if (!SUPABASE_URL || !SUPABASE_KEY || !GEMINI_API_KEY) {
     console.error("Missing required env vars.");
     process.exit(1);
@@ -135,6 +159,10 @@ const MVDIS_HOME_URL = 'https://www.mvdis.gov.tw/';
 const args = process.argv.slice(2);
 const shardArg = args.find(arg => arg.startsWith('--shard='));
 const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
+
+// 同 run 站點續爬（見 loadCompletedStations 註解）；wrapper 會傳入檔案路徑。
+const COMPLETED_STATIONS_FILE = (TARGET_SHARD && process.env.COMPLETED_STATIONS_FILE) || null;
+const completedStations = loadCompletedStations(COMPLETED_STATIONS_FILE);
 
 // --- AI Manager (Failover Support) ---
 //
@@ -1033,8 +1061,12 @@ async function processStation(page, deptId, station) {
     }
     const duration = ((Date.now() - startTime) / 1000);
     console.log(`⏱️  Station ${station.name} finished in ${duration.toFixed(2)}s`);
-    if (status !== 'FAILED') stats.stationsSuccess++;
-    else stats.stationsFailed++;
+    if (status !== 'FAILED') {
+        stats.stationsSuccess++;
+        recordCompletedStation(COMPLETED_STATIONS_FILE, completedStations, station.id);
+    } else {
+        stats.stationsFailed++;
+    }
     stats.addStationStat({ id: station.id, name: station.name, region: getRegion(station.id), duration_sec: duration, plates_found: platesFound, retries: retries, status: status });
 }
 
@@ -1152,6 +1184,11 @@ async function processStation(page, deptId, station) {
             console.log(`\n=== Dept ${deptId} (${stations.length} stations) ===`);
 
             for (const station of stations) {
+                if (completedStations.has(String(station.id))) {
+                    console.log(`⏭️  [Resume] ${station.name} 本輪稍早已完成（staging 資料仍在），跳過。`);
+                    stats.stationsSuccess++;
+                    continue;
+                }
                 const stationAttemptStart = Date.now();
                 try {
                     await processStation(page, deptId, station);

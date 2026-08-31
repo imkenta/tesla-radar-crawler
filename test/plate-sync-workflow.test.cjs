@@ -71,7 +71,7 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     const recoveryCrawl = getLaneStep('recovery', 'Retry crawler on fresh runner within lane budget');
     assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*fresh/);
     assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '15');
-    assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '3');
+    assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '5');
     assert.match(recoveryCrawl.env.DEADLINE_EPOCH, /needs\.primary\.outputs\.deadline_epoch/);
     assert.deepEqual(gate.needs, ['primary', 'recovery']);
     assert.equal(gate.if, 'always()');
@@ -349,4 +349,17 @@ test('crawler 將連環驗證碼被拒分類為出口 IP 軟封鎖，丟 exit 75
     // 跳站→單站失敗→HARD_FAILURE 的死刑路徑
     assert.match(source, /navAbortErr\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
     assert.doesNotMatch(source, /All navigation attempts failed, skipping station/);
+});
+
+test('crawler 支援同 run 站點續爬：完成站記錄檔＋跳站，wrapper 傳入檔案路徑', () => {
+    const source = fs.readFileSync(crawlerPath, 'utf8');
+    const wrapper = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'run-plate-shard-with-recovery.sh'), 'utf8');
+
+    // 只在 shard 模式啟用；成功站寫檔、重啟時跳過
+    assert.match(source, /TARGET_SHARD && process\.env\.COMPLETED_STATIONS_FILE/);
+    assert.match(source, /recordCompletedStation\(COMPLETED_STATIONS_FILE, completedStations, station\.id\)/);
+    assert.match(source, /completedStations\.has\(String\(station\.id\)\)/);
+    // wrapper 對兩種 node 呼叫（有/無 deadline）都要傳入同一份記錄檔
+    const passCount = (wrapper.match(/COMPLETED_STATIONS_FILE="\$COMPLETED_STATIONS_FILE"/g) || []).length;
+    assert.equal(passCount, 2);
 });
