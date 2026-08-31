@@ -32,7 +32,7 @@ jobs:
   primary:
     name: primary-attempt (${{ inputs.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 19
+    timeout-minutes: 20
     outputs:
       status: ${{ steps.crawl.outputs.status }}
       deadline_epoch: ${{ steps.budget.outputs.deadline_epoch }}
@@ -40,10 +40,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Start 18-minute shard lane budget
+      # 2026-08-31：1080→1140。lane 結束後只剩 verify(~15s)+finalize(~60s)，1140s
+      # 預算下 workflow 最晚 ~T+20.4 收工；下一班 dispatch 最多排隊 ~30s（僅在
+      # lane 用滿預算時發生，綠燈輪 T+13 就收），無連環取消風險——取消雪崩需要
+      # 單輪 >>20 分鐘（8/30 事故是 38-52 分鐘）。多出的 60s 專救尖峰期差
+      # 2-3 分鐘完賽的輪（8/31 NORTH 兩度如此）。
+      - name: Start 19-minute shard lane budget
         id: budget
         shell: bash
-        run: echo "deadline_epoch=$(( $(date +%s) + 1080 ))" >> "$GITHUB_OUTPUT"
+        run: echo "deadline_epoch=$(( $(date +%s) + 1140 ))" >> "$GITHUB_OUTPUT"
 
       - name: Setup primary crawler runner
         uses: ./.github/actions/setup-plate-runner
@@ -115,20 +120,23 @@ jobs:
     needs: primary
     if: needs.primary.outputs.status == 'RETRY'
     runs-on: ubuntu-latest
-    timeout-minutes: 16
+    timeout-minutes: 17
     outputs:
       status: ${{ steps.crawl.outputs.status }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 2026-08-31：600→480。recovery setup 實測 ~75-90s，480s 起跑仍有 ~390s
+      # 爬行時間，小 shard（CENTRAL/SHARD4 清爬 250-350s）救得回來；deadline
+      # 本身已硬性擋住越班，拒收門檻只需擋「連 setup 都不值得」的情況。
       - name: Require enough lane budget for recovery
         shell: bash
         env:
           DEADLINE_EPOCH: ${{ needs.primary.outputs.deadline_epoch }}
         run: |
           remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
-          if [ "$remaining_seconds" -lt 600 ]; then
+          if [ "$remaining_seconds" -lt 480 ]; then
             echo "::error::Only ${remaining_seconds}s remain; refusing to start a recovery that would delay the next 20-minute schedule."
             exit 1
           fi

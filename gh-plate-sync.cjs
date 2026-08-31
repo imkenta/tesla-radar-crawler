@@ -823,7 +823,9 @@ async function processStation(page, deptId, station) {
                 let navOk = false;
                 for (let navTry = 0; navTry < 3; navTry++) {
                     try {
-                        await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                        // 2026-08-31：90s→45s。尖峰期 MVDIS 若 45 秒內沒回就不會回了
+                        // （實測失敗導航都撞 protocolTimeout 60s 上限），早失敗早重試。
+                        await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
                         navOk = true;
                         break;
                     } catch (navErr) {
@@ -873,10 +875,13 @@ async function processStation(page, deptId, station) {
                 await sleep(1000);
             }
 
-            // 2. 驗證碼辨識
+            // 2. 驗證碼辨識（90s 牆鐘上限：5xx 風暴下單次 solve 最壞 ~57s，
+            // 5 次迴圈可鏈到 4-5 分鐘；超時就放棄本 attempt 走 Full Nav 重來，
+            // 也避免頁面 session 在乾等中過期）
             let code = null;
             let captchaAttempts = 0;
-            while (!code && captchaAttempts < 5) {
+            const solveDeadline = Date.now() + 90000;
+            while (!code && captchaAttempts < 5 && Date.now() < solveDeadline) {
                 captchaAttempts++;
                 await page.evaluate(() => {
                     const btn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');

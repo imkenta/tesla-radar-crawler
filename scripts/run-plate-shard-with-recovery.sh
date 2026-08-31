@@ -10,9 +10,9 @@ readonly INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-0}"
 readonly RETRY_COOLDOWN_SECONDS="${RETRY_COOLDOWN_SECONDS:-15}"
 readonly MAX_PREFLIGHT_ATTEMPTS="${MAX_PREFLIGHT_ATTEMPTS:-2}"
 readonly DEADLINE_EPOCH="${DEADLINE_EPOCH:-0}"
-# primary 原地重抽 WARP 身分的預算門檻：600s（recovery gate 下限）＋重抽與一次
+# primary 原地重抽 WARP 身分的預算門檻：480s（recovery gate 下限）＋重抽與一次
 # preflight 失敗的最壞耗時（~180s）＋餘裕（60s）。低於此值直接交棒，不賭。
-readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-840}"
+readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-720}"
 
 if [ -z "$SHARD" ]; then
   echo "::error::Missing shard argument."

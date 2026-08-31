@@ -46,16 +46,16 @@ test('每個 shard 使用獨立 recovery lane，不再等待全部 primary 完�
     assert.equal(lane.strategy['fail-fast'], false);
 });
 
-test('shard lane 共用 18 分鐘 deadline，recovery 直接依賴自己的 primary', () => {
+test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 primary', () => {
     const primary = laneWorkflow.jobs.primary;
     const recovery = laneWorkflow.jobs.recovery;
     const gate = laneWorkflow.jobs['lane-gate'];
 
     assert.equal(primary.name, 'primary-attempt (${{ inputs.shard }})');
-    assert.equal(primary['timeout-minutes'], 19);
+    assert.equal(primary['timeout-minutes'], 20);
     assert.match(primary.outputs.deadline_epoch, /steps\.budget\.outputs\.deadline_epoch/);
-    const budgetStep = getLaneStep('primary', 'Start 18-minute shard lane budget');
-    assert.match(budgetStep.run, /\+ 1080/);
+    const budgetStep = getLaneStep('primary', 'Start 19-minute shard lane budget');
+    assert.match(budgetStep.run, /\+ 1140/);
     assert.equal(getLaneStep('primary', 'Setup primary crawler runner')['timeout-minutes'], 10);
     const primaryCrawl = getLaneStep('primary', 'Run primary crawler once');
     assert.match(primaryCrawl.run, /run-plate-shard-with-recovery\.sh/);
@@ -64,7 +64,9 @@ test('shard lane 共用 18 分鐘 deadline，recovery 直接依賴自己的 prim
 
     assert.equal(recovery.needs, 'primary');
     assert.match(recovery.if, /needs\.primary\.outputs\.status == 'RETRY'/);
-    assert.equal(recovery['timeout-minutes'], 16);
+    assert.equal(recovery['timeout-minutes'], 17);
+    const gateStep = getLaneStep('recovery', 'Require enough lane budget for recovery');
+    assert.match(gateStep.run, /-lt 480/);
     assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 5);
     const recoveryCrawl = getLaneStep('recovery', 'Retry crawler on fresh runner within lane budget');
     assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*fresh/);

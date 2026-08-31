@@ -103,7 +103,7 @@ test('primary exit 75 且無 deadline 資訊 → 立即交給 fresh runner，不
 });
 
 test('primary exit 75 且預算充足 → 原地重抽 WARP 身分後再試一次，成功則 SUCCESS', () => {
-    const deadlineEpoch = Math.floor(Date.now() / 1000) + 1000; // 剩 1000s ≥ 840s 門檻
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 1000; // 剩 1000s ≥ 720s 門檻
     const scenario = runScenario([75, 0], { deadlineEpoch });
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
@@ -126,8 +126,8 @@ test('primary exit 75 且預算充足但重抽後 preflight 仍失敗 → 交出
     assert.equal(scenario.nodeCalls, 2);
 });
 
-test('primary exit 75 但預算不足 840s → 不重抽、立即交棒（守住 recovery gate 600s 門檻）', () => {
-    const deadlineEpoch = Math.floor(Date.now() / 1000) + 700; // 剩 ~700s < 840s
+test('primary exit 75 但預算不足 720s → 不重抽、立即交棒（守住 recovery gate 480s 門檻）', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 700; // 剩 ~700s < 720s
     const scenario = runScenario([75, 0], { deadlineEpoch });
     const output = `${scenario.result.stdout}${scenario.result.stderr}`;
 
