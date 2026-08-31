@@ -343,4 +343,8 @@ test('crawler 將連環驗證碼被拒分類為出口 IP 軟封鎖，丟 exit 75
     assert.match(source, /bailErr\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
     // 站點層 catch 必須把 exit 75 類錯誤往上拋，不得吞掉降級成「跳過本站」
     assert.match(source, /stationErr\.exitCode\s*===\s*MVDIS_PREFLIGHT_EXIT_CODE/);
+    // 站中導航連續逾時同樣屬可重抽類（2026-08-31 恆春案例），不得再走
+    // 跳站→單站失敗→HARD_FAILURE 的死刑路徑
+    assert.match(source, /navAbortErr\.exitCode\s*=\s*MVDIS_PREFLIGHT_EXIT_CODE/);
+    assert.doesNotMatch(source, /All navigation attempts failed, skipping station/);
 });

@@ -832,10 +832,14 @@ async function processStation(page, deptId, station) {
                     }
                 }
                 if (!navOk) {
-                    console.log('    [Nav] All navigation attempts failed, skipping station.');
-                    status = 'FAILED';
-                    stationAborted = true;
-                    break;
+                    // 2026-08-31 03:43 SHARD4 恆春實戰：站中導航 3 連逾時＝MVDIS 對本
+                    // 出口 IP 中途停止回應（動態限流）或 Chrome 卡死。原本跳站→單站
+                    // 失敗擋 swap→exit 1 HARD_FAILURE→lane 判死不給 recovery，但這與
+                    // preflight 失敗同類、換身分即可重試——改丟 exit 75 交回 workflow
+                    // 重抽 WARP 身分。
+                    const navAbortErr = new Error(`站中導航連續 3 次逾時（${station.name}）：MVDIS 對本出口停止回應，交回 workflow 重抽 WARP 身分。`);
+                    navAbortErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+                    throw navAbortErr;
                 }
                 await page.evaluate(() => {
                     if (typeof $ !== 'undefined' && $.unblockUI) $.unblockUI();
