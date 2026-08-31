@@ -70,8 +70,8 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 5);
     const recoveryCrawl = getLaneStep('recovery', 'Retry crawler on fresh runner within lane budget');
     assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*fresh/);
-    assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '15');
-    assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '5');
+    assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '8');
+    assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '6');
     assert.match(recoveryCrawl.env.DEADLINE_EPOCH, /needs\.primary\.outputs\.deadline_epoch/);
     assert.deepEqual(gate.needs, ['primary', 'recovery']);
     assert.equal(gate.if, 'always()');

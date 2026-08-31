@@ -36,8 +36,8 @@ for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PR
   fi
 done
 
-if [ "$MAX_PREFLIGHT_ATTEMPTS" -lt 1 ] || [ "$MAX_PREFLIGHT_ATTEMPTS" -gt 5 ]; then
-  echo "::error::MAX_PREFLIGHT_ATTEMPTS must be between 1 and 5."
+if [ "$MAX_PREFLIGHT_ATTEMPTS" -lt 1 ] || [ "$MAX_PREFLIGHT_ATTEMPTS" -gt 8 ]; then
+  echo "::error::MAX_PREFLIGHT_ATTEMPTS must be between 1 and 8."
   exit 2
 fi
 

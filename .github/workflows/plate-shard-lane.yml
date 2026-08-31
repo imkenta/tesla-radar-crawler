@@ -163,10 +163,12 @@ jobs:
           RESULT_PATH: ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
           DEADLINE_EPOCH: ${{ needs.primary.outputs.deadline_epoch }}
           INITIAL_DELAY_SECONDS: '0'
-          RETRY_COOLDOWN_SECONDS: '15'
-          # 2026-08-31：3→5。06:23 SHARD5 三張票用完時預算還剩 510s——次數限制
-          # 不該先於預算耗盡；deadline 與 wait_before_retry 已硬性框住總時長。
-          MAX_PREFLIGHT_ATTEMPTS: '5'
+          # 2026-08-31：冷卻 15→8s。重抽本身要 15-20s，兩者疊加的實際間隔仍
+          # ~25s+；每張廢票省 7s。
+          RETRY_COOLDOWN_SECONDS: '8'
+          # 2026-08-31：3→5→6。次數限制不該先於預算耗盡；deadline 與
+          # wait_before_retry 已硬性框住總時長，08:23 SHARD5 五票用盡差一張。
+          MAX_PREFLIGHT_ATTEMPTS: '6'
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

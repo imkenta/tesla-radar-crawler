@@ -797,7 +797,9 @@ async function preflightCheck(page) {
     // here would keep using the same poisoned browser network stack.
     console.log('🔍 Pre-flight [2/2]: Testing MVDIS connectivity...');
     try {
-        const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // 2026-08-31：30s→20s。成功 preflight 實測 2-13s 內回，20s 沒回就是
+        // 被擋；每張廢票省 10s 偵測時間。
+        const response = await page.goto(MVDIS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
         if (response) {
             const status = response.status();
             if (status >= 200 && status < 400) {
