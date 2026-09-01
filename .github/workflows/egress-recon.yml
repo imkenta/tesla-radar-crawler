@@ -1,0 +1,67 @@
+name: Egress Recon (manual)
+
+# 2026-09-01 出口偵察：只在手動觸發時執行，零 DB 寫入、零 staging 變更、
+# 不參與 plate-sync 的任何 gate。目的是回答「WARP 以外有沒有乾淨出口」。
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    name: raw-runner-egress
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Raw runner egress facts (no WARP installed in this job)
+        shell: bash
+        run: |
+          echo "=== 本 runner 原生出口（未安裝 WARP）==="
+          IPV4=$(curl -4 -fsS --max-time 15 https://api.ipify.org || echo UNKNOWN)
+          echo "RUNNER_IPV4=$IPV4"
+          curl -fsS --max-time 15 "https://ipinfo.io/${IPV4}/json" 2>/dev/null \
+            | tr -d '\n' | sed 's/^/RUNNER_IPV4_INFO=/' || true
+          echo
+
+          echo "=== IPv6 能力（GitHub-hosted runner 官方未保證，實測為準）==="
+          IPV6=$(curl -6 -fsS --max-time 10 https://api6.ipify.org 2>/dev/null || echo NONE)
+          echo "RUNNER_IPV6=$IPV6"
+
+      - name: curl probe to MVDIS over IPv4 and IPv6
+        shell: bash
+        run: |
+          echo "=== curl IPv4 → MVDIS ==="
+          set +e
+          curl -4 -sS -o /dev/null --connect-timeout 10 --max-time 30 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "Accept-Language: zh-TW,zh;q=0.9" \
+            -w "CURL_IPV4=HTTP_%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s total=%{time_total}s\n" \
+            "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo"
+          echo "CURL_IPV4_EXIT=$?"
+
+          echo "=== curl IPv6 → MVDIS（MVDIS AAAA = 2001:4420:6709:0:10:0:9:21）==="
+          curl -6 -sS -o /dev/null --connect-timeout 10 --max-time 30 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "Accept-Language: zh-TW,zh;q=0.9" \
+            -w "CURL_IPV6=HTTP_%{http_code} remote_ip=%{remote_ip} connect=%{time_connect}s total=%{time_total}s\n" \
+            "https://www.mvdis.gov.tw/m3-emv-plate/webpickno/queryPickNo"
+          echo "CURL_IPV6_EXIT=$?"
+          set -e
+
+      - name: Chromium probe to MVDIS (authoritative)
+        shell: bash
+        run: node scripts/egress-recon.cjs
+        env:
+          NODE_OPTIONS: '--dns-result-order=ipv4first'
