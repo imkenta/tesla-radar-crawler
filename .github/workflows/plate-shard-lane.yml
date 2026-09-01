@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   primary:
@@ -80,6 +81,17 @@ jobs:
           GEMINI_API_KEY_SHARD5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
           NODE_OPTIONS: '--dns-result-order=ipv4first'
 
+      # 熱備援與 primary 平行啟動、拿不到 needs outputs；result artifact（含
+      # status 與 deadline_epoch）是它取得 primary 結局與 lane 預算的唯一管道。
+      - name: Publish primary outcome for the hot spare
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plate-sync-result-${{ inputs.shard }}
+          path: ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
+          retention-days: 1
+          overwrite: true
+
       - name: Summarize primary crawler outcome
         if: always()
         shell: bash
@@ -115,32 +127,18 @@ jobs:
           echo "::error::${{ inputs.shard }} failed outside the retryable MVDIS preflight boundary."
           exit 1
 
+  # 2026-09-01 熱備援：與 primary 平行啟動（無 needs），setup＋暖身驗票先做完，
+  # 等 primary 的 result artifact——RETRY 就立刻接棒（省掉舊 recovery 2.5 分鐘
+  # setup 關鍵路徑），SUCCESS/HARD_FAILURE 就收工。swap 全有全無語義不動。
   recovery:
     name: recovery-attempt (${{ inputs.shard }})
-    needs: primary
-    if: needs.primary.outputs.status == 'RETRY'
     runs-on: ubuntu-latest
-    timeout-minutes: 17
+    timeout-minutes: 21
     outputs:
       status: ${{ steps.crawl.outputs.status }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      # 2026-08-31：600→480。recovery setup 實測 ~75-90s，480s 起跑仍有 ~390s
-      # 爬行時間，小 shard（CENTRAL/SHARD4 清爬 250-350s）救得回來；deadline
-      # 本身已硬性擋住越班，拒收門檻只需擋「連 setup 都不值得」的情況。
-      - name: Require enough lane budget for recovery
-        shell: bash
-        env:
-          DEADLINE_EPOCH: ${{ needs.primary.outputs.deadline_epoch }}
-        run: |
-          remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
-          if [ "$remaining_seconds" -lt 480 ]; then
-            echo "::error::Only ${remaining_seconds}s remain; refusing to start a recovery that would delay the next 20-minute schedule."
-            exit 1
-          fi
-          echo "Starting isolated recovery with ${remaining_seconds}s remaining in the shard lane budget."
 
       - name: Setup fresh recovery runner
         uses: ./.github/actions/setup-plate-runner
@@ -155,13 +153,13 @@ jobs:
           gemini-api-key-shard4: ${{ secrets.GEMINI_API_KEY_SHARD4 }}
           gemini-api-key-shard5: ${{ secrets.GEMINI_API_KEY_SHARD5 }}
 
-      - name: Retry crawler on fresh runner within lane budget
+      - name: Stand by warm and take over within lane budget
         id: crawl
         shell: bash
-        run: bash scripts/run-plate-shard-with-recovery.sh "${{ inputs.shard }}" fresh
+        run: bash scripts/run-plate-shard-with-recovery.sh "${{ inputs.shard }}" spare
         env:
-          RESULT_PATH: ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
-          DEADLINE_EPOCH: ${{ needs.primary.outputs.deadline_epoch }}
+          GH_TOKEN: ${{ github.token }}
+          RESULT_PATH: ${{ runner.temp }}/plate-sync-spare-result-${{ inputs.shard }}.json
           INITIAL_DELAY_SECONDS: '0'
           # 2026-08-31：冷卻 15→8s。重抽本身要 15-20s，兩者疊加的實際間隔仍
           # ~25s+；每張廢票省 7s。

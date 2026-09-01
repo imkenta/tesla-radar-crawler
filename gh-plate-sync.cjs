@@ -164,6 +164,11 @@ const TARGET_SHARD = shardArg ? shardArg.split('=')[1] : null;
 const COMPLETED_STATIONS_FILE = (TARGET_SHARD && process.env.COMPLETED_STATIONS_FILE) || null;
 const completedStations = loadCompletedStations(COMPLETED_STATIONS_FILE);
 
+// 2026-09-01 熱備援：--preflight-only＝只驗證「本 WARP 出口的 Chromium 能否到
+// MVDIS」，exit 0/75。⛔此模式絕不寫 DB（sync_metadata／服務狀態）——備援機的
+// 暖身探測若寫入，會覆蓋正牌 run 的狀態、污染 swap 守門判定。
+const PREFLIGHT_ONLY = args.includes('--preflight-only');
+
 // --- AI Manager (Failover Support) ---
 //
 // 狀態機純邏輯在 lib/ai-model-ladder.cjs 的 LadderState（可測）；此處只做 I/O（API 呼叫、
@@ -474,6 +479,8 @@ class SyncStats {
         console.log(`   - CAPTCHA: ${this.captchaSuccess}/${this.captchaAttempts} (${captchaRate}%)`);
         console.log(`   - Runtime: ${runtime.toFixed(2)}s`);
 
+        if (PREFLIGHT_ONLY) return; // 暖身探測不寫 sync_logs，避免灌噪音列
+
         const { error } = await supabase.from('sync_logs').upsert({
             run_id: this.runId,
             start_time: this.startTime.toISOString(),
@@ -652,6 +659,7 @@ async function clearStaging() {
 }
 
 async function reportStatus(status, message = null, key = 'plates_full_sync') {
+    if (PREFLIGHT_ONLY) return; // 暖身探測不得污染正牌 run 的 sync_metadata
     const { error } = await supabase
         .from('sync_metadata')
         .upsert({ // Changed to upsert to create key if missing
@@ -667,6 +675,7 @@ async function reportStatus(status, message = null, key = 'plates_full_sync') {
 // 三個 shard 並行皆會寫此 row：施工時內容相同（無衝突）；無施工時各 shard 都寫 NORMAL，
 // 施工結束後最多一輪（30 分鐘）即收斂為 NORMAL，前端橫幅自動消失。
 async function reportServiceStatus(isMaintenance, message = null) {
+    if (PREFLIGHT_ONLY) return; // 暖身探測不得動前端施工橫幅狀態
     const { error } = await supabase
         .from('sync_metadata')
         .upsert({
@@ -1095,7 +1104,7 @@ async function processStation(page, deptId, station) {
     }
     
     try {
-        await loadStationData();
+        if (!PREFLIGHT_ONLY) await loadStationData();
     } catch (err) {
         console.error('Fatal: Failed to initialize station data', err);
         process.exit(1);
@@ -1149,6 +1158,20 @@ async function processStation(page, deptId, station) {
 
         const syncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
         await reportStatus('RUNNING', null, syncKey);
+
+        // 熱備援暖身探測：只做 Chromium preflight，成功 exit 0、失敗走既有
+        // exit 75 路徑。跳過施工偵測與所有 DB 副作用（reportStatus/
+        // reportServiceStatus 內已各自短路）。
+        if (PREFLIGHT_ONLY) {
+            const ok = await preflightCheck(page);
+            if (!ok) {
+                const err = new Error('Preflight-only probe: MVDIS unreachable from this WARP exit.');
+                err.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+                throw err;
+            }
+            console.log('✅ Preflight-only probe passed: this WARP exit is a verified ticket.');
+            return; // finally 正常關瀏覽器；stats.status 非 FAILED → exit 0
+        }
 
         // 施工偵測（先於選號 preflight）：首頁不擋非台灣 IP，可在 WARP 異常時仍區分
         // 「官方施工」與「純 IP/WARP 連線問題」。偵測到施工→寫狀態給前端橫幅、正常結束（不噴 FAILED）。

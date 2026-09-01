@@ -11,7 +11,13 @@ readonly COMPLETED_STATIONS_FILE="${COMPLETED_STATIONS_FILE:-${RUNNER_TEMP:-/tmp
 readonly INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-0}"
 readonly RETRY_COOLDOWN_SECONDS="${RETRY_COOLDOWN_SECONDS:-15}"
 readonly MAX_PREFLIGHT_ATTEMPTS="${MAX_PREFLIGHT_ATTEMPTS:-2}"
-readonly DEADLINE_EPOCH="${DEADLINE_EPOCH:-0}"
+# spare 模式會在讀到 primary 的 result artifact 後以其 deadline 覆寫，故非 readonly。
+DEADLINE_EPOCH="${DEADLINE_EPOCH:-0}"
+# spare（熱備援）模式參數：輪詢間隔壓 API 用量（GITHUB_TOKEN 每 repo 每小時
+# 1000 次上限，5 lane × 每 20 分一輪要省著用）；暖身重抽上限見 run_spare。
+readonly SPARE_POLL_INTERVAL_SECONDS="${SPARE_POLL_INTERVAL_SECONDS:-20}"
+readonly SPARE_MAX_WAIT_SECONDS="${SPARE_MAX_WAIT_SECONDS:-1080}"
+readonly WARM_TICKET_MAX_TRIES="${WARM_TICKET_MAX_TRIES:-3}"
 # primary 原地重抽 WARP 身分的預算門檻：480s（recovery gate 下限）＋重抽與一次
 # preflight 失敗的最壞耗時（~180s）＋餘裕（60s）。低於此值直接交棒，不賭。
 readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-720}"
@@ -22,14 +28,14 @@ if [ -z "$SHARD" ]; then
 fi
 
 case "$MODE" in
-  primary|fresh) ;;
+  primary|fresh|spare) ;;
   *)
     echo "::error::Unknown recovery mode: $MODE"
     exit 2
     ;;
 esac
 
-for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS"; do
+for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES"; do
   if ! [[ "$numeric_value" =~ ^[0-9]+$ ]]; then
     echo "::error::Recovery timing values must be non-negative integers."
     exit 2
@@ -45,7 +51,10 @@ write_outcome() {
   local status="$1"
 
   mkdir -p "$(dirname "$RESULT_PATH")"
-  printf '{"shard":"%s","status":"%s"}\n' "$SHARD" "$status" > "$RESULT_PATH"
+  # deadline_epoch 一併寫入：primary 的 result artifact 是熱備援 runner 取得
+  # lane 共同預算的唯一管道（spare 與 primary 平行啟動，拿不到 needs outputs）。
+  printf '{"shard":"%s","status":"%s","deadline_epoch":%s}\n' \
+    "$SHARD" "$status" "${DEADLINE_EPOCH:-0}" > "$RESULT_PATH"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
   fi
@@ -267,8 +276,111 @@ run_fresh() {
   done
 }
 
+# 熱備援（2026-09-01）：與 primary 平行啟動，setup 完先暖身驗票，等 primary
+# 的 result artifact 出現後接棒——省掉舊 recovery 路徑上 2.5 分鐘的 setup
+# 關鍵路徑（昨天多場敗局差距正是 2-3 分鐘）。swap 全有全無語義完全不動。
+run_spare() {
+  local warm_try
+  local waited=0
+  local artifact_id=""
+  local primary_conclusion=""
+  local result_json=""
+  local primary_status=""
+  local primary_deadline=""
+
+  # 1) 暖身：先確保手上是一張經 Chromium 驗證的好票（等待期先把樂透抽完）。
+  for ((warm_try = 1; warm_try <= WARM_TICKET_MAX_TRIES; warm_try++)); do
+    if SKIP_SHARD_JITTER=1 COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+      node gh-plate-sync.cjs "--shard=$SHARD" --preflight-only; then
+      echo "Spare holds a verified MVDIS ticket (warm attempt $warm_try/$WARM_TICKET_MAX_TRIES)."
+      break
+    fi
+    if [ "$warm_try" -lt "$WARM_TICKET_MAX_TRIES" ]; then
+      reroll_warp_identity || true
+    else
+      echo "::warning::Spare could not verify a ticket after $WARM_TICKET_MAX_TRIES rolls; standing by anyway (crawl path re-rolls on its own)."
+    fi
+  done
+
+  # 2) 等 primary 的 result artifact（或 primary 沒留下 artifact 就終局）。
+  while [ "$waited" -lt "$SPARE_MAX_WAIT_SECONDS" ]; do
+    artifact_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+      --jq '[.artifacts[] | select(.name == "plate-sync-result-'"$SHARD"'")][0].id // ""' 2>/dev/null || true)
+    if [ -n "$artifact_id" ]; then
+      break
+    fi
+    primary_conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+      --jq '[.jobs[] | select(.name | endswith("primary-attempt ('"$SHARD"')"))][0].conclusion // ""' 2>/dev/null || true)
+    if [ -n "$primary_conclusion" ]; then
+      echo "Primary finished ($primary_conclusion) without publishing a result artifact; spare standing down."
+      write_outcome SPARE_IDLE
+      return 0
+    fi
+    sleep "$SPARE_POLL_INTERVAL_SECONDS"
+    waited=$((waited + SPARE_POLL_INTERVAL_SECONDS))
+  done
+
+  if [ -z "$artifact_id" ]; then
+    echo "::warning::Spare wait timed out without seeing a primary result; standing down."
+    write_outcome SPARE_IDLE
+    return 0
+  fi
+
+  # 3) 讀 primary outcome（artifact 是 zip；unzip -p 直接吐 JSON）。
+  local artifact_zip="${RUNNER_TEMP:-/tmp}/plate-sync-result-${SHARD}.zip"
+  if ! gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$artifact_zip"; then
+    echo "::error::Spare failed to download the primary result artifact."
+    write_outcome SPARE_IDLE
+    return 0
+  fi
+  result_json=$(unzip -p "$artifact_zip" 2>/dev/null || true)
+  primary_status=$(sed -nE 's/.*"status":"([A-Z_]+)".*/\1/p' <<< "$result_json")
+  primary_deadline=$(sed -nE 's/.*"deadline_epoch":([0-9]+).*/\1/p' <<< "$result_json")
+
+  case "$primary_status" in
+    SUCCESS)
+      echo "Primary completed $SHARD on its own; spare standing down."
+      write_outcome SPARE_IDLE
+      return 0
+      ;;
+    HARD_FAILURE)
+      echo "Primary hit a non-retryable failure; spare must not mask it. Standing down."
+      write_outcome SPARE_IDLE
+      return 0
+      ;;
+    RETRY)
+      ;;
+    *)
+      echo "::warning::Unrecognized primary status '${primary_status:-EMPTY}'; spare standing down."
+      write_outcome SPARE_IDLE
+      return 0
+      ;;
+  esac
+
+  # 4) 接棒：以 primary 的 lane 預算為準，沿用既有 fresh 重試迴圈（含重抽）。
+  if [ -n "$primary_deadline" ] && [ "$primary_deadline" -gt 0 ]; then
+    DEADLINE_EPOCH="$primary_deadline"
+  fi
+  if [ "$DEADLINE_EPOCH" -gt 0 ]; then
+    local remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
+    if [ "$remaining_seconds" -lt 240 ]; then
+      echo "::error::Only ${remaining_seconds}s remain when the spare takes over; refusing a hopeless crawl."
+      write_outcome RETRY
+      return "$MVDIS_PREFLIGHT_EXIT_CODE"
+    fi
+    echo "Spare taking over shard $SHARD with ${remaining_seconds}s remaining in the lane budget."
+  fi
+  run_fresh
+  return $?
+}
+
 if [ "$MODE" = "fresh" ]; then
   run_fresh
+  exit $?
+fi
+
+if [ "$MODE" = "spare" ]; then
+  run_spare
   exit $?
 fi
 

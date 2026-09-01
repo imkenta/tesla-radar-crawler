@@ -62,17 +62,23 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.doesNotMatch(primaryCrawl.run, /fresh/);
     assert.match(primaryCrawl.env.DEADLINE_EPOCH, /steps\.budget\.outputs\.deadline_epoch/);
 
-    assert.equal(recovery.needs, 'primary');
-    assert.match(recovery.if, /needs\.primary\.outputs\.status == 'RETRY'/);
-    assert.equal(recovery['timeout-minutes'], 17);
-    const gateStep = getLaneStep('recovery', 'Require enough lane budget for recovery');
-    assert.match(gateStep.run, /-lt 480/);
+    // 2026-09-01 熱備援：recovery 與 primary 平行啟動（無 needs/if），deadline
+    // 與 primary 結局改由 result artifact 傳遞。
+    assert.equal(recovery.needs, undefined);
+    assert.equal(recovery.if, undefined);
+    assert.equal(recovery['timeout-minutes'], 21);
     assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 5);
-    const recoveryCrawl = getLaneStep('recovery', 'Retry crawler on fresh runner within lane budget');
-    assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*fresh/);
+    const recoveryCrawl = getLaneStep('recovery', 'Stand by warm and take over within lane budget');
+    assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*spare/);
     assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '8');
     assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '6');
-    assert.match(recoveryCrawl.env.DEADLINE_EPOCH, /needs\.primary\.outputs\.deadline_epoch/);
+    assert.ok(recoveryCrawl.env.GH_TOKEN, 'spare 需要 GH_TOKEN 輪詢同 run 的 jobs/artifacts API');
+    assert.equal(recoveryCrawl.env.DEADLINE_EPOCH, undefined);
+    const uploadStep = getLaneStep('primary', 'Publish primary outcome for the hot spare');
+    assert.equal(uploadStep.if, 'always()');
+    assert.match(uploadStep.with.name, /plate-sync-result-/);
+    assert.equal(laneWorkflow.permissions.actions, 'read');
+    assert.equal(workflow.permissions.actions, 'read');
     assert.deepEqual(gate.needs, ['primary', 'recovery']);
     assert.equal(gate.if, 'always()');
     assert.equal(workflow.jobs['finalize-sync'].needs, 'recovery-gate');
@@ -359,7 +365,8 @@ test('crawler 支援同 run 站點續爬：完成站記錄檔＋跳站，wrapper
     assert.match(source, /TARGET_SHARD && process\.env\.COMPLETED_STATIONS_FILE/);
     assert.match(source, /recordCompletedStation\(COMPLETED_STATIONS_FILE, completedStations, station\.id\)/);
     assert.match(source, /completedStations\.has\(String\(station\.id\)\)/);
-    // wrapper 對兩種 node 呼叫（有/無 deadline）都要傳入同一份記錄檔
+    // wrapper 對三種 node 呼叫（有/無 deadline 的 crawl＋spare 暖身探測）
+    // 都要傳入同一份記錄檔
     const passCount = (wrapper.match(/COMPLETED_STATIONS_FILE="\$COMPLETED_STATIONS_FILE"/g) || []).length;
-    assert.equal(passCount, 2);
+    assert.equal(passCount, 3);
 });

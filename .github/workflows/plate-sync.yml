@@ -10,6 +10,9 @@ concurrency:
 
 permissions:
   contents: read
+  # 熱備援 runner 需輪詢同 run 的 jobs/artifacts API（呼叫端權限是 reusable
+  # workflow 權限的上限，這裡不開、lane 裡開了也沒用）。
+  actions: read
 
 jobs:
   shard-lane:
