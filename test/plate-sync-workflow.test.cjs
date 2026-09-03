@@ -67,7 +67,8 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.equal(recovery.needs, undefined);
     assert.equal(recovery.if, undefined);
     assert.equal(recovery['timeout-minutes'], 21);
-    assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 5);
+    assert.equal(recovery['continue-on-error'], true, '備援機失敗不得染紅 reusable workflow');
+    assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 8);
     const recoveryCrawl = getLaneStep('recovery', 'Stand by warm and take over within lane budget');
     assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*spare/);
     assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '8');
@@ -152,10 +153,30 @@ test('shard lane gate 只有在 primary 成功或 bounded recovery 完成時放�
         RECOVERY_STATUS: 'RETRY',
     });
 
+    // continue-on-error 下備援機 setup 崩潰：result 仍是 success 但 status 為空，
+    // primary RETRY 時必須 fail-closed（9/3 22:23 案例的反向保護）
+    const spareCrashed = runLaneGate({
+        SHARD: 'CENTRAL',
+        PRIMARY_RESULT: 'success',
+        PRIMARY_STATUS: 'RETRY',
+        RECOVERY_RESULT: 'success',
+        RECOVERY_STATUS: '',
+    });
+    // primary 自己成功時，備援機崩潰不得影響放行
+    const spareCrashedPrimaryOk = runLaneGate({
+        SHARD: 'CENTRAL',
+        PRIMARY_RESULT: 'success',
+        PRIMARY_STATUS: 'SUCCESS',
+        RECOVERY_RESULT: 'success',
+        RECOVERY_STATUS: '',
+    });
+
     assert.equal(primaryPassed.status, 0, `${primaryPassed.stdout}${primaryPassed.stderr}`);
     assert.equal(recoveryPassed.status, 0, `${recoveryPassed.stdout}${recoveryPassed.stderr}`);
     assert.equal(recoveryFailed.status, 1, `${recoveryFailed.stdout}${recoveryFailed.stderr}`);
     assert.match(`${recoveryFailed.stdout}${recoveryFailed.stderr}`, /did not complete CENTRAL/);
+    assert.equal(spareCrashed.status, 1, `${spareCrashed.stdout}${spareCrashed.stderr}`);
+    assert.equal(spareCrashedPrimaryOk.status, 0, `${spareCrashedPrimaryOk.stdout}${spareCrashedPrimaryOk.stderr}`);
 });
 
 test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries', () => {

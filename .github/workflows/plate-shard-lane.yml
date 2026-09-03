@@ -134,6 +134,11 @@ jobs:
     name: recovery-attempt (${{ inputs.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 21
+    # 2026-09-04：備援機每輪都跑，它自己的失敗（如 setup 逾時）不得把整個 reusable
+    # workflow 染紅、連累已成功的 primary（9/3 22:23 五個 primary 全成功、四台備援
+    # setup 逾時 → 完整資料被丟掉不 swap）。lane-gate 以 status 輸出為準，
+    # primary RETRY 時 status 非 SUCCESS 仍 fail-closed，不會因此放行殘缺資料。
+    continue-on-error: true
     outputs:
       status: ${{ steps.crawl.outputs.status }}
     steps:
@@ -142,7 +147,9 @@ jobs:
 
       - name: Setup fresh recovery runner
         uses: ./.github/actions/setup-plate-runner
-        timeout-minutes: 5
+        # 5→8：備援機不在關鍵路徑上（primary 最快 T+3.5 分鐘才交棒），setup 慢一點
+        # 只是晚接棒，比 5 分鐘直接死掉好。
+        timeout-minutes: 8
         with:
           shards: ${{ inputs.shard }}
           supabase-url: ${{ secrets.VITE_SUPABASE_URL }}
