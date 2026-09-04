@@ -18,6 +18,10 @@ DEADLINE_EPOCH="${DEADLINE_EPOCH:-0}"
 readonly SPARE_POLL_INTERVAL_SECONDS="${SPARE_POLL_INTERVAL_SECONDS:-20}"
 readonly SPARE_MAX_WAIT_SECONDS="${SPARE_MAX_WAIT_SECONDS:-1080}"
 readonly WARM_TICKET_MAX_TRIES="${WARM_TICKET_MAX_TRIES:-3}"
+# 備援機獨立接手用：primary 開爬前死於 setup 時沒有 artifact 可讀 deadline，
+# 改以備援機自身起跑時間＋lane 預算推算（兩者同輪同秒發車，誤差數秒）。
+readonly SPARE_START_EPOCH="${SPARE_START_EPOCH:-0}"
+readonly LANE_BUDGET_SECONDS="${LANE_BUDGET_SECONDS:-1140}"
 # primary 原地重抽 WARP 身分的預算門檻：480s（recovery gate 下限）＋重抽與一次
 # preflight 失敗的最壞耗時（~180s）＋餘裕（60s）。低於此值直接交棒，不賭。
 readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-720}"
@@ -35,7 +39,7 @@ case "$MODE" in
     ;;
 esac
 
-for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES"; do
+for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES" "$SPARE_START_EPOCH" "$LANE_BUDGET_SECONDS"; do
   if ! [[ "$numeric_value" =~ ^[0-9]+$ ]]; then
     echo "::error::Recovery timing values must be non-negative integers."
     exit 2
@@ -312,6 +316,15 @@ run_spare() {
     primary_conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
       --jq '[.jobs[] | select(.name | endswith("primary-attempt ('"$SHARD"')"))][0].conclusion // ""' 2>/dev/null || true)
     if [ -n "$primary_conclusion" ]; then
+      # 2026-09-04：SUCCESS/RETRY/HARD_FAILURE 都會留 artifact；「失敗且無 artifact」＝
+      # primary 在開爬前就死於 setup（apt 慢/逾時，SHARD5 10:03/10:23 實例）。此時
+      # 健康的備援機不該收工，而是以自身起跑時間推算 lane 預算、整個 shard 接手。
+      if [ "$primary_conclusion" != "success" ] && [ "$SPARE_START_EPOCH" -gt 0 ]; then
+        DEADLINE_EPOCH=$((SPARE_START_EPOCH + LANE_BUDGET_SECONDS))
+        echo "Primary died before crawling ($primary_conclusion, no artifact); spare taking the whole shard $SHARD."
+        spare_take_over
+        return $?
+      fi
       echo "Primary finished ($primary_conclusion) without publishing a result artifact; spare standing down."
       write_outcome SPARE_IDLE
       return 0
@@ -361,6 +374,12 @@ run_spare() {
   if [ -n "$primary_deadline" ] && [ "$primary_deadline" -gt 0 ]; then
     DEADLINE_EPOCH="$primary_deadline"
   fi
+  spare_take_over
+  return $?
+}
+
+# 備援機接手爬行（兩條路徑共用）：預算門檻 240s（已暖機、零 setup 成本）。
+spare_take_over() {
   if [ "$DEADLINE_EPOCH" -gt 0 ]; then
     local remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
     if [ "$remaining_seconds" -lt 240 ]; then

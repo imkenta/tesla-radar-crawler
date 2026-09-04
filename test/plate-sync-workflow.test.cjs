@@ -55,7 +55,8 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.equal(primary['timeout-minutes'], 20);
     assert.match(primary.outputs.deadline_epoch, /steps\.budget\.outputs\.deadline_epoch/);
     const budgetStep = getLaneStep('primary', 'Start 19-minute shard lane budget');
-    assert.match(budgetStep.run, /\+ 1140/);
+    assert.equal(laneWorkflow.env.LANE_BUDGET_SECONDS, '1140', 'lane 預算單一來源');
+    assert.match(budgetStep.run, /\+ LANE_BUDGET_SECONDS/);
     assert.equal(getLaneStep('primary', 'Setup primary crawler runner')['timeout-minutes'], 10);
     const primaryCrawl = getLaneStep('primary', 'Run primary crawler once');
     assert.match(primaryCrawl.run, /run-plate-shard-with-recovery\.sh/);
@@ -74,6 +75,8 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.equal(recoveryCrawl.env.RETRY_COOLDOWN_SECONDS, '8');
     assert.equal(recoveryCrawl.env.MAX_PREFLIGHT_ATTEMPTS, '6');
     assert.ok(recoveryCrawl.env.GH_TOKEN, 'spare 需要 GH_TOKEN 輪詢同 run 的 jobs/artifacts API');
+    assert.match(recoveryCrawl.env.SPARE_START_EPOCH, /steps\.spare_budget\.outputs\.spare_start_epoch/);
+    assert.ok(getLaneStep('recovery', 'Record spare start for standalone takeover budget'));
     assert.equal(recoveryCrawl.env.DEADLINE_EPOCH, undefined);
     const uploadStep = getLaneStep('primary', 'Publish primary outcome for the hot spare');
     assert.equal(uploadStep.if, 'always()');
@@ -177,6 +180,26 @@ test('shard lane gate 只有在 primary 成功或 bounded recovery 完成時放�
     assert.match(`${recoveryFailed.stdout}${recoveryFailed.stderr}`, /did not complete CENTRAL/);
     assert.equal(spareCrashed.status, 1, `${spareCrashed.stdout}${spareCrashed.stderr}`);
     assert.equal(spareCrashedPrimaryOk.status, 0, `${spareCrashedPrimaryOk.stdout}${spareCrashedPrimaryOk.stderr}`);
+
+    // 2026-09-04：primary 死於 setup（無 status）＋備援機整個接手成功 → 放行
+    const primaryDiedSpareDone = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'failure', PRIMARY_STATUS: '',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SUCCESS',
+    });
+    // primary 曾開爬並 HARD_FAILURE → 備援機收工，仍判死
+    const primaryHardFailure = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'failure', PRIMARY_STATUS: 'HARD_FAILURE',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SPARE_IDLE',
+    });
+    // primary 死於 setup 但備援機沒完成 → 判死
+    const primaryDiedSpareIdle = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'failure', PRIMARY_STATUS: '',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SPARE_IDLE',
+    });
+    assert.equal(primaryDiedSpareDone.status, 0, `${primaryDiedSpareDone.stdout}${primaryDiedSpareDone.stderr}`);
+    assert.match(`${primaryDiedSpareDone.stdout}`, /hot spare completed the whole shard/);
+    assert.equal(primaryHardFailure.status, 1);
+    assert.equal(primaryDiedSpareIdle.status, 1);
 });
 
 test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries', () => {
@@ -190,6 +213,10 @@ test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries',
     assert.match(installStep.run, /timeout --signal=TERM --kill-after=15s 240s/);
     assert.match(installStep.run, /Acquire::Retries=2/);
     assert.doesNotMatch(installStep.run, /sudo apt-get update &&/);
+    // 2026-09-04：快取命中直裝本地 .deb（零 apt-get update）；未命中只更新 Cloudflare 單一來源
+    assert.match(installStep.run, /install -y "\$WARP_DEB"/);
+    assert.match(installStep.run, /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
+    assert.match(installStep.run, /APT::Get::List-Cleanup=0/);
     assert.match(cacheStep.with.key, /plate-shard-lane\.yml/);
 });
 

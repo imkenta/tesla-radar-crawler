@@ -25,6 +25,7 @@ function runScenario(exitCodes, options = {}) {
         ghPrimaryConclusion = '',
         primaryResultJson = '',
         warmTicketMaxTries = 1,
+        spareStartEpoch = 0,
     } = options;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-shard-recovery-'));
     const fakeBin = path.join(tempDir, 'bin');
@@ -89,6 +90,8 @@ exit 1
             FAKE_GH_ARTIFACT_ID: String(ghArtifactId),
             FAKE_GH_PRIMARY_CONCLUSION: String(ghPrimaryConclusion),
             FAKE_PRIMARY_RESULT_JSON: String(primaryResultJson),
+            SPARE_START_EPOCH: String(spareStartEpoch),
+            LANE_BUDGET_SECONDS: '1140',
         },
     });
 
@@ -325,4 +328,45 @@ test('spare：暖身探測失敗會重抽再驗，直到拿到好票', () => {
     assert.equal(scenario.nodeCalls, 3); // 暖身×2（敗+成）＋接棒 crawl
     const warpCommands = scenario.warpLog.trim().split('\n');
     assert.equal(warpCommands.filter((c) => c === 'registration new').length, 1);
+});
+
+test('spare：primary 失敗且無 artifact（開爬前死於 setup）→ 以自身起跑時間推算預算、整個接手', () => {
+    const scenario = runScenario([0, 0], {
+        mode: 'spare',
+        ghArtifactId: '',
+        ghPrimaryConclusion: 'failure',
+        spareStartEpoch: Math.floor(Date.now() / 1000) - 300, // 已跑 5 分鐘，仍餘 840s
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SUCCESS');
+    assert.equal(scenario.nodeCalls, 2); // 暖身 + 接手 crawl
+    assert.match(output, /Primary died before crawling/);
+});
+
+test('spare：primary 失敗且無 artifact 但預算已耗盡 → 拒絕接手、交出 RETRY（fail-closed）', () => {
+    const scenario = runScenario([0], {
+        mode: 'spare',
+        ghArtifactId: '',
+        ghPrimaryConclusion: 'cancelled',
+        spareStartEpoch: Math.floor(Date.now() / 1000) - 2000, // 早已超過 1140s
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 75, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'RETRY');
+    assert.equal(scenario.nodeCalls, 1); // 只有暖身，沒有接手爬行
+});
+
+test('spare：primary 成功但無 artifact（異常）→ 仍收工，不擅自重爬', () => {
+    const scenario = runScenario([0], {
+        mode: 'spare',
+        ghArtifactId: '',
+        ghPrimaryConclusion: 'success',
+        spareStartEpoch: Math.floor(Date.now() / 1000) - 300,
+    });
+    assert.equal(scenario.result.status, 0);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SPARE_IDLE');
+    assert.equal(scenario.nodeCalls, 1);
 });

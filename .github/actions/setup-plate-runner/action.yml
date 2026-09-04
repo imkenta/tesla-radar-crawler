@@ -74,39 +74,59 @@ runs:
           || echo "Cache miss: packages will be downloaded fresh this run."
         echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
 
-        APT_UPDATED=false
-        for ATTEMPT in 1 2; do
-          echo "apt-get update attempt $ATTEMPT/2..."
-          if sudo timeout --signal=TERM --kill-after=15s 90s \
+        # 2026-09-04：快取命中→直接裝本地 .deb，完全跳過 apt-get update。9/3-9/4 runner
+        # 對 Ubuntu 鏡像的 apt-get update 慢到 90s×2 逾時，setup 被拖到 7-10 分鐘、連
+        # primary 都死在 setup（SHARD5 10:03/10:23）。本地 .deb 不需要任何索引刷新，
+        # 相依套件由 runner 映像既有的 apt 清單解析。
+        # 從 /var/cache/apt/archives 取（上方已從快取複製過去；root 擁有，apt 的 _apt 沙箱
+        # 使用者必能讀取，避免 $HOME 權限造成 unsandboxed 警告或失敗）。
+        WARP_DEB=$(ls /var/cache/apt/archives/cloudflare-warp*.deb 2>/dev/null | head -n 1 || true)
+        if [ -n "$WARP_DEB" ]; then
+          echo "Cache hit: installing $WARP_DEB directly (no apt-get update)."
+          if ! sudo timeout --signal=TERM --kill-after=15s 240s \
+            env DEBIAN_FRONTEND=noninteractive \
+            apt-get -o Dpkg::Use-Pty=0 install -y "$WARP_DEB"; then
+            echo "::error::Cloudflare WARP local .deb installation failed or timed out."
+            exit 1
+          fi
+        else
+          # 快取未命中：只刷新 Cloudflare 單一來源的索引，不碰 Ubuntu 鏡像
+          # （sourcelist 指到 cloudflare-client.list、sourceparts 清空、List-Cleanup=0
+          # 保留 runner 映像既有清單供相依解析）。
+          APT_UPDATED=false
+          for ATTEMPT in 1 2; do
+            echo "apt-get update (Cloudflare repo only) attempt $ATTEMPT/2..."
+            if sudo timeout --signal=TERM --kill-after=15s 90s \
+              apt-get \
+                -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list \
+                -o Dir::Etc::sourceparts=- \
+                -o APT::Get::List-Cleanup=0 \
+                -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=20 \
+                -o Dpkg::Use-Pty=0 \
+                update; then
+              APT_UPDATED=true
+              break
+            fi
+            echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
+            if [ "$ATTEMPT" -lt 2 ]; then sleep 5; fi
+          done
+          if [ "$APT_UPDATED" != "true" ]; then
+            echo "::error::Unable to refresh apt indexes after bounded retries."
+            exit 1
+          fi
+          if ! sudo timeout --signal=TERM --kill-after=15s 240s \
+            env DEBIAN_FRONTEND=noninteractive \
             apt-get \
               -o Acquire::Retries=2 \
               -o Acquire::http::Timeout=15 \
               -o Acquire::https::Timeout=20 \
               -o Dpkg::Use-Pty=0 \
-              update; then
-            APT_UPDATED=true
-            break
+              install -y cloudflare-warp; then
+            echo "::error::Cloudflare WARP package installation failed or timed out."
+            exit 1
           fi
-
-          echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
-          if [ "$ATTEMPT" -lt 2 ]; then sleep 5; fi
-        done
-
-        if [ "$APT_UPDATED" != "true" ]; then
-          echo "::error::Unable to refresh apt indexes after bounded retries."
-          exit 1
-        fi
-
-        if ! sudo timeout --signal=TERM --kill-after=15s 240s \
-          env DEBIAN_FRONTEND=noninteractive \
-          apt-get \
-            -o Acquire::Retries=2 \
-            -o Acquire::http::Timeout=15 \
-            -o Acquire::https::Timeout=20 \
-            -o Dpkg::Use-Pty=0 \
-            install -y cloudflare-warp; then
-          echo "::error::Cloudflare WARP package installation failed or timed out."
-          exit 1
         fi
 
         mkdir -p "$HOME/.warp-apt-cache"

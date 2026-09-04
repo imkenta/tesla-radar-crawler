@@ -29,6 +29,10 @@ permissions:
   contents: read
   actions: read
 
+env:
+  # lane 預算單一來源：primary 的 deadline 與備援機獨立接手時的推算都用它。
+  LANE_BUDGET_SECONDS: '1140'
+
 jobs:
   primary:
     name: primary-attempt (${{ inputs.shard }})
@@ -49,7 +53,7 @@ jobs:
       - name: Start 19-minute shard lane budget
         id: budget
         shell: bash
-        run: echo "deadline_epoch=$(( $(date +%s) + 1140 ))" >> "$GITHUB_OUTPUT"
+        run: echo "deadline_epoch=$(( $(date +%s) + LANE_BUDGET_SECONDS ))" >> "$GITHUB_OUTPUT"
 
       - name: Setup primary crawler runner
         uses: ./.github/actions/setup-plate-runner
@@ -145,6 +149,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 2026-09-04：primary 若在開爬前死於 setup（apt 慢/逾時）不會留 artifact，備援機
+      # 以自己的起跑時間推算同一份 lane 預算整個接手（兩者同輪同秒發車）。
+      - name: Record spare start for standalone takeover budget
+        id: spare_budget
+        shell: bash
+        run: echo "spare_start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Setup fresh recovery runner
         uses: ./.github/actions/setup-plate-runner
         # 5→8：備援機不在關鍵路徑上（primary 最快 T+3.5 分鐘才交棒），setup 慢一點
@@ -166,6 +177,7 @@ jobs:
         run: bash scripts/run-plate-shard-with-recovery.sh "${{ inputs.shard }}" spare
         env:
           GH_TOKEN: ${{ github.token }}
+          SPARE_START_EPOCH: ${{ steps.spare_budget.outputs.spare_start_epoch }}
           RESULT_PATH: ${{ runner.temp }}/plate-sync-spare-result-${{ inputs.shard }}.json
           INITIAL_DELAY_SECONDS: '0'
           # 2026-08-31：冷卻 15→8s。重抽本身要 15-20s，兩者疊加的實際間隔仍
@@ -201,6 +213,12 @@ jobs:
           RECOVERY_STATUS: ${{ needs.recovery.outputs.status }}
         run: |
           if [ "$PRIMARY_RESULT" != "success" ]; then
+            # 2026-09-04：primary 死於 setup（從未開爬，沒有任何 status）而健康的備援機
+            # 整個接手成功 → 放行；primary 曾開爬（HARD_FAILURE 等必留 status）→ 維持判死。
+            if [ -z "$PRIMARY_STATUS" ] && [ "$RECOVERY_STATUS" = "SUCCESS" ]; then
+              echo "$SHARD primary died before crawling; the hot spare completed the whole shard."
+              exit 0
+            fi
             echo "::error::Primary runner infrastructure or non-retryable failure for $SHARD."
             exit 1
           fi
