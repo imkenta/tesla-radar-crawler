@@ -81,6 +81,9 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     const uploadStep = getLaneStep('primary', 'Publish primary outcome for the hot spare');
     assert.equal(uploadStep.if, 'always()');
     assert.match(uploadStep.with.name, /plate-sync-result-/);
+    // 2026-09-10：artifact 需一併帶進度檔，備援機才能續爬
+    assert.match(uploadStep.with.path, /plate-sync-result-/);
+    assert.match(uploadStep.with.path, /plate-completed-stations-/);
     assert.equal(laneWorkflow.permissions.actions, 'read');
     assert.equal(workflow.permissions.actions, 'read');
     assert.deepEqual(gate.needs, ['primary', 'recovery']);
@@ -218,6 +221,11 @@ test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries',
     assert.match(installStep.run, /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
     assert.match(installStep.run, /APT::Get::List-Cleanup=0/);
     assert.match(cacheStep.with.key, /plate-shard-lane\.yml/);
+    // 2026-09-10：npm ci 需重試（Puppeteer 下載 ECONNRESET 曾秒殺 primary），並快取瀏覽器
+    const installDeps = getStep('Install Dependencies');
+    assert.match(installDeps.run, /for attempt in 1 2 3/);
+    assert.match(installDeps.run, /npm ci failed after 3 attempts/);
+    assert.equal(getStep('Cache Puppeteer browsers').with.path, '~/.cache/puppeteer');
 });
 
 function runMvdisShellPreflightScenario(scenario) {

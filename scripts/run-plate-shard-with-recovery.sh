@@ -25,6 +25,14 @@ readonly LANE_BUDGET_SECONDS="${LANE_BUDGET_SECONDS:-1140}"
 # primary 原地重抽 WARP 身分的預算門檻：480s（recovery gate 下限）＋重抽與一次
 # preflight 失敗的最壞耗時（~180s）＋餘裕（60s）。低於此值直接交棒，不賭。
 readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SECONDS:-720}"
+# 2026-09-10：primary 保留給熱備援的交棒窗。過去 primary 會把整個 lane 預算燒到
+# 見底才交棒（9/10 SOUTH：做完 6 站的 5 站、死在最後一站，備援機拿到通知時只剩
+# -18s），暖機待命一整輪的備援機等於白放。primary 改用「lane deadline 減保留窗」
+# 當爬行 deadline；配合下方進度傳承，備援機接手時是續爬而非從第一站重來。
+# 330 = 備援機接手門檻 240s ＋ 輪詢偵測與下載延遲（~20-40s）＋ 餘裕。
+readonly PRIMARY_HANDOFF_RESERVE_SECONDS="${PRIMARY_HANDOFF_RESERVE_SECONDS:-330}"
+# run_crawler 實際使用的 deadline；primary 會設成保留後的較早值，fresh/spare 沿用 lane deadline。
+CRAWL_DEADLINE_EPOCH=""
 
 if [ -z "$SHARD" ]; then
   echo "::error::Missing shard argument."
@@ -39,7 +47,7 @@ case "$MODE" in
     ;;
 esac
 
-for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES" "$SPARE_START_EPOCH" "$LANE_BUDGET_SECONDS"; do
+for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES" "$SPARE_START_EPOCH" "$LANE_BUDGET_SECONDS" "$PRIMARY_HANDOFF_RESERVE_SECONDS"; do
   if ! [[ "$numeric_value" =~ ^[0-9]+$ ]]; then
     echo "::error::Recovery timing values must be non-negative integers."
     exit 2
@@ -68,9 +76,10 @@ run_crawler() {
   local skip_jitter="${1:-0}"
   local exit_code
   local remaining_seconds
+  local crawl_deadline="${CRAWL_DEADLINE_EPOCH:-$DEADLINE_EPOCH}"
 
-  if [ "$DEADLINE_EPOCH" -gt 0 ]; then
-    remaining_seconds=$((DEADLINE_EPOCH - $(date +%s)))
+  if [ "$crawl_deadline" -gt 0 ]; then
+    remaining_seconds=$((crawl_deadline - $(date +%s)))
     if [ "$remaining_seconds" -le 0 ]; then
       echo "::error::Shard $SHARD has exhausted its end-to-end lane budget before starting another crawler."
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
@@ -187,6 +196,12 @@ run_primary() {
   local first_exit
   local second_exit
   local remaining_seconds
+
+  # 保留交棒窗：primary 不再獨佔整個 lane 預算（見常數註解）。
+  if [ "$DEADLINE_EPOCH" -gt 0 ] && [ "$PRIMARY_HANDOFF_RESERVE_SECONDS" -gt 0 ]; then
+    CRAWL_DEADLINE_EPOCH=$((DEADLINE_EPOCH - PRIMARY_HANDOFF_RESERVE_SECONDS))
+    echo "Primary reserves the last ${PRIMARY_HANDOFF_RESERVE_SECONDS}s of the lane budget as a handoff window for the warm spare."
+  fi
 
   run_crawler 0
   first_exit=$?
@@ -346,7 +361,20 @@ run_spare() {
     write_outcome SPARE_IDLE
     return 0
   fi
-  result_json=$(unzip -p "$artifact_zip" 2>/dev/null || true)
+  # 依檔名逐一取出（artifact 內含 result 與 completed-stations 兩個檔，
+  # 不指定成員的 unzip -p 會把兩檔內容串在一起、破壞 JSON 解析）。
+  result_json=$(unzip -p "$artifact_zip" "plate-sync-result-${SHARD}.json" 2>/dev/null || true)
+
+  # 2026-09-10 進度傳承：接手時續爬 primary 沒做完的站，而非從第一站重來。
+  # 已完成站的 staging 資料仍在（delete 只發生在真正重爬該站時），swap 守門不受影響。
+  if unzip -p "$artifact_zip" "plate-completed-stations-${SHARD}.json" \
+      > "${COMPLETED_STATIONS_FILE}.inherited" 2>/dev/null \
+     && [ -s "${COMPLETED_STATIONS_FILE}.inherited" ]; then
+    mv "${COMPLETED_STATIONS_FILE}.inherited" "$COMPLETED_STATIONS_FILE"
+    echo "Spare inherited primary progress for $SHARD: $(cat "$COMPLETED_STATIONS_FILE")"
+  else
+    rm -f "${COMPLETED_STATIONS_FILE}.inherited"
+  fi
   primary_status=$(sed -nE 's/.*"status":"([A-Z_]+)".*/\1/p' <<< "$result_json")
   primary_deadline=$(sed -nE 's/.*"deadline_epoch":([0-9]+).*/\1/p' <<< "$result_json")
 

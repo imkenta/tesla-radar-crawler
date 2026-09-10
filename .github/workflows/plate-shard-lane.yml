@@ -92,7 +92,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: plate-sync-result-${{ inputs.shard }}
-          path: ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
+          # 一併帶上已完成站清單，讓接手的備援機續爬而非從第一站重來。
+          path: |
+            ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
+            ${{ runner.temp }}/plate-completed-stations-${{ inputs.shard }}.json
+          if-no-files-found: warn
           retention-days: 1
           overwrite: true
 

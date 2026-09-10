@@ -26,6 +26,8 @@ function runScenario(exitCodes, options = {}) {
         primaryResultJson = '',
         warmTicketMaxTries = 1,
         spareStartEpoch = 0,
+        completedJson = '',
+        primaryHandoffReserveSeconds = 0,
     } = options;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-shard-recovery-'));
     const fakeBin = path.join(tempDir, 'bin');
@@ -34,6 +36,7 @@ function runScenario(exitCodes, options = {}) {
     const nodeCountPath = path.join(tempDir, 'node-count.txt');
     const warpLogPath = path.join(tempDir, 'warp.log');
     const sleepLogPath = path.join(tempDir, 'sleep.log');
+    const completedStationsPath = path.join(tempDir, 'completed-stations.json');
     fs.mkdirSync(fakeBin);
 
     executable(path.join(fakeBin, 'node'), `#!/bin/bash
@@ -62,7 +65,15 @@ if [[ "$args" == *"/artifacts"* ]]; then printf '%s' "$FAKE_GH_ARTIFACT_ID"; exi
 if [[ "$args" == *"/jobs"* ]]; then printf '%s' "$FAKE_GH_PRIMARY_CONCLUSION"; exit 0; fi
 exit 1
 `);
-    executable(path.join(fakeBin, 'unzip'), '#!/bin/bash\nprintf "%s" "$FAKE_PRIMARY_RESULT_JSON"\n');
+    // unzip -p <zip> <member>：依成員檔名回應，才測得到「result 與進度檔分別取出」
+    executable(path.join(fakeBin, 'unzip'), `#!/bin/bash
+member="$3"
+case "$member" in
+  *result*) printf '%s' "$FAKE_PRIMARY_RESULT_JSON" ;;
+  *completed*) [ -n "$FAKE_COMPLETED_JSON" ] || exit 1; printf '%s' "$FAKE_COMPLETED_JSON" ;;
+  *) exit 1 ;;
+esac
+`);
 
     const result = spawnSync('/bin/bash', [recoveryScript, 'NORTH', mode], {
         cwd: path.join(__dirname, '..'),
@@ -92,6 +103,9 @@ exit 1
             FAKE_PRIMARY_RESULT_JSON: String(primaryResultJson),
             SPARE_START_EPOCH: String(spareStartEpoch),
             LANE_BUDGET_SECONDS: '1140',
+            FAKE_COMPLETED_JSON: String(completedJson),
+            COMPLETED_STATIONS_FILE: completedStationsPath,
+            PRIMARY_HANDOFF_RESERVE_SECONDS: String(primaryHandoffReserveSeconds),
         },
     });
 
@@ -100,6 +114,9 @@ exit 1
         outcome: fs.existsSync(resultPath) ? JSON.parse(fs.readFileSync(resultPath, 'utf8')) : null,
         nodeCalls: fs.existsSync(nodeCountPath) ? Number(fs.readFileSync(nodeCountPath, 'utf8')) : 0,
         warpLog: fs.existsSync(warpLogPath) ? fs.readFileSync(warpLogPath, 'utf8') : '',
+        completedStations: fs.existsSync(completedStationsPath)
+            ? fs.readFileSync(completedStationsPath, 'utf8')
+            : null,
         sleeps: fs.existsSync(sleepLogPath)
             ? fs.readFileSync(sleepLogPath, 'utf8').trim().split('\n').filter(Boolean).map(Number)
             : [],
@@ -369,4 +386,62 @@ test('spare：primary 成功但無 artifact（異常）→ 仍收工，不擅自
     assert.equal(scenario.result.status, 0);
     assert.equal(scenario.outcome && scenario.outcome.status, 'SPARE_IDLE');
     assert.equal(scenario.nodeCalls, 1);
+});
+
+// --- 交棒窗保留與進度傳承（2026-09-10）---
+
+test('primary 保留交棒窗：爬行 deadline = lane deadline 減保留秒數，不再獨佔整個預算', () => {
+    const scenario = runScenario([0], {
+        deadlineEpoch: Math.floor(Date.now() / 1000) + 1000,
+        primaryHandoffReserveSeconds: 330,
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.match(output, /reserves the last 330s of the lane budget/);
+    // 實際交給 crawler 的剩餘時間應為 ~670s（1000-330），而非 ~1000s
+    const remaining = Number(output.match(/has (\d+)s remaining in its end-to-end lane budget/)[1]);
+    assert.ok(remaining > 640 && remaining <= 670, `expected ~670s, got ${remaining}`);
+});
+
+test('primary 保留窗設為 0 時行為不變（沿用整個 lane 預算）', () => {
+    const scenario = runScenario([0], {
+        deadlineEpoch: Math.floor(Date.now() / 1000) + 1000,
+        primaryHandoffReserveSeconds: 0,
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+    const remaining = Number(output.match(/has (\d+)s remaining in its end-to-end lane budget/)[1]);
+    assert.ok(remaining > 970, `expected ~1000s, got ${remaining}`);
+    assert.doesNotMatch(output, /reserves the last/);
+});
+
+test('spare 接手時繼承 primary 的完成站清單（續爬而非從第一站重來）', () => {
+    const deadline = Math.floor(Date.now() / 1000) + 600;
+    const scenario = runScenario([0, 0], {
+        mode: 'spare',
+        ghArtifactId: '123',
+        primaryResultJson: `{"shard":"NORTH","status":"RETRY","deadline_epoch":${deadline}}`,
+        completedJson: '["20","21","25"]',
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SUCCESS');
+    assert.match(output, /inherited primary progress for NORTH/);
+    assert.equal(scenario.completedStations, '["20","21","25"]');
+});
+
+test('spare：artifact 內沒有進度檔時不建立空的續爬記錄（整個 shard 重爬）', () => {
+    const deadline = Math.floor(Date.now() / 1000) + 600;
+    const scenario = runScenario([0, 0], {
+        mode: 'spare',
+        ghArtifactId: '123',
+        primaryResultJson: `{"shard":"NORTH","status":"RETRY","deadline_epoch":${deadline}}`,
+        completedJson: '',
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.doesNotMatch(output, /inherited primary progress/);
+    assert.equal(scenario.completedStations, null, '不得留下空的 .inherited 或空檔');
 });

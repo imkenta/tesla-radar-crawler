@@ -35,9 +35,28 @@ runs:
       with:
         node-version: '20'
 
+    # 2026-09-10：Puppeteer 的 postinstall 會下載 Chrome headless shell，撞到
+    # ECONNRESET 就整個 npm ci 失敗、primary 在 11 秒內死於 setup（9/9 19:03 SHARD5）。
+    # 快取瀏覽器讓命中時完全不必下載。
+    - name: Cache Puppeteer browsers
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/puppeteer
+        key: puppeteer-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+        restore-keys: |
+          puppeteer-${{ runner.os }}-
+
     - name: Install Dependencies
       shell: bash
-      run: npm ci
+      # npm ci 本身無重試；瞬斷不該讓整條 lane 陣亡。
+      run: |
+        for attempt in 1 2 3; do
+          if npm ci; then exit 0; fi
+          echo "::warning::npm ci attempt $attempt/3 failed."
+          if [ "$attempt" -lt 3 ]; then sleep $((attempt * 5)); fi
+        done
+        echo "::error::npm ci failed after 3 attempts."
+        exit 1
 
     - name: Cache Cloudflare WARP apt packages
       id: cache-warp-apt
