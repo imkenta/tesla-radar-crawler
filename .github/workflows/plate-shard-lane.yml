@@ -74,6 +74,8 @@ jobs:
         run: bash scripts/run-plate-shard-with-recovery.sh "${{ inputs.shard }}"
         env:
           RESULT_PATH: ${{ runner.temp }}/plate-sync-result-${{ inputs.shard }}.json
+          # 2026-09-10：進度檔路徑顯式設定，與 artifact 上傳路徑釘成同一份（寫入端＝上傳端）。
+          COMPLETED_STATIONS_FILE: ${{ runner.temp }}/plate-completed-stations-${{ inputs.shard }}.json
           DEADLINE_EPOCH: ${{ steps.budget.outputs.deadline_epoch }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -183,6 +185,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SPARE_START_EPOCH: ${{ steps.spare_budget.outputs.spare_start_epoch }}
           RESULT_PATH: ${{ runner.temp }}/plate-sync-spare-result-${{ inputs.shard }}.json
+          # 2026-09-10：進度檔路徑顯式設定，與 artifact 上傳路徑釘成同一份（寫入端＝上傳端）。
+          COMPLETED_STATIONS_FILE: ${{ runner.temp }}/plate-completed-stations-${{ inputs.shard }}.json
           INITIAL_DELAY_SECONDS: '0'
           # 2026-08-31：冷卻 15→8s。重抽本身要 15-20s，兩者疊加的實際間隔仍
           # ~25s+；每張廢票省 7s。

@@ -84,6 +84,11 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     // 2026-09-10：artifact 需一併帶進度檔，備援機才能續爬
     assert.match(uploadStep.with.path, /plate-sync-result-/);
     assert.match(uploadStep.with.path, /plate-completed-stations-/);
+    // 寫入端與上傳端必須是同一份路徑（2026-09-10）
+    const completedPath = '${{ runner.temp }}/plate-completed-stations-${{ inputs.shard }}.json';
+    assert.equal(primaryCrawl.env.COMPLETED_STATIONS_FILE, completedPath);
+    assert.equal(recoveryCrawl.env.COMPLETED_STATIONS_FILE, completedPath);
+    assert.ok(uploadStep.with.path.split('\n').map((l) => l.trim()).includes(completedPath), '上傳路徑須與寫入路徑相同');
     assert.equal(laneWorkflow.permissions.actions, 'read');
     assert.equal(workflow.permissions.actions, 'read');
     assert.deepEqual(gate.needs, ['primary', 'recovery']);
@@ -421,8 +426,10 @@ test('crawler 支援同 run 站點續爬：完成站記錄檔＋跳站，wrapper
     assert.match(source, /TARGET_SHARD && process\.env\.COMPLETED_STATIONS_FILE/);
     assert.match(source, /recordCompletedStation\(COMPLETED_STATIONS_FILE, completedStations, station\.id\)/);
     assert.match(source, /completedStations\.has\(String\(station\.id\)\)/);
-    // wrapper 對三種 node 呼叫（有/無 deadline 的 crawl＋spare 暖身探測）
-    // 都要傳入同一份記錄檔
-    const passCount = (wrapper.match(/COMPLETED_STATIONS_FILE="\$COMPLETED_STATIONS_FILE"/g) || []).length;
-    assert.equal(passCount, 3);
+    // 2026-09-10：⛔不得對 readonly 的 COMPLETED_STATIONS_FILE 做前綴賦值——CI 裡子程序收
+    // 不到值，續爬從 8/31 起全死（舊斷言要求前綴賦值恰好 3 次，等於把 bug 寫成規格）。
+    // 改為宣告後 export，子程序直接繼承。
+    const prefixCount = (wrapper.match(/COMPLETED_STATIONS_FILE="\$COMPLETED_STATIONS_FILE"/g) || []).length;
+    assert.equal(prefixCount, 0, 'readonly 變數前綴賦值會讓子程序收不到值');
+    assert.match(wrapper, /^export COMPLETED_STATIONS_FILE$/m);
 });

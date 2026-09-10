@@ -13,6 +13,12 @@ function executable(filePath, content) {
     fs.writeFileSync(filePath, content, { mode: 0o755 });
 }
 
+function withoutKeys(obj, keys) {
+    const copy = { ...obj };
+    for (const key of keys) delete copy[key];
+    return copy;
+}
+
 function runScenario(exitCodes, options = {}) {
     const {
         mode = 'primary',
@@ -28,6 +34,7 @@ function runScenario(exitCodes, options = {}) {
         spareStartEpoch = 0,
         completedJson = '',
         primaryHandoffReserveSeconds = 0,
+        omitCompletedEnv = false,
     } = options;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-shard-recovery-'));
     const fakeBin = path.join(tempDir, 'bin');
@@ -37,9 +44,11 @@ function runScenario(exitCodes, options = {}) {
     const warpLogPath = path.join(tempDir, 'warp.log');
     const sleepLogPath = path.join(tempDir, 'sleep.log');
     const completedStationsPath = path.join(tempDir, 'completed-stations.json');
+    const nodeEnvLogPath = path.join(tempDir, 'node-env.log');
     fs.mkdirSync(fakeBin);
 
     executable(path.join(fakeBin, 'node'), `#!/bin/bash
+echo "\${COMPLETED_STATIONS_FILE:-<unset>}" >> "$FAKE_NODE_ENV_LOG"
 count=0
 if [ -f "$FAKE_NODE_COUNT_FILE" ]; then count=$(cat "$FAKE_NODE_COUNT_FILE"); fi
 count=$((count + 1))
@@ -78,7 +87,7 @@ esac
     const result = spawnSync('/bin/bash', [recoveryScript, 'NORTH', mode], {
         cwd: path.join(__dirname, '..'),
         encoding: 'utf8',
-        env: {
+        env: withoutKeys({
             ...process.env,
             PATH: `${fakeBin}:${process.env.PATH}`,
             RESULT_PATH: resultPath,
@@ -106,7 +115,8 @@ esac
             FAKE_COMPLETED_JSON: String(completedJson),
             COMPLETED_STATIONS_FILE: completedStationsPath,
             PRIMARY_HANDOFF_RESERVE_SECONDS: String(primaryHandoffReserveSeconds),
-        },
+            FAKE_NODE_ENV_LOG: nodeEnvLogPath,
+        }, omitCompletedEnv ? ['COMPLETED_STATIONS_FILE'] : []),
     });
 
     return {
@@ -117,6 +127,9 @@ esac
         completedStations: fs.existsSync(completedStationsPath)
             ? fs.readFileSync(completedStationsPath, 'utf8')
             : null,
+        nodeEnvSeen: fs.existsSync(nodeEnvLogPath)
+            ? fs.readFileSync(nodeEnvLogPath, 'utf8').trim().split('\n').filter(Boolean)
+            : [],
         sleeps: fs.existsSync(sleepLogPath)
             ? fs.readFileSync(sleepLogPath, 'utf8').trim().split('\n').filter(Boolean).map(Number)
             : [],
@@ -444,4 +457,39 @@ test('spare：artifact 內沒有進度檔時不建立空的續爬記錄（整個
     assert.equal(scenario.result.status, 0, output);
     assert.doesNotMatch(output, /inherited primary progress/);
     assert.equal(scenario.completedStations, null, '不得留下空的 .inherited 或空檔');
+});
+
+// --- 回歸：CI 情境（env 未帶 COMPLETED_STATIONS_FILE）子程序必須收到路徑（2026-09-10）---
+// 舊版對 readonly 變數做前綴賦值，CI 裡子程序收不到值，續爬從 8/31 起全死；
+// 舊測試全都在 env 帶了該變數，剛好把 bug 遮住。
+
+test('CI 情境：primary 啟動的 crawler 收到預設進度檔路徑，且無 readonly 錯誤', () => {
+    const scenario = runScenario([0], {
+        deadlineEpoch: Math.floor(Date.now() / 1000) + 1000,
+        omitCompletedEnv: true,
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.doesNotMatch(output, /readonly variable|唯讀/);
+    assert.equal(scenario.nodeEnvSeen.length, 1);
+    assert.match(scenario.nodeEnvSeen[0], /plate-completed-stations-NORTH\.json$/);
+});
+
+test('CI 情境：spare 的暖身探測與接手爬行都收到同一份進度檔路徑', () => {
+    const deadline = Math.floor(Date.now() / 1000) + 600;
+    const scenario = runScenario([0, 0], {
+        mode: 'spare',
+        ghArtifactId: '123',
+        primaryResultJson: `{"shard":"NORTH","status":"RETRY","deadline_epoch":${deadline}}`,
+        omitCompletedEnv: true,
+    });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.doesNotMatch(output, /readonly variable|唯讀/);
+    assert.equal(scenario.nodeEnvSeen.length, 2);
+    for (const seen of scenario.nodeEnvSeen) {
+        assert.match(seen, /plate-completed-stations-NORTH\.json$/);
+    }
 });

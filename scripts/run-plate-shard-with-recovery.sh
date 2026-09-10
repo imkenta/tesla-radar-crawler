@@ -8,6 +8,13 @@ readonly MODE="${2:-primary}"
 readonly RESULT_PATH="${RESULT_PATH:-${RUNNER_TEMP:-/tmp}/plate-sync-result-${SHARD}.json}"
 # 同 run 站點續爬記錄：同一 runner 上跨 crawler process 存活，換 runner 自然歸零。
 readonly COMPLETED_STATIONS_FILE="${COMPLETED_STATIONS_FILE:-${RUNNER_TEMP:-/tmp}/plate-completed-stations-${SHARD}.json}"
+# 2026-09-10：必須 export。原本在呼叫 node 時用前綴賦值
+# （`VAR="$VAR" node ...` 形式）傳遞，但對 readonly 變數做
+# 前綴賦值會報「readonly variable」，且變數不在 env 時（＝CI 的情況）子程序收不到值——
+# 爬蟲拿到 null、靜默不寫進度檔，同 runner 續爬（8/31）與跨 runner 進度傳承（9/10）
+# 因此從上線起就沒運作過（CI log 每次啟動爬蟲都印 line 89 readonly variable）。
+# export 後子程序直接繼承，⛔勿再對它做前綴賦值。
+export COMPLETED_STATIONS_FILE
 readonly INITIAL_DELAY_SECONDS="${INITIAL_DELAY_SECONDS:-0}"
 readonly RETRY_COOLDOWN_SECONDS="${RETRY_COOLDOWN_SECONDS:-15}"
 readonly MAX_PREFLIGHT_ATTEMPTS="${MAX_PREFLIGHT_ATTEMPTS:-2}"
@@ -86,7 +93,7 @@ run_crawler() {
     fi
 
     echo "Shard $SHARD has ${remaining_seconds}s remaining in its end-to-end lane budget."
-    SKIP_SHARD_JITTER="$skip_jitter" COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+    SKIP_SHARD_JITTER="$skip_jitter" \
       timeout --signal=TERM --kill-after=15s \
       "${remaining_seconds}s" node gh-plate-sync.cjs "--shard=$SHARD"
     exit_code=$?
@@ -95,7 +102,7 @@ run_crawler() {
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi
   else
-    SKIP_SHARD_JITTER="$skip_jitter" COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+    SKIP_SHARD_JITTER="$skip_jitter" \
       node gh-plate-sync.cjs "--shard=$SHARD"
     exit_code=$?
   fi
@@ -309,7 +316,7 @@ run_spare() {
 
   # 1) 暖身：先確保手上是一張經 Chromium 驗證的好票（等待期先把樂透抽完）。
   for ((warm_try = 1; warm_try <= WARM_TICKET_MAX_TRIES; warm_try++)); do
-    if SKIP_SHARD_JITTER=1 COMPLETED_STATIONS_FILE="$COMPLETED_STATIONS_FILE" \
+    if SKIP_SHARD_JITTER=1 \
       node gh-plate-sync.cjs "--shard=$SHARD" --preflight-only; then
       echo "Spare holds a verified MVDIS ticket (warm attempt $warm_try/$WARM_TICKET_MAX_TRIES)."
       break
