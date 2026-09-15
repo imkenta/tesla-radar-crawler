@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -173,9 +173,11 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 //
 // 狀態機純邏輯在 lib/ai-model-ladder.cjs 的 LadderState（可測）；此處只做 I/O（API 呼叫、
 // 退避 sleep、log、SDK 重建）。2026-07-05 三次修正，依三 shard 實戰 log：
-// - 一般失敗階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemma-4-31b-it(敗2)
-//   → gemini-3.1-flash-lite(敗2) → gemini-3-flash-preview(敗1)。PerDay 死亡卡在末層時
+// - 一般失敗階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemini-3.1-flash-lite(敗2)
+//   （2026-09-15 起兩層，31B 與 flash-preview 已依多日統計移除）。PerDay 死亡卡在末層時
 //   可回找仍存活的前層；只有全部 key×model 都有明確 PerDay 429 才是 EXHAUSTED。
+// - 回探第一層（2026-09-15）：停在較高層滿 5 分鐘後，下一張驗證碼改用 26B 試一次，
+//   成功就留在 26B、失敗立即回到原層（不計入任何門檻），見 maybeProbeFirstTier。
 // - 連續失敗才升級：成功呼叫重置當前層失敗計數（v1 累計語義讓中區在多次成功之間
 //   累積零星 500 也升級到已死的 31B——已修）。
 // - key 協同：同一層先試 shard key（GEMINI_API_KEY_{SHARD}），該 (key, model) 被日配額
@@ -186,7 +188,7 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 //   PerMinute 或無 PerDay 字樣 → 退避（RetryInfo.retryDelay 或 20s）同 combo 重試 1 次，
 //   成功不計數。
 // - 5xx → 退避 5-10 秒同 combo 重試 1 次，成功不計數，再失敗才計入升級門檻。
-//   另計滑動窗風暴偵測（2026-08-30 四次修正）：同 combo 5 分鐘內累積 3 次 5xx
+//   另計滑動窗風暴偵測（2026-08-30 四次修正）：同 combo 10 分鐘內累積 2 次 5xx
 //   → 判定模型端過載風暴，直接升級（成功不歸零風暴窗，見 lib/ai-model-ladder.cjs）。
 // - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
 // 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
@@ -233,11 +235,27 @@ class AIManager {
         console.log(`[AI] Initialized using: ${this.currentKeyName} / model: ${this.modelName}`);
     }
 
+    // 回探第一層（2026-09-15）：停在較高層滿 FIRST_TIER_PROBE_INTERVAL_MS 後，下一張驗證碼
+    // 改用 26B 試一次（狀態機在 LadderState.maybeStartFirstTierProbe）。成功由 generateContent
+    // 的 recordSuccess 收尾、失敗由 catch 的回探分支立即回到原層，皆不計入任何門檻。
+    maybeProbeFirstTier() {
+        const from = `${this.currentKeyName}/${this.modelName}`;
+        const probe = this.ladder.maybeStartFirstTierProbe(Date.now());
+        if (!probe) return;
+        console.log(`🔁 [AI] 回探第一層 → ${this.currentKeyName}/${this.modelName}（${from} 已停留 ≥${FIRST_TIER_PROBE_INTERVAL_MS / 60000} 分鐘）`);
+        this.init();
+    }
+
     // 25 秒硬逾時包裝：輸掉 race 的原始 promise 掛 no-op catch，避免它稍後
     // reject 時炸出 unhandledRejection。逾時錯誤帶 status=503，讓既有的
     // isServerError / 風暴偵測路徑自然接手。
+    // 2026-09-15 觀測（只記錄、不影響邏輯）：被本地逾時切掉的呼叫後來到底有沒有回應、
+    // 花多久、成功或失敗——用來判斷 25s 門檻是否切掉「慢但會成功」的呼叫（多日統計時
+    // 無法判斷，因為輸掉 race 的結果從未被記錄）。
     async generateContentWithTimeout(payload) {
         let timer;
+        const label = `${this.currentKeyName}/${this.modelName}`;
+        const startedAt = Date.now();
         const inflight = this.model.generateContent(payload);
         inflight.catch(() => {});
         try {
@@ -245,6 +263,10 @@ class AIManager {
                 inflight,
                 new Promise((_resolve, reject) => {
                     timer = setTimeout(() => {
+                        inflight.then(
+                            () => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應成功（已被 ${AI_CALL_TIMEOUT_MS / 1000}s 逾時捨棄）`),
+                            (lateErr) => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應失敗（${(lateErr && lateErr.status) || 'unknown'}）`),
+                        );
                         const err = new Error(`[AI] generateContent 本地硬逾時 ${AI_CALL_TIMEOUT_MS / 1000}s（視同暫時性 5xx）`);
                         err.status = 503;
                         reject(err);
@@ -259,6 +281,8 @@ class AIManager {
     async generateContent(payload) {
         // 迴圈有界：日配額死亡矩陣單調成長（≤ keys×tiers 個組合）、分鐘級/5xx 退避
         // 各限重試 1 次（per-call 旗標）、一般失敗要嘛升級（≤ 層數次）要嘛 throw。
+        // 回探（2026-09-15）：maybeStartFirstTierProbe 只在 solveCaptcha（本方法唯一呼叫點）
+        // 觸發，且回探中任何錯誤都先中止回探再 continue，因此每次呼叫最多多一輪。
         let minuteRetried = false;
         let serverRetried = false;
         for (;;) {
@@ -268,7 +292,10 @@ class AIManager {
             }
             try {
                 const result = await this.generateContentWithTimeout(payload);
-                this.ladder.recordSuccess(); // 連續失敗語義：任何成功都重置當前層失敗計數
+                // 連續失敗語義：任何成功都重置當前層失敗計數；回探中的成功＝留在第一層
+                if (this.ladder.recordSuccess()) {
+                    console.log(`✅ [AI] 回探成功，留在第一層 → ${this.currentKeyName}/${this.modelName}`);
+                }
                 return result;
             } catch (e) {
                 // 出口地區不支援是基礎設施錯誤：切模型、切 key 都仍走同一出口，
@@ -278,6 +305,17 @@ class AIManager {
                 }
 
                 const quota = classifyQuotaError(e);
+
+                // 回探第一層失敗（2026-09-15）：不論 5xx、逾時或 429，一律立即回到回探前的較高層
+                // 重試本張，不計入任何門檻；26B 回的是 PerDay 429 就順便標死，之後不再回探它。
+                if (this.ladder.isProbing) {
+                    const probeCombo = `${this.currentKeyName}/${this.modelName}`;
+                    const markDead = quota.isQuotaError && quota.quotaWindow === QUOTA_PER_DAY;
+                    this.ladder.abortFirstTierProbe(Date.now(), { markDead });
+                    console.log(`↩️  [AI] 回探失敗 @ ${probeCombo}（${markDead ? '日配額耗盡，已標死' : '仍不穩'}），回到原層 → ${this.currentKeyName}/${this.modelName}`);
+                    this.init();
+                    continue;
+                }
 
                 // 日配額耗盡（quotaId 含 PerDay）→ 該 (key, model) 本輪標死、立即跳選。
                 // RetryInfo.retryDelay 對日配額無意義，絕不退避重試。
@@ -559,9 +597,6 @@ async function solveCaptcha(page) {
     await geminiLimiter.wait(); 
     stats.captchaAttempts++;
     
-    // 標籤必印「本次實際呼叫的模型/key」（讀 aiManager 即時狀態），不可印基礎常數
-    // MODEL_NAME——v1 曾印基礎模型、實際打升級後模型，實戰除錯被誤導。
-    console.log(`    [AI] Solving CAPTCHA (${aiManager.modelName} @ ${aiManager.currentKeyName})...`);
     try {
         const captchaEl = await page.$('#pickimg');
         if (!captchaEl) throw new Error('CAPTCHA image not found');
@@ -577,6 +612,12 @@ async function solveCaptcha(page) {
         // Minimal prompt since systemInstruction handles the constraints
         const prompt = "Characters in image:";
         
+        // 回探第一層必須在截圖成功之後、印標籤之前決定（2026-09-15）：截圖失敗就不會開始
+        // 回探（避免回探狀態殘留到下一張驗證碼）；標籤才會是本張實際使用的模型/key。
+        aiManager.maybeProbeFirstTier();
+        // 標籤必印「本次實際呼叫的模型/key」（讀 aiManager 即時狀態），不可印基礎常數
+        // MODEL_NAME——v1 曾印基礎模型、實際打升級後模型，實戰除錯被誤導。
+        console.log(`    [AI] Solving CAPTCHA (${aiManager.modelName} @ ${aiManager.currentKeyName})...`);
         const result = await aiManager.generateContent([
             prompt,
             { inlineData: { data: imageBuffer, mimeType: "image/jpeg" } }
@@ -599,6 +640,12 @@ async function solveCaptcha(page) {
         return text;
     } catch (e) {
         console.error('    [AI] Error:', e.message);
+        // 防禦（2026-09-15）：回探中卻走到這裡（目前只剩地區不支援的 fatal 會帶著回探拋出）
+        // → 先結束回探，不讓回探狀態殘留。
+        if (aiManager.ladder.isProbing) {
+            aiManager.ladder.abortFirstTierProbe(Date.now());
+            aiManager.init();
+        }
         // 這兩種錯誤在同一個 runner/process 內重試沒有意義；往下吞成 null 只會讓
         // 每站跑滿 10 次並洗出數百行假「配額耗盡」。交給外層以正確根因快速失敗。
         if (isUnsupportedLocationError(e) || aiManager.ladder.isCurrentComboDead()) {
@@ -914,7 +961,9 @@ async function processStation(page, deptId, station) {
                 await sleep(1000);
             }
 
-            // 2. 驗證碼辨識（90s 牆鐘上限：5xx 風暴下單次 solve 最壞 ~57s，
+            // 2. 驗證碼辨識（90s 牆鐘上限：5xx 風暴下單次 solve 最壞 ~57s；遇到回探第一層那張
+            // （每 5 分鐘最多一次）最壞約 80–85s＝26B 逾時 25s＋原層逾時 25s＋退避＋再逾時，
+            // 遇分鐘級 429 再加 20s；期限只在每次嘗試之間檢查，單次嘗試可能略超 90s。
             // 5 次迴圈可鏈到 4-5 分鐘；超時就放棄本 attempt 走 Full Nav 重來，
             // 也避免頁面 session 在乾等中過期）
             let code = null;

@@ -433,3 +433,32 @@ test('crawler 支援同 run 站點續爬：完成站記錄檔＋跳站，wrapper
     assert.equal(prefixCount, 0, 'readonly 變數前綴賦值會讓子程序收不到值');
     assert.match(wrapper, /^export COMPLETED_STATIONS_FILE$/m);
 });
+
+test('crawler 整合回探第一層：印模型標籤前先決定回探，回探失敗優先於 PerDay／5xx 分支、不計入門檻', () => {
+    const source = fs.readFileSync(crawlerPath, 'utf8');
+
+    const solve = source.slice(source.indexOf('async function solveCaptcha('), source.indexOf('async function doSubmit('));
+    const shot = solve.indexOf('captchaEl.screenshot(');
+    const probeCall = solve.indexOf('aiManager.maybeProbeFirstTier();');
+    const label = solve.indexOf('[AI] Solving CAPTCHA');
+    const aiCall = solve.indexOf('aiManager.generateContent(');
+    assert.ok(shot > -1 && probeCall > -1 && label > -1 && aiCall > -1);
+    assert.ok(shot < probeCall && probeCall < label && label < aiCall, '回探必須在截圖成功後、印標籤前決定（截圖失敗不得開始回探）');
+    const catchBlock = solve.slice(solve.indexOf('} catch (e) {'));
+    assert.match(catchBlock, /if \(aiManager\.ladder\.isProbing\) \{\s*aiManager\.ladder\.abortFirstTierProbe\(Date\.now\(\)\);/, '防禦：回探中走到 catch 必須先結束回探');
+
+    const gen = source.slice(source.indexOf('    async generateContent(payload) {'));
+    const probeBranch = gen.indexOf('if (this.ladder.isProbing) {');
+    const perDayBranch = gen.indexOf('quota.quotaWindow === QUOTA_PER_DAY) {');
+    const stormBranch = gen.indexOf('if (isServerError(e)) {');
+    assert.ok(probeBranch > -1 && perDayBranch > -1 && stormBranch > -1);
+    assert.ok(probeBranch < perDayBranch && probeBranch < stormBranch, '回探失敗必須先於 PerDay／5xx 分支處理');
+    assert.match(source, /abortFirstTierProbe\(Date\.now\(\), \{ markDead \}\)/);
+    assert.match(source, /if \(this\.ladder\.recordSuccess\(\)\) \{/);
+    // 新 log 皆帶「→ KEY/MODEL」，與多日統計的解析規則相容
+    assert.match(source, /回探第一層 → \$\{this\.currentKeyName\}\/\$\{this\.modelName\}/);
+    assert.match(source, /回到原層 → \$\{this\.currentKeyName\}\/\$\{this\.modelName\}/);
+    // 25s 逾時觀測只記錄、不改邏輯
+    assert.match(source, /逾時後觀測 @ \$\{label\}/);
+    assert.match(source, /回探失敗 @ \$\{probeCombo\}/);
+});
