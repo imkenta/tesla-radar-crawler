@@ -117,8 +117,15 @@ const SOURCES = [
   {
     // 台中無結構化開放資料，來源是官方 PDF（文字型，非掃描，見 lib/speed-camera-parser.cjs
     // parseTaichung 與 docs/speed-camera-sources.md）。已含座標，不需 geocode。
+    //
+    // ⚠️ 2026-09-16 修：PDF 檔名含上傳時戳（`downlod/<yyyymmddhhmmssN>.pdf`），官方 7/28 改版
+    // 重新上傳後舊檔名的 filedownload 回應變成**壞掉的 chunked body**（curl 報
+    // `chunk hex-length char not a hex digit`、Node undici 報 `terminated`，非 404 非逾時），
+    // 於是 taichung 從 7/28 起每週靜默抓取失敗、庫存卡在 7/27（發現時已 51 天）。
+    // ⇒ 改成每輪先從公告頁解析當前檔名（resolveUrl），url 僅作為解析失敗時的保底。
     name: 'taichung',
-    url: 'https://www.police.taichung.gov.tw/filedownload?file=downlod/202605151635480.pdf&filedisplay=%E8%87%BA%E4%B8%AD%E5%B8%82%E6%94%BF%E5%BA%9C%E8%AD%A6%E5%AF%9F%E5%B1%80%E5%9F%B7%E8%A1%8C%E5%9B%BA%E5%AE%9A%E5%BC%8F%E7%A7%91%E5%AD%B8%E5%84%80%E5%99%A8%E5%9F%B7%E6%B3%95%E8%A8%AD%E5%82%99%E5%8F%96%E7%B7%A0%E5%9C%B0%E9%BB%9E%E4%B8%80%E8%A6%BD%E8%A1%A83.pdf&flag=doc',
+    url: 'https://www.police.taichung.gov.tw/filedownload?file=downlod/202607281817151.pdf&filedisplay=%E8%87%BA%E4%B8%AD%E5%B8%82%E6%94%BF%E5%BA%9C%E8%AD%A6%E5%AF%9F%E5%B1%80%E5%9F%B7%E8%A1%8C%E5%9B%BA%E5%AE%9A%E5%BC%8F%E7%A7%91%E5%AD%B8%E5%84%80%E5%99%A8%E5%9F%B7%E6%B3%95%E8%A8%AD%E5%82%99%E5%8F%96%E7%B7%A0%E5%9C%B0%E9%BB%9E%E4%B8%80%E8%A6%BD%E8%A1%A8-.pdf&flag=doc',
+    resolveUrl: resolveTaichungFixedPdfUrl,
     parse: parseTaichung,
     fallbackUrls: [],
   },
@@ -164,6 +171,16 @@ const MAX_TOTAL_ATTEMPTS = FETCH_MAX_ATTEMPTS + FALLBACK_MAX_ATTEMPTS * 3; // �
 
 // 來源新鮮度黃燈門檻（天）：抓取全敗時，庫存資料在此天數內視為可容忍，不計入失敗。
 const STALE_OK_DAYS = Number(process.env.SPEEDCAM_STALE_OK_DAYS) || 60;
+
+// 筆數暴跌防護：本輪解析筆數低於 DB 既有筆數的此比例時，判定為來源改版／解析失效，
+// 直接讓該 source 失敗（不 upsert、不清 stale）。2026-09-16 台中實證：官方 PDF 改版後
+// 舊 parser 只解析出 4 筆（原 229），若照常寫入會 upsert 4 筆再把其餘 225 筆當 stale 刪掉，
+// 而且摘要還是「成功」——靜默刪掉整個城市的固定式測速桿。
+const ROW_COLLAPSE_MIN_RATIO = Number(process.env.SPEEDCAM_ROW_COLLAPSE_MIN_RATIO) || 0.5;
+
+// 台中固定式 PDF 的官方公告頁（檔名含上傳時戳，改版就換檔名 ⇒ 不能寫死）。
+const TAICHUNG_ORIGIN = 'https://www.police.taichung.gov.tw';
+const TAICHUNG_NOTICE_URL = `${TAICHUNG_ORIGIN}/traffic/home.jsp?id=55&parentpath=0,5,53&mcustomize=multimessages_view.jsp&dataserno=202207040001&t=Download&mserno=201801260055`;
 
 function logClassificationCounts(sourceName, records) {
   const counts = { confirmed: 0, rejected: 0, unknown: 0 };
@@ -248,12 +265,55 @@ async function fetchWithRetry(url, logLabel, maxAttempts, retryDelaysMs) {
  * @param {object} source SOURCES 內的一筆
  * @returns {Promise<{ buffer: Buffer, parse: Function }>}
  */
+/**
+ * 從台中警局公告頁解析出「固定式科學儀器執法設備取締地點一覽表」當前的 PDF 連結。
+ * 公告頁同時掛著公告、區間測速、科技執法、移動式等多份 PDF，以 filedisplay（URL-encoded
+ * 中文檔名）挑出含「固定式」且含「一覽表」的那一份，排除移動式／區間／科技執法。
+ * 解析不到就讓呼叫端 fallback 回寫死的 url（保底，至少還是 7/28 版）。
+ * @returns {Promise<string>} 絕對 URL
+ */
+async function resolveTaichungFixedPdfUrl() {
+  const buffer = await fetchWithRetry(TAICHUNG_NOTICE_URL, 'taichung 公告頁', 2, FETCH_RETRY_DELAYS_MS);
+  const html = buffer.toString('utf8');
+  const links = html.match(/\/?filedownload\?file=[^"'<>\s]+/g) || [];
+  for (const link of links) {
+    const displayMatch = /filedisplay=([^&]*)/.exec(link);
+    let display = displayMatch ? displayMatch[1] : '';
+    try {
+      display = decodeURIComponent(display);
+    } catch {
+      // filedisplay 偶有非法百分比編碼，維持原字串比對即可。
+    }
+    if (!display.includes('固定式') || !display.includes('一覽表')) continue;
+    if (display.includes('移動式') || display.includes('區間')) continue;
+    return link.startsWith('/') ? `${TAICHUNG_ORIGIN}${link}` : `${TAICHUNG_ORIGIN}/${link}`;
+  }
+  throw new Error('公告頁找不到「固定式…一覽表」PDF 連結');
+}
+
 async function fetchSourceBuffer(source) {
   let totalAttempts = 0;
   const primaryAttempts = Math.min(FETCH_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS);
 
+  // 來源若提供 resolveUrl（檔名會隨官方改版而變），每輪先解析當前連結；
+  // 解析失敗不致命，退回寫死的 source.url。
+  let primaryUrl = source.url;
+  if (typeof source.resolveUrl === 'function') {
+    try {
+      primaryUrl = await source.resolveUrl();
+      if (primaryUrl !== source.url) {
+        console.error(`[speed-camera-sync] ${source.name} 公告頁解析到當前檔案：${primaryUrl.slice(0, 120)}`);
+      }
+    } catch (resolveErr) {
+      console.error(
+        `[speed-camera-sync] ${source.name} 公告頁解析失敗（改用內建 URL）：${resolveErr.message}`
+      );
+      primaryUrl = source.url;
+    }
+  }
+
   try {
-    const buffer = await fetchWithRetry(source.url, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS);
+    const buffer = await fetchWithRetry(primaryUrl, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS);
     return { buffer, parse: source.parse };
   } catch (err) {
     totalAttempts += primaryAttempts;
@@ -289,6 +349,41 @@ async function fetchSourceBuffer(source) {
  * @param {string} sourceName
  * @returns {Promise<number|null>}
  */
+/**
+ * 查詢某 source 在 DB 現有的列數（供筆數暴跌防護比對）。查詢失敗回傳 null（fail-open，
+ * 不因為統計查不到就擋掉正常寫入）。
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @param {string} sourceName
+ * @returns {Promise<number|null>}
+ */
+/**
+ * 讀上一輪 speed-camera 同步在 sync_logs 留下的黃燈來源名單（`YELLOW <source>:` 行）。
+ * 查不到或解析不出就回空陣列（fail-open：寧可少判一次連續黃燈，也不要因為查詢失敗
+ * 就把正常來源判成失敗）。
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase
+ * @returns {Promise<string[]>}
+ */
+async function getPreviousYellowSources(supabase) {
+  const { data, error } = await supabase
+    .from('sync_logs')
+    .select('error_summary')
+    .like('run_id', 'speed_camera_sync_%')
+    .order('start_time', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data || !data.error_summary) return [];
+  return [...String(data.error_summary).matchAll(/^YELLOW (\S+):/gm)].map((m) => m[1]);
+}
+
+async function getRowCountForSource(supabase, sourceName) {
+  const { count, error } = await supabase
+    .from('speed_cameras')
+    .select('id', { count: 'exact', head: true })
+    .eq('source', sourceName);
+  if (error || typeof count !== 'number') return null;
+  return count;
+}
+
 async function getStaleDaysForSource(supabase, sourceName) {
   const { data, error } = await supabase
     .from('speed_cameras')
@@ -387,6 +482,10 @@ async function writeAll(supabase, opts = {}) {
   // 共用同一個 geocoder 實例：Nominatim 1 req/s 節流是跨 source 全域的，
   // 不是每個 source 各自 1 req/s（避免多個需要 geocode 的來源疊加超過節流限制）。
   const geocoder = opts.geocoder || createGeocoder();
+  // 連續兩輪黃燈＝紅燈（使用者裁決 2026-09-16）：單輪抓取失敗但庫存新鮮可以容忍，
+  // 但連兩輪抓不到代表來源真的壞了，不能再靜悄悄放行。上一輪黃燈名單由呼叫端從
+  // sync_logs 取得（見 getPreviousYellowSources），測試可直接注入。
+  const previousYellowSources = new Set(opts.previousYellowSources || []);
   // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析（含台南 geocode
   // 補值後）的座標點位，見 SOURCES 內 national-npa 項與 dedupeAgainstExisting 說明。
   const collectedPoints = [];
@@ -445,6 +544,16 @@ async function writeAll(supabase, opts = {}) {
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);
 
+      // 筆數暴跌防護：來源改版／解析失效時，upsert 少少幾筆再清 stale ＝ 靜默刪光該來源。
+      // 寧可整個 source 失敗（會走黃燈或紅燈判定），也不要讓資料庫被削掉。
+      const existingCount = await getRowCountForSource(supabase, source.name);
+      if (existingCount !== null && existingCount > 0 && payloads.length < existingCount * ROW_COLLAPSE_MIN_RATIO) {
+        throw new Error(
+          `解析筆數暴跌：本輪 ${payloads.length} 筆 < 既有 ${existingCount} 筆 × ` +
+            `${ROW_COLLAPSE_MIN_RATIO}（疑似來源改版或 parser 失效），中止寫入以免誤刪`
+        );
+      }
+
       if (payloads.length > 0) {
         const { error: upsertError } = await supabase
           .from('speed_cameras')
@@ -474,12 +583,21 @@ async function writeAll(supabase, opts = {}) {
       // 來源新鮮度黃燈：抓取全敗時查 DB 庫存新鮮度，仍新鮮則不計入失敗。
       const staleDays = await getStaleDaysForSource(supabase, source.name);
       if (staleDays !== null && staleDays <= STALE_OK_DAYS) {
-        result.ok = true;
-        result.stale = true;
-        result.staleDays = staleDays;
-        console.error(
-          `[speed-camera-sync] ⚠️ ${source.name} 抓取失敗但庫存資料仍新鮮（${staleDays.toFixed(1)} 天前），視為可容忍`
-        );
+        if (previousYellowSources.has(source.name)) {
+          // 上一輪已經黃燈過 ⇒ 連續第 2 次，改判紅燈。staleDays 仍記錄供 log 判讀。
+          result.staleDays = staleDays;
+          result.error = `連續第 2 次黃燈（上一輪也抓取失敗，庫存 ${staleDays.toFixed(1)} 天前）：${err.message}`;
+          console.error(
+            `[speed-camera-sync] ❌ ${source.name} 連續第 2 次抓取失敗（庫存 ${staleDays.toFixed(1)} 天前）⇒ 不再容忍，計入失敗`
+          );
+        } else {
+          result.ok = true;
+          result.stale = true;
+          result.staleDays = staleDays;
+          console.error(
+            `[speed-camera-sync] ⚠️ ${source.name} 抓取失敗但庫存資料仍新鮮（${staleDays.toFixed(1)} 天前），視為可容忍`
+          );
+        }
       }
     }
     sourceResults.push(result);
@@ -502,11 +620,14 @@ async function writeSyncLog(supabase, summary, startTime) {
   const totalWritten = summary.sourceResults.reduce((sum, r) => sum + r.written, 0);
   const successCount = summary.sourceResults.filter((r) => r.ok).length;
   const failedCount = summary.sourceResults.filter((r) => !r.ok).length;
-  const errorSummary = summary.sourceResults
-    .filter((r) => !r.ok)
-    .map((r) => `${r.name}: ${r.error}`)
-    .join('\n')
-    .substring(0, 2000);
+  const failureLines = summary.sourceResults.filter((r) => !r.ok).map((r) => `${r.name}: ${r.error}`);
+  // 黃燈也必須留痕：下一輪靠這幾行判斷「同一個 source 是不是連續第 2 次黃燈」。
+  // 格式固定為 `YELLOW <source>: <天數>天前`，由 getPreviousYellowSources 反解析。
+  // （2026-09-16 前黃燈完全不進 sync_logs，台中連黃 8 週、log 仍寫「全部成功」。）
+  const yellowLines = summary.sourceResults
+    .filter((r) => r.ok && r.stale)
+    .map((r) => `YELLOW ${r.name}: ${r.staleDays == null ? '?' : r.staleDays.toFixed(1)}天前`);
+  const errorSummary = [...failureLines, ...yellowLines].join('\n').substring(0, 2000);
 
   const { error } = await supabase.from('sync_logs').upsert(
     {
@@ -539,7 +660,14 @@ async function runWriteMode() {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
   const startTime = new Date();
 
-  const summary = await writeAll(supabase);
+  const previousYellowSources = await getPreviousYellowSources(supabase);
+  if (previousYellowSources.length > 0) {
+    console.error(
+      `[speed-camera-sync] 上一輪黃燈來源：${previousYellowSources.join('、')}（本輪若再黃燈即判失敗）`
+    );
+  }
+
+  const summary = await writeAll(supabase, { previousYellowSources });
   await writeSyncLog(supabase, summary, startTime);
 
   const okSources = summary.sourceResults.filter((r) => r.ok && !r.stale);
@@ -604,5 +732,8 @@ module.exports = {
   SOURCES,
   sleep: realSleep,
   getExistingCoordsForSource,
+  getPreviousYellowSources,
+  resolveTaichungFixedPdfUrl,
   GEOCODE_MAX_CALLS_PER_RUN,
+  ROW_COLLAPSE_MIN_RATIO,
 };

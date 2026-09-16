@@ -54,22 +54,39 @@
 
 ### 台中市 —— 查無結構化開放資料，PDF spike（R8）判定文字型、已實作（source=`taichung`）
 - 台中市政府資料開放平台（opendata.taichung.gov.tw）搜尋「科技執法」「固定式測速照相」查無對應資料集，確認仍只有 PDF。
-- 資料集：`臺中市政府警察局「固定式科學儀器執法設備」取締地點一覽表(115年3月10日)`
+- 資料集：`臺中市政府警察局「固定式科學儀器執法設備」取締地點一覽表`（目前版次 **115年7月24日**，224 筆）
 - 官方來源頁面（表單下載）：
   `https://www.police.taichung.gov.tw/traffic/home.jsp?id=55&parentpath=0,5,53`
-- 下載連結（PDF，2026-07-05 實測下載驗證，845835 bytes，14 頁）：
-  `https://www.police.taichung.gov.tw/filedownload?file=downlod/202605151635480.pdf&filedisplay=...&flag=doc`
-  （filedisplay 為 URL-encoded 中文檔名，見 `speed-camera-sync.cjs` SOURCES 內完整字串；下載連結非 session-based，重複下載 md5 一致，可穩定排程抓取。）
+- 🔴 **2026-09-16 修正：下載連結不可寫死**（發現時資料已 51 天沒更新）
+  - 檔名含上傳時戳（`downlod/<yyyymmddhhmmssN>.pdf`）。官方 **2026-07-28 重新上傳**（公告頁 `dataserno=202207040001`，標題日期 115-07-28）後，舊檔名 `202605151635480.pdf` 的 `filedownload` **不是回 404，而是回一個壞掉的 chunked body**——curl 報 `chunk hex-length char not a hex digit: 0xd`、Node undici 報 `terminated`，且 http1.1／http2／換 UA／加 Referer 全都一樣（~0.08s、size=0）⇒ 不是反爬也不是逾時。
+  - 我們最後一次成功抓取是 7/27，官方 7/28 換檔 ⇒ 之後每週三次重試全敗、被黃燈容忍靜默放行 8 週。
+  - ✅ 修法：每輪先從**公告頁**解析當前檔名（`resolveTaichungFixedPdfUrl`，`speed-camera-sync.cjs`）。挑選規則＝`filedisplay`（URL-decoded 中文檔名）同時含「固定式」與「一覽表」，排除「移動式」「區間」（同一頁還掛著公告、區間平均測速、科技執法、移動式等多份 PDF）。解析失敗才退回 SOURCES 內寫死的 URL（保底）。
+- 下載連結（目前版次，2026-09-16 實測 885654 bytes、14 頁、224 筆）：
+  `https://www.police.taichung.gov.tw/filedownload?file=downlod/202607281817151.pdf&filedisplay=...&flag=doc`
+  （filedisplay 為 URL-encoded 中文檔名，見 `speed-camera-sync.cjs` SOURCES 內完整字串；下載連結非 session-based，可穩定重複下載。）
 - **PDF spike 判定過程與證據**：
   1. `pdftotext -layout`（poppler）與 Node `pdf-parse`（`PDFParse.getText()`）兩種獨立工具分別抽取，皆取得**與視覺呈現一致的完整文字層**（非空白、非亂碼），確認為**文字型 PDF，非掃描影像**——若為掃描型，這兩種工具皆只能拿到空字串或需要 OCR。
   2. 全 14 頁、229 筆記錄逐筆比對：每筆的「編號」連續遞增 1~229（`sequential? True`）、每筆座標皆落在台中市地理範圍（緯度 23.5-24.6、經度 120.4-121.0，零筆超出）、`(行政區+設置地點, 拍攝方向)` 組合零重複，確認表格結構規律可靠，不是排版混亂的自由格式文字。
   3. 判定：**文字型且表格結構可靠 → 依規格實作 parser**（未使用 OCR）。
-- **版面解析規則**（`parseTaichung`，`lib/speed-camera-parser.cjs`）：每筆紀錄的欄位跨 2 行（少數因備註/取締項目換行變 3-4 行）：
-  ```
-  <編號> <行政區> <設置地點>[ (備註，如往XX方向) ]
-  <取締項目（可能再換行）> <座標緯度> <座標經度> <拍攝方向> <速限> <管轄單位>[ ※]
-  ```
-  以「行首為『數字 + 空白 + X區 + 空白』」判斷新紀錄起點；座標列尾端固定為「緯度 經度 方向 速限 XX分局」正則比對（容許尾端多印一個 `※` 註記符號，無額外語意，忽略）。
+- **版面解析規則**（`parseTaichung`，`lib/speed-camera-parser.cjs`）：**兩種版面都要支援**，座標列格式兩版相同。
+  - 舊版（115年3月10日）：
+    ```
+    <編號> <行政區> <設置地點>[ (備註，如往XX方向) ]
+    <取締項目（可能再換行）> <座標緯度> <座標經度> <拍攝方向> <速限> <管轄單位>[ ※]
+    ```
+  - 新版（115年7月24日起）：**行政區變更時**，編號與行政區各自獨立成行；行政區未變的列則是「編號 行政區黏著設置地點」（區名與路名之間**沒有空白**）：
+    ```
+    1
+    中區
+    中區建國路與民權路口 闖紅燈、不依標誌、標線、
+    號誌指示行駛 24.13584 120.68225 西往東 50 第一分局
+    2 中區三民路三段與公園路口 闖紅燈、不依標誌、標線、
+    號誌指示行駛、超速 24.14563 120.68389 北往南 50 第一分局
+    ```
+  - 起點判斷：先比舊版「數字＋空白＋X區＋空白」；再比「純數字行」（下一行為純行政區行）；最後比「數字＋空白＋其餘」。後兩者以**編號必須等於上一筆＋1** 守門，避免續行裡的數字被誤判成新紀錄。座標列尾端固定為「緯度 經度 方向 速限 XX分局」（容許尾端多印一個 `※`，無語意，忽略）。
+- 🔴 **這條的真正教訓：只改 URL 會刪掉資料**。新版面丟給舊 parser 只解析得出 **4／224 筆**，而 `writeAll` 成功後會把同 source 其餘列當 stale 刪除 ⇒ 會靜默刪掉 ~225 支台中固定式測速桿，而且摘要仍顯示「成功」。因此同批加了兩道防護：
+  - **筆數暴跌防護**（`ROW_COLLAPSE_MIN_RATIO`，預設 0.5）：本輪解析筆數 < DB 既有列數 × 0.5 ⇒ 該 source 直接判失敗，不 upsert、不清 stale。
+  - **連續黃燈即紅燈**：黃燈（抓取失敗但庫存新鮮）會寫進 `sync_logs.error_summary` 的 `YELLOW <source>: <天數>天前` 行，下一輪讀回來；同一 source 連續第 2 次黃燈改判失敗（exit≠0、macOS 通知），不再連黃 8 週沒人知道。
 - **新增依賴**：`pdf-parse@2.4.5`（已加入 `package.json`/`package-lock.json`）。其 2.x 版 API 為 `PDFParse` class + `getText()`（非 1.x 的函式呼叫），文字抽取為非同步 API，`parseTaichung` 因此為 `async function`（`speed-camera-sync.cjs` 呼叫端已改為 `await parse(...)`，其餘同步 parser 不受影響）。
 - 座標已含在來源資料中（「座標緯度/座標經度」欄位），**不需要 geocode**。
 - 「取締項目」欄位混合「闖紅燈」「不依標誌、標線、號誌指示行駛」「超速」等多種類型（同新北市/台南模式，保留原始資料不篩選）。

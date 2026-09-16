@@ -521,6 +521,28 @@ test('parseTaichung：文字型 PDF（非掃描），跨頁抽取、備註換行
   });
 });
 
+test('parseTaichung：官方 115年7月24日 改版版面（編號／行政區各自獨立成行）解析結果與舊版面完全一致', async () => {
+  // 2026-07-28 官方重新上傳，版面從「編號 行政區 設置地點」同一行，改成行政區變更時
+  // 「編號」與「行政區」各自獨立成行、其餘列區名與路名黏在一起（`2 中區三民路三段…`）。
+  // 舊 parser 對新版面只解析得出 4/224 筆（實測），而 writeAll 成功後會把其餘列當 stale
+  // 清掉 ⇒ 等於靜默刪掉整個台中固定式測速。此測試釘死「兩種版面都要吃得下」。
+  //
+  // 兩個 fixture 都是官方 PDF 的前 2 頁節錄、同樣涵蓋 31 筆（含備註換行「(往XX方向)」
+  // 與跨頁銜接），且這 31 筆在兩版之間內容未變 ⇒ 直接比對「新版面解析結果 === 舊版面解析結果」，
+  // 比逐欄硬編值更能證明版面差異沒有造成任何欄位錯位。
+  const legacy = await parseTaichung(fixtureBuffer('speed-camera-taichung.pdf'), FIXED_NOW);
+  const current = await parseTaichung(fixtureBuffer('speed-camera-taichung-115-07.pdf'), FIXED_NOW);
+
+  assert.equal(current.length, 31);
+  assert.deepEqual(current.map(legacyShape), legacy.map(legacyShape));
+
+  // 行政區獨立成行的那幾筆（每次換區的第一筆）最容易錯位，單獨釘住第 1 筆與換區後的第 3 筆。
+  assert.equal(current[0].address, '中區 中區建國路與民權路口');
+  assert.equal(current[2].address, '西區 西區臺灣大道二段與忠明路口');
+  // 備註換行仍併入 address/road
+  assert.equal(current[14].address, '北區 北區三民路三段與崇德路一段路口 (往五權路方向)');
+});
+
 test('parseNationalNpa：只跳過無效座標說明列，縣市與國道路段分類全部保留（golden）', () => {
   // fixture 節錄自 data.gov.tw/dataset/7320「測速執法設置點」真實下載（2026-07-05，
   // 見 docs/speed-camera-sources.md）：金門縣x2、宜蘭縣、臺北市（六都，parser 層保留，

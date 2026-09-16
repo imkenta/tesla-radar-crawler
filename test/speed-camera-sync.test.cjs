@@ -103,7 +103,14 @@ function fakeGeocoder(resultsByAddress = {}) {
  *   .from('speed_cameras').select('address, direction, lat, lng').eq('source', name).not(...).not(...)
  *   （鏈末端無 .maybeSingle()，直接 await 整個 chain，故 chain 需可 thenable。）
  */
-function makeFakeSupabase({ upsertImpl, deleteImpl, selectImpl, existingCoordsImpl } = {}) {
+function makeFakeSupabase({
+  upsertImpl,
+  deleteImpl,
+  selectImpl,
+  existingCoordsImpl,
+  rowCountImpl,
+  syncLogImpl,
+} = {}) {
   const calls = { upsert: [], delete: [], select: [] };
 
   function from(table) {
@@ -133,12 +140,19 @@ function makeFakeSupabase({ upsertImpl, deleteImpl, selectImpl, existingCoordsIm
         };
         return chain;
       },
-      select(cols) {
+      select(cols, opts) {
         const chain = {
           _eq: {},
+          _like: {},
           _notCount: 0,
+          _opts: opts || {},
           eq(col, val) {
             chain._eq[col] = val;
+            return chain;
+          },
+          // getPreviousYellowSources 用 .like('run_id', 'speed_camera_sync_%') 撈上一輪同步紀錄。
+          like(col, val) {
+            chain._like[col] = val;
             return chain;
           },
           order() {
@@ -148,7 +162,11 @@ function makeFakeSupabase({ upsertImpl, deleteImpl, selectImpl, existingCoordsIm
             return chain;
           },
           maybeSingle() {
-            calls.select.push({ table, cols, eq: chain._eq });
+            calls.select.push({ table, cols, eq: chain._eq, like: chain._like });
+            if (table === 'sync_logs') {
+              const impl = syncLogImpl && syncLogImpl(chain._like);
+              return Promise.resolve(impl || { data: null, error: null });
+            }
             const impl = selectImpl && selectImpl(table, chain._eq);
             return Promise.resolve(impl || { data: null, error: null });
           },
@@ -158,8 +176,16 @@ function makeFakeSupabase({ upsertImpl, deleteImpl, selectImpl, existingCoordsIm
           },
           // getExistingCoordsForSource 不呼叫 .maybeSingle()，直接 await chain 本身，
           // 故 chain 需實作 thenable（PromiseLike）介面。
+          // getRowCountForSource 走 .select('id', { count: 'exact', head: true }).eq(...) 亦同，
+          // 但要回 { count } 而非 { data }。
           then(resolve, reject) {
-            calls.select.push({ table, cols, eq: chain._eq, not: chain._notCount });
+            calls.select.push({ table, cols, eq: chain._eq, not: chain._notCount, opts: chain._opts });
+            if (chain._opts.count) {
+              const count = rowCountImpl ? rowCountImpl(chain._eq.source) : null;
+              return Promise.resolve(
+                typeof count === 'number' ? { count, error: null } : { count: null, error: null }
+              ).then(resolve, reject);
+            }
             const impl = existingCoordsImpl && existingCoordsImpl(chain._eq.source);
             return Promise.resolve(impl || { data: [], error: null }).then(resolve, reject);
           },
@@ -767,4 +793,146 @@ test('writeAll：非 needsGeocode 的 source（如高雄）不會呼叫 getExist
   const kaohsiungResult = summary.sourceResults.find((r) => r.name === 'kaohsiung');
   assert.equal(kaohsiungResult.ok, true);
   assert.equal(geocodeCalls.length, 0);
+});
+
+// --- 筆數暴跌防護 / 連續黃燈 / 台中公告頁解析（2026-09-16） ---
+//
+// 背景：台中固定式 PDF 於 2026-07-28 改版換檔名，舊 URL 回應變成壞掉的 chunked body，
+// 每週靜默抓取失敗、黃燈容忍 8 週都沒人發現；而且就算把 URL 修好，舊 parser 對新版面
+// 只解析得出 4/224 筆，寫入後會把其餘 ~225 筆當 stale 刪光。以下三組測試分別釘住
+// 「不准削資料」「連兩次黃燈就報錯」「檔名自己去公告頁解析」。
+
+test('writeAll：筆數暴跌防護 — 解析筆數不到既有列數一半 → 該 source 失敗，且不 upsert、不清 stale', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchReturning({ kaohsiung: KAOHSIUNG_CSV });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // DB 既有 500 筆，本輪只解析出個位數 → 低於 500 × 0.5，必須中止寫入。
+  const { from, calls } = makeFakeSupabase({
+    rowCountImpl: (source) => (source === 'kaohsiung' ? 500 : 0),
+  });
+  const supabase = { from };
+
+  const summary = await writeAll(supabase);
+
+  const kaohsiungResult = summary.sourceResults.find((r) => r.name === 'kaohsiung');
+  assert.equal(kaohsiungResult.ok, false, '筆數暴跌必須判失敗，不能當成功');
+  assert.match(kaohsiungResult.error, /筆數暴跌/);
+  assert.equal(kaohsiungResult.written, 0);
+
+  const kaohsiungUpserts = calls.upsert.filter(
+    (c) => Array.isArray(c.payload) && c.payload.some((p) => p.source === 'kaohsiung')
+  );
+  assert.equal(kaohsiungUpserts.length, 0, '暴跌時不得 upsert');
+  const kaohsiungDeletes = calls.delete.filter((c) => c.eq && c.eq.source === 'kaohsiung');
+  assert.equal(kaohsiungDeletes.length, 0, '暴跌時更不得清 stale（這正是會刪光整個來源的那一步）');
+});
+
+test('writeAll：連續第 2 次黃燈 — 上一輪已黃燈的 source 本輪再抓取失敗 → 改判紅燈', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = allSourcesFailFetch();
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+  const { from } = makeFakeSupabase({
+    selectImpl: (table, eqCond) =>
+      table === 'speed_cameras' && eqCond.source === 'kaohsiung'
+        ? { data: { fetched_at: tenDaysAgo }, error: null }
+        : { data: null, error: null },
+  });
+  const supabase = { from };
+
+  const summary = await writeAll(supabase, { previousYellowSources: ['kaohsiung'] });
+
+  const kaohsiungResult = summary.sourceResults.find((r) => r.name === 'kaohsiung');
+  assert.equal(kaohsiungResult.ok, false, '連續第 2 次黃燈不得再容忍');
+  assert.equal(kaohsiungResult.stale, false);
+  assert.match(kaohsiungResult.error, /連續第 2 次黃燈/);
+});
+
+test('writeAll：上一輪黃燈的是別的 source → 本來源第一次黃燈仍照舊容忍', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = allSourcesFailFetch();
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+  const { from } = makeFakeSupabase({
+    selectImpl: (table, eqCond) =>
+      table === 'speed_cameras' && eqCond.source === 'kaohsiung'
+        ? { data: { fetched_at: tenDaysAgo }, error: null }
+        : { data: null, error: null },
+  });
+
+  const summary = await writeAll({ from }, { previousYellowSources: ['taichung'] });
+
+  const kaohsiungResult = summary.sourceResults.find((r) => r.name === 'kaohsiung');
+  assert.equal(kaohsiungResult.ok, true);
+  assert.equal(kaohsiungResult.stale, true);
+});
+
+test('writeSyncLog：黃燈來源寫進 error_summary 的 YELLOW 行，status 仍為 COMPLETED', async () => {
+  const { from, calls } = makeFakeSupabase();
+  const summary = {
+    batchFetchedAt: '2026-09-16T02:00:00.000Z',
+    sourceResults: [
+      { name: 'taipei', ok: true, stale: false, staleDays: null, written: 143, staleDeleted: 0, error: null },
+      { name: 'taichung', ok: true, stale: true, staleDays: 49.0, written: 0, staleDeleted: 0, error: null },
+    ],
+  };
+
+  await writeSyncLog({ from }, summary, new Date(Date.now() - 1000));
+
+  const logRow = calls.upsert.find((c) => c.table === 'sync_logs').payload;
+  assert.equal(logRow.status, 'COMPLETED', '黃燈不改變 COMPLETED 語意');
+  assert.match(logRow.error_summary, /^YELLOW taichung: 49\.0天前$/m, '黃燈必須留痕供下一輪比對');
+});
+
+test('getPreviousYellowSources：解析上一輪 sync_logs 的 YELLOW 行；查不到則回空陣列', async () => {
+  const { from } = makeFakeSupabase({
+    syncLogImpl: () => ({
+      data: {
+        error_summary: 'kaohsiung: 下載失敗 HTTP 500\nYELLOW taichung: 49.0天前\nYELLOW tainan: 3.0天前',
+      },
+      error: null,
+    }),
+  });
+  assert.deepEqual(await speedCameraSync.getPreviousYellowSources({ from }), ['taichung', 'tainan']);
+
+  const { from: emptyFrom } = makeFakeSupabase({ syncLogImpl: () => ({ data: null, error: null }) });
+  assert.deepEqual(
+    await speedCameraSync.getPreviousYellowSources({ from: emptyFrom }),
+    [],
+    'fail-open：查不到就不判連續黃燈'
+  );
+});
+
+test('resolveTaichungFixedPdfUrl：公告頁多份 PDF 中只挑「固定式…一覽表」，排除公告／移動式／區間', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const link = (file, display) =>
+    `<a href="/filedownload?file=downlod/${file}&filedisplay=${encodeURIComponent(display)}&flag=doc">下載</a>`;
+  const html = [
+    link('1.pdf', '臺中市政府警察局公告.pdf'),
+    link('2.pdf', '臺中市政府警察局執行固定式科學儀器執法設備取締地點一覽表-.pdf'),
+    link('3.pdf', '臺中市政府警察局執行移動式測速照相取締地點一覽表.pdf'),
+    link('4.pdf', '臺中市政府警察局執行科技執法區間平均測速、違規停車取締一覽表.pdf'),
+  ].join('\n');
+  const buf = Buffer.from(html, 'utf8');
+  globalThis.fetch = mock.fn(async () => ({
+    ok: true,
+    status: 200,
+    arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+  }));
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const url = await speedCameraSync.resolveTaichungFixedPdfUrl();
+  assert.match(url, /downlod\/2\.pdf/);
+  assert.ok(url.startsWith('https://www.police.taichung.gov.tw/'));
 });
