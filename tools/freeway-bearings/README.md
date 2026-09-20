@@ -1,6 +1,8 @@
 # 國道測速桿「實際道路走向」離線比對工具（C-64）
 
-**狀態（2026-09-20）：離線比對階段。這個目錄的東西沒有接進 `speed-camera-sync.cjs`，不會改到線上資料。**
+**狀態（2026-09-20）：已上線。** 這個目錄是**離線**工具，產出 `data/freeway-bearing-overrides.json`；同步流程（`speed-camera-sync.cjs`）只讀那張表（`lib/freeway-bearing-overrides.cjs`），本身不連 OSM。
+
+同步 log 出現 `⚠️ … 有國道單向桿不在方位表內` ＝官方新增了桿、改了路名或座標搬家超過 30m：那幾支會退回羅盤值（修前行為），請重跑下面的步驟更新表，並跑 `npm test`（表的健全性測試會擋住明顯算錯的結果）。
 
 ## 為什麼
 
@@ -28,7 +30,7 @@ App 對國道單向桿用它判斷「同向就報、對向就排除」（TeslaTo
   9/19 的 5 次對向誤報（北向 37K、五楊北向 38.8K、汐五南向 29.5K、南向 22.7K、汐五南向 16.1K）新方位夾角 160–170°，全部會被正確排除；
   被壓到 109m／389m／401m 才報的三支真桿新夾角 8–9°。
 
-完整逐桿表：`comparison-2026-09-20.csv`；候選改寫表：`freeway-bearing-overrides.candidate.json`。
+完整逐桿表：`comparison-2026-09-20.csv`；正式表：`data/freeway-bearing-overrides.json`（170 筆方位＋18 筆 `keep_compass`）。
 
 ## 重跑
 

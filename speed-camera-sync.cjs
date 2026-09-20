@@ -27,6 +27,7 @@
  */
 
 const fs = require('fs');
+const { applyFreewayBearingOverrides, logFreewayBearingResult } = require('./lib/freeway-bearing-overrides.cjs');
 const {
   parseTaipei,
   parseNewTaipei,
@@ -457,6 +458,15 @@ async function syncAll() {
         }
       }
 
+      {
+        // C-64：國道單向桿改用離線算好的實際道路走向（對不上的一律退回羅盤值）。
+        // 放在聯集去重之後：national-npa 裡與 freeway-npa 重疊的國道桿此時已被丟掉，
+        // 「表上找不到」的警告才會只針對真的要寫進資料庫的桿。
+        const bearingResult = applyFreewayBearingOverrides(records);
+        records = bearingResult.records;
+        logFreewayBearingResult(source.name, bearingResult);
+      }
+
       results.push(...records);
     } catch (err) {
       console.error(`[speed-camera-sync] ${source.name} 失敗：${err.message}`);
@@ -540,6 +550,15 @@ async function writeAll(supabase, opts = {}) {
             collectedPoints.push({ lat: r.lat, lng: r.lng });
           }
         }
+      }
+
+      {
+        // C-64：國道單向桿改用離線算好的實際道路走向（對不上的一律退回羅盤值）。
+        // 放在聯集去重之後：national-npa 裡與 freeway-npa 重疊的國道桿此時已被丟掉，
+        // 「表上找不到」的警告才會只針對真的要寫進資料庫的桿。
+        const bearingResult = applyFreewayBearingOverrides(records);
+        records = bearingResult.records;
+        logFreewayBearingResult(source.name, bearingResult);
       }
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);
