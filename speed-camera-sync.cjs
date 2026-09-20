@@ -240,6 +240,29 @@ async function fetchBufferOnce(url) {
  * @param {number} maxAttempts
  * @param {number[]|number} retryDelaysMs 每次重試前的等待毫秒數（陣列依索引取值，或單一數字每次相同）
  */
+/**
+ * 來源預期是 CSV／JSON／PDF，卻拿到一張網頁時，回傳可讀的說明（含網頁標題）；不是網頁回 null。
+ *
+ * 2026-09-20 實例：臺南市政府大樓停電，開放資料平台對下載網址回 `200 text/html` 的「網站服務暫停公告」，
+ * 同步只報 `Invalid Opening Quote: … "<!DOCTYPE html>"`，得人工打開網址才知道是維護公告。
+ * 本專案沒有任何來源的資料本體是 HTML（台中的公告頁解析走 resolveUrl，不經這裡），所以一律視為異常。
+ */
+function describeUnexpectedHtml(buffer) {
+  if (!buffer || buffer.length === 0) return null;
+  const head = Buffer.from(buffer.subarray(0, 4096)).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+  if (!/^(<!doctype html|<html[\s>])/i.test(head)) return null;
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(Buffer.from(buffer.subarray(0, 65536)).toString('utf8'));
+  const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+  return `來源回傳的是網頁而不是資料檔（網頁標題：「${title || '無標題'}」）——多半是維護公告、登入頁或平台改版`;
+}
+
+/** 下載成功但內容是網頁 → 直接丟錯（不重試：維護頁重抓幾次都一樣），交給鏡像或黃燈／紅燈判定。 */
+function assertNotHtml(buffer) {
+  const problem = describeUnexpectedHtml(buffer);
+  if (problem) throw new Error(problem);
+  return buffer;
+}
+
 async function fetchWithRetry(url, logLabel, maxAttempts, retryDelaysMs) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -314,7 +337,9 @@ async function fetchSourceBuffer(source) {
   }
 
   try {
-    const buffer = await fetchWithRetry(primaryUrl, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS);
+    const buffer = assertNotHtml(
+      await fetchWithRetry(primaryUrl, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS)
+    );
     return { buffer, parse: source.parse };
   } catch (err) {
     totalAttempts += primaryAttempts;
@@ -327,12 +352,12 @@ async function fetchSourceBuffer(source) {
 
       const attemptsLeft = Math.min(FALLBACK_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS - totalAttempts);
       try {
-        const buffer = await fetchWithRetry(
+        const buffer = assertNotHtml(await fetchWithRetry(
           fallback.url,
           `${source.name} 鏡像(${host})`,
           attemptsLeft,
           FALLBACK_RETRY_DELAY_MS
-        );
+        ));
         return { buffer, parse: fallback.parse || source.parse };
       } catch (fallbackErr) {
         totalAttempts += attemptsLeft;
@@ -745,6 +770,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  describeUnexpectedHtml,
   syncAll,
   writeAll,
   writeSyncLog,

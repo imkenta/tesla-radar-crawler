@@ -936,3 +936,27 @@ test('resolveTaichungFixedPdfUrl：公告頁多份 PDF 中只挑「固定式…�
   assert.match(url, /downlod\/2\.pdf/);
   assert.ok(url.startsWith('https://www.police.taichung.gov.tw/'));
 });
+
+// ── 來源回傳網頁而不是資料檔（2026-09-20 臺南市政府停電維護公告）────────────────
+
+test('describeUnexpectedHtml：維護公告頁會被認出來，並帶出網頁標題', () => {
+  const { describeUnexpectedHtml } = require('../speed-camera-sync.cjs');
+  const page = Buffer.from(
+    '﻿<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-Hant-tw">\n<head>\n' +
+      '<title>\n  網站服務暫停公告 - 臺南市政府\n</title></head><body>臺南市政府部分網站服務暫停中</body></html>',
+    'utf8'
+  );
+  const msg = describeUnexpectedHtml(page);
+  assert.match(msg, /網頁而不是資料檔/);
+  assert.match(msg, /網站服務暫停公告 - 臺南市政府/);
+  assert.match(describeUnexpectedHtml(Buffer.from('<html><body>login</body></html>')), /無標題/);
+});
+
+test('describeUnexpectedHtml：CSV／JSON／PDF／空內容都不是網頁', () => {
+  const { describeUnexpectedHtml } = require('../speed-camera-sync.cjs');
+  assert.equal(describeUnexpectedHtml(Buffer.from('﻿編號,地點,速限\n1,"<html> 路口",50\n')), null, '內文出現 <html> 字樣的 CSV 不算');
+  assert.equal(describeUnexpectedHtml(Buffer.from('{"result":{"records":[]}}')), null);
+  assert.equal(describeUnexpectedHtml(Buffer.from('%PDF-1.7\n')), null);
+  assert.equal(describeUnexpectedHtml(Buffer.alloc(0)), null);
+  assert.equal(describeUnexpectedHtml(null), null);
+});
