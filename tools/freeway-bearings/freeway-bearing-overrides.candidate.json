@@ -1,0 +1,1707 @@
+{
+ "generated_at": "2026-09-20",
+ "osm_base": "2026-09-20T00:53:21Z",
+ "note": "候選表——尚未接進同步流程。鍵=road+lat+lng（5 位小數）。",
+ "entries": [
+  {
+   "road": "國道一號北向1.9公里",
+   "lat": 25.10776,
+   "lng": 121.72534,
+   "bearing": 20,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 72,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向2公里",
+   "lat": 25.10686,
+   "lng": 121.72474,
+   "bearing": 201,
+   "compass_was": 180,
+   "osm_dist_m": 6,
+   "chord": 252,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向7.5公里",
+   "lat": 25.08581,
+   "lng": 121.68071,
+   "bearing": 89,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 68,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向13.7公里",
+   "lat": 25.06673,
+   "lng": 121.62494,
+   "bearing": 265,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 258,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向14.5公里",
+   "lat": 25.06592,
+   "lng": 121.61644,
+   "bearing": 83,
+   "compass_was": 0,
+   "osm_dist_m": 8,
+   "chord": 78,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號汐五北向16公里",
+   "lat": 25.06395,
+   "lng": 121.6017,
+   "bearing": 82,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 89,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號汐五南向16.1公里",
+   "lat": 25.06428,
+   "lng": 121.60144,
+   "bearing": 262,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 269,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向22.7公里",
+   "lat": 25.07305,
+   "lng": 121.53686,
+   "bearing": 262,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 276,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號汐五南向29.5公里",
+   "lat": 25.0755,
+   "lng": 121.47129,
+   "bearing": 284,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 258,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向30公里",
+   "lat": 25.07594,
+   "lng": 121.46635,
+   "bearing": 271,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 258,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向34.4公里",
+   "lat": 25.06626,
+   "lng": 121.42388,
+   "bearing": 57,
+   "compass_was": 0,
+   "osm_dist_m": 14,
+   "chord": 79,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向34.4公里",
+   "lat": 25.06722,
+   "lng": 121.42437,
+   "bearing": 241,
+   "compass_was": 180,
+   "osm_dist_m": 8,
+   "chord": 259,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向37公里",
+   "lat": 25.05534,
+   "lng": 121.40256,
+   "bearing": 99,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 81,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號五楊北向38.8公里",
+   "lat": 25.065,
+   "lng": 121.38388,
+   "bearing": 81,
+   "compass_was": 0,
+   "osm_dist_m": 10,
+   "chord": 85,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號五楊南向44.6公里",
+   "lat": 25.0607,
+   "lng": 121.33263,
+   "bearing": 228,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 280,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向60.1公里",
+   "lat": 24.97036,
+   "lng": 121.21667,
+   "bearing": 227,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 242,
+   "chord_agree": 0.99
+  },
+  {
+   "road": "國道一號北向63.7公里",
+   "lat": 24.94583,
+   "lng": 121.19477,
+   "bearing": 14,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 50,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號五楊北向64.3公里",
+   "lat": 24.94103,
+   "lng": 121.19353,
+   "bearing": 20,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 50,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向78.2公里",
+   "lat": 24.88472,
+   "lng": 121.08215,
+   "bearing": 266,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 258,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向81.1公里",
+   "lat": 24.87599,
+   "lng": 121.05576,
+   "bearing": 90,
+   "compass_was": 0,
+   "osm_dist_m": 8,
+   "chord": 72,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向81.8公里",
+   "lat": 24.87638,
+   "lng": 121.04861,
+   "bearing": 274,
+   "compass_was": 180,
+   "osm_dist_m": 21,
+   "chord": 252,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向81.8公里",
+   "lat": 24.87661,
+   "lng": 121.04881,
+   "bearing": 274,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 252,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向82.1公里",
+   "lat": 24.87656,
+   "lng": 121.04609,
+   "bearing": 94,
+   "compass_was": 0,
+   "osm_dist_m": 7,
+   "chord": 72,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向86.5公里",
+   "lat": 24.85992,
+   "lng": 121.01066,
+   "bearing": 191,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 251,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向102.5公里",
+   "lat": 24.73607,
+   "lng": 120.96852,
+   "bearing": 235,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 216,
+   "chord_agree": 0.99
+  },
+  {
+   "road": "國道一號北向105.5公里",
+   "lat": 24.7269,
+   "lng": 120.94732,
+   "bearing": 89,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 35,
+   "chord_agree": 0.99
+  },
+  {
+   "road": "國道一號南向106公里",
+   "lat": 24.72512,
+   "lng": 120.9376,
+   "bearing": 242,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 215,
+   "chord_agree": 0.99
+  },
+  {
+   "road": "國道一號南向124公里",
+   "lat": 24.59203,
+   "lng": 120.86044,
+   "bearing": 179,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 208,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向126.5公里",
+   "lat": 24.5708,
+   "lng": 120.85275,
+   "bearing": 207,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 208,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向127.5公里",
+   "lat": 24.56477,
+   "lng": 120.84621,
+   "bearing": 38,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 30,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向129.15公里",
+   "lat": 24.55151,
+   "lng": 120.83935,
+   "bearing": 199,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 210,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向134.7公里",
+   "lat": 24.51113,
+   "lng": 120.80868,
+   "bearing": 36,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 28,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向141.7公里",
+   "lat": 24.46205,
+   "lng": 120.78804,
+   "bearing": 15,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 26,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向152.9公里",
+   "lat": 24.37083,
+   "lng": 120.74645,
+   "bearing": 212,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 207,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向157.4公里",
+   "lat": 24.33757,
+   "lng": 120.72009,
+   "bearing": 27,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 28,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向157.4公里",
+   "lat": 24.33797,
+   "lng": 120.72033,
+   "bearing": 27,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 28,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向165.3公里",
+   "lat": 24.2733,
+   "lng": 120.69309,
+   "bearing": 186,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 201,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向170.3公里",
+   "lat": 24.22831,
+   "lng": 120.68516,
+   "bearing": 203,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 205,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向172.4公里",
+   "lat": 24.21423,
+   "lng": 120.67317,
+   "bearing": 233,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 205,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向172.8公里",
+   "lat": 24.21157,
+   "lng": 120.66915,
+   "bearing": 60,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 25,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向200.1公里",
+   "lat": 24.05308,
+   "lng": 120.52378,
+   "bearing": 179,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 204,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向223.5公里",
+   "lat": 23.84269,
+   "lng": 120.48407,
+   "bearing": 180,
+   "compass_was": 180,
+   "osm_dist_m": 9,
+   "chord": 177,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向223.5公里",
+   "lat": 23.84475,
+   "lng": 120.48422,
+   "bearing": 182,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 177,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向224.9公里",
+   "lat": 23.83054,
+   "lng": 120.48505,
+   "bearing": 356,
+   "compass_was": 0,
+   "osm_dist_m": 8,
+   "chord": 357,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向224.9公里",
+   "lat": 23.83192,
+   "lng": 120.48481,
+   "bearing": 356,
+   "compass_was": 0,
+   "osm_dist_m": 7,
+   "chord": 357,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向233.4公里",
+   "lat": 23.75602,
+   "lng": 120.4677,
+   "bearing": 4,
+   "compass_was": 0,
+   "osm_dist_m": 7,
+   "chord": 8,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向233.4公里",
+   "lat": 23.75788,
+   "lng": 120.46778,
+   "bearing": 6,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 8,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向238.6公里",
+   "lat": 23.71235,
+   "lng": 120.47608,
+   "bearing": 181,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 190,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向246.8公里",
+   "lat": 23.64309,
+   "lng": 120.4443,
+   "bearing": 16,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 13,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向247.2公里",
+   "lat": 23.6416,
+   "lng": 120.44377,
+   "bearing": 195,
+   "compass_was": 180,
+   "osm_dist_m": 12,
+   "chord": 193,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向252.2公里",
+   "lat": 23.59747,
+   "lng": 120.43435,
+   "bearing": 191,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 193,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向254.1公里",
+   "lat": 23.58111,
+   "lng": 120.42849,
+   "bearing": 25,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 16,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向260.5公里",
+   "lat": 23.52765,
+   "lng": 120.40582,
+   "bearing": 199,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 196,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向261.7公里",
+   "lat": 23.51677,
+   "lng": 120.40404,
+   "bearing": 6,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 16,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向276.2公里",
+   "lat": 23.39774,
+   "lng": 120.35525,
+   "bearing": 177,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 189,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向277.3公里",
+   "lat": 23.38762,
+   "lng": 120.35529,
+   "bearing": 6,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 24,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向279公里",
+   "lat": 23.37321,
+   "lng": 120.35071,
+   "bearing": 206,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 204,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向285.3公里",
+   "lat": 23.3343,
+   "lng": 120.30684,
+   "bearing": 217,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 214,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向292.5公里",
+   "lat": 23.27852,
+   "lng": 120.27128,
+   "bearing": 43,
+   "compass_was": 0,
+   "osm_dist_m": 6,
+   "chord": 26,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向293.1公里",
+   "lat": 23.27464,
+   "lng": 120.26733,
+   "bearing": 215,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 206,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向301.5公里",
+   "lat": 23.20487,
+   "lng": 120.23672,
+   "bearing": 3,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 2,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向301.6公里",
+   "lat": 23.20419,
+   "lng": 120.23653,
+   "bearing": 183,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 182,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向306.1公里",
+   "lat": 23.16412,
+   "lng": 120.23149,
+   "bearing": 192,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 182,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向309.1公里",
+   "lat": 23.13745,
+   "lng": 120.23468,
+   "bearing": 339,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 356,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向315.5公里",
+   "lat": 23.08262,
+   "lng": 120.25174,
+   "bearing": 173,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 176,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向321.8公里",
+   "lat": 23.02625,
+   "lng": 120.2493,
+   "bearing": 177,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 181,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向323.4公里",
+   "lat": 23.01191,
+   "lng": 120.24937,
+   "bearing": 16,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 1,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向334公里",
+   "lat": 22.91866,
+   "lng": 120.26014,
+   "bearing": 337,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 336,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向336.7公里",
+   "lat": 22.89629,
+   "lng": 120.27043,
+   "bearing": 335,
+   "compass_was": 0,
+   "osm_dist_m": 5,
+   "chord": 336,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向340.2公里",
+   "lat": 22.86798,
+   "lng": 120.28468,
+   "bearing": 160,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 156,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向353.3公里",
+   "lat": 22.75911,
+   "lng": 120.3321,
+   "bearing": 337,
+   "compass_was": 0,
+   "osm_dist_m": 10,
+   "chord": 350,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向353.4公里",
+   "lat": 22.7585,
+   "lng": 120.33219,
+   "bearing": 158,
+   "compass_was": 180,
+   "osm_dist_m": 7,
+   "chord": 170,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向362.5公里",
+   "lat": 22.67753,
+   "lng": 120.32873,
+   "bearing": 176,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 181,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號北向373.4公里",
+   "lat": 22.58614,
+   "lng": 120.32915,
+   "bearing": 52,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 1,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道一號南向373.5公里",
+   "lat": 22.58575,
+   "lng": 120.32836,
+   "bearing": 232,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 181,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道二號西向2公里",
+   "lat": 25.04983,
+   "lng": 121.2172,
+   "bearing": 338,
+   "compass_was": 270,
+   "osm_dist_m": 1,
+   "chord": 310,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道二號東向2.4公里",
+   "lat": 25.04633,
+   "lng": 121.21863,
+   "bearing": 157,
+   "compass_was": 90,
+   "osm_dist_m": 5,
+   "chord": 130,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道二號西向6.4公里",
+   "lat": 25.02828,
+   "lng": 121.2518,
+   "bearing": 290,
+   "compass_was": 270,
+   "osm_dist_m": 4,
+   "chord": 310,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道二號東向11.8公里",
+   "lat": 24.99567,
+   "lng": 121.28297,
+   "bearing": 192,
+   "compass_was": 90,
+   "osm_dist_m": 4,
+   "chord": 136,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道二號東向18.5公里",
+   "lat": 24.95927,
+   "lng": 121.32486,
+   "bearing": 172,
+   "compass_was": 90,
+   "osm_dist_m": 2,
+   "chord": 136,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向4.7公里",
+   "lat": 25.11023,
+   "lng": 121.68526,
+   "bearing": 211,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 219,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向10.2公里",
+   "lat": 25.07831,
+   "lng": 121.64748,
+   "bearing": 17,
+   "compass_was": 0,
+   "osm_dist_m": 5,
+   "chord": 39,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向14.5公里",
+   "lat": 25.04688,
+   "lng": 121.62579,
+   "bearing": 23,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 31,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向17.1公里",
+   "lat": 25.02955,
+   "lng": 121.61057,
+   "bearing": 57,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 35,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向21.8公里",
+   "lat": 24.9922,
+   "lng": 121.59263,
+   "bearing": 191,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 221,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向24.6公里",
+   "lat": 24.97643,
+   "lng": 121.5743,
+   "bearing": 265,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 230,
+   "chord_agree": 0.93
+  },
+  {
+   "road": "國道三號北向25公里",
+   "lat": 24.9761,
+   "lng": 121.57083,
+   "bearing": 97,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 50,
+   "chord_agree": 0.93
+  },
+  {
+   "road": "國道三號北向29.1公里",
+   "lat": 24.95847,
+   "lng": 121.53918,
+   "bearing": 81,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 59,
+   "chord_agree": 0.89
+  },
+  {
+   "road": "國道三號北向38.3公里",
+   "lat": 24.97751,
+   "lng": 121.46552,
+   "bearing": 51,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 87,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向39.3公里",
+   "lat": 24.97526,
+   "lng": 121.45628,
+   "bearing": 272,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 267,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向57公里",
+   "lat": 24.9243,
+   "lng": 121.30428,
+   "bearing": 63,
+   "compass_was": 0,
+   "osm_dist_m": 6,
+   "chord": 53,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向64.2公里",
+   "lat": 24.8811,
+   "lng": 121.25546,
+   "bearing": 238,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 233,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向69.5公里",
+   "lat": 24.85756,
+   "lng": 121.21052,
+   "bearing": 62,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 51,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向81.5公里",
+   "lat": 24.8072,
+   "lng": 121.14987,
+   "bearing": 266,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 233,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向84.6公里",
+   "lat": 24.79138,
+   "lng": 121.12608,
+   "bearing": 26,
+   "compass_was": 0,
+   "osm_dist_m": 5,
+   "chord": 57,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向90.2公里",
+   "lat": 24.76711,
+   "lng": 121.08147,
+   "bearing": 219,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 237,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向107.4公里",
+   "lat": 24.74601,
+   "lng": 120.92539,
+   "bearing": 217,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 233,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向112.2公里",
+   "lat": 24.71492,
+   "lng": 120.89375,
+   "bearing": 223,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 233,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向116.5公里",
+   "lat": 24.69591,
+   "lng": 120.85748,
+   "bearing": 46,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 43,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向116.5公里",
+   "lat": 24.69619,
+   "lng": 120.85779,
+   "bearing": 46,
+   "compass_was": 0,
+   "osm_dist_m": 0,
+   "chord": 43,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向117.1公里",
+   "lat": 24.69197,
+   "lng": 120.85331,
+   "bearing": 217,
+   "compass_was": 180,
+   "osm_dist_m": 6,
+   "chord": 223,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向122.5公里",
+   "lat": 24.64878,
+   "lng": 120.83118,
+   "bearing": 45,
+   "compass_was": 0,
+   "osm_dist_m": 37,
+   "chord": 26,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向131.2公里",
+   "lat": 24.5913,
+   "lng": 120.77907,
+   "bearing": 56,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 33,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向142.9公里",
+   "lat": 24.50729,
+   "lng": 120.71315,
+   "bearing": 228,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 213,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向150.2公里",
+   "lat": 24.45305,
+   "lng": 120.67839,
+   "bearing": 177,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 197,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向162.1公里",
+   "lat": 24.35021,
+   "lng": 120.65884,
+   "bearing": 26,
+   "compass_was": 0,
+   "osm_dist_m": 10,
+   "chord": 32,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向162.1公里",
+   "lat": 24.35028,
+   "lng": 120.65872,
+   "bearing": 205,
+   "compass_was": 180,
+   "osm_dist_m": 10,
+   "chord": 212,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向166公里",
+   "lat": 24.33059,
+   "lng": 120.62855,
+   "bearing": 227,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 225,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向171公里",
+   "lat": 24.2937,
+   "lng": 120.60209,
+   "bearing": 9,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 17,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向177.8公里",
+   "lat": 24.23618,
+   "lng": 120.59372,
+   "bearing": 7,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 21,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向178.6公里",
+   "lat": 24.22956,
+   "lng": 120.59093,
+   "bearing": 212,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 207,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向184.1公里",
+   "lat": 24.1909,
+   "lng": 120.56188,
+   "bearing": 257,
+   "compass_was": 180,
+   "osm_dist_m": 6,
+   "chord": 217,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向186.1公里",
+   "lat": 24.17851,
+   "lng": 120.54876,
+   "bearing": 27,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 38,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向206.6公里",
+   "lat": 24.07105,
+   "lng": 120.63864,
+   "bearing": 308,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 351,
+   "chord_agree": 0.95
+  },
+  {
+   "road": "國道三號北向218公里",
+   "lat": 24,
+   "lng": 120.65042,
+   "bearing": 8,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 351,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向235.2公里",
+   "lat": 23.86997,
+   "lng": 120.70508,
+   "bearing": 18,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 11,
+   "chord_agree": 0.95
+  },
+  {
+   "road": "國道三號北向247.1公里",
+   "lat": 23.77744,
+   "lng": 120.68793,
+   "bearing": 98,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 44,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向262.1公里",
+   "lat": 23.71877,
+   "lng": 120.60345,
+   "bearing": 175,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 197,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向265.1公里",
+   "lat": 23.69292,
+   "lng": 120.5988,
+   "bearing": 40,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 17,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向282.7公里",
+   "lat": 23.57035,
+   "lng": 120.50546,
+   "bearing": 189,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 204,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向313.7公里",
+   "lat": 23.33321,
+   "lng": 120.43359,
+   "bearing": 208,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 205,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向318.7公里",
+   "lat": 23.2988,
+   "lng": 120.40729,
+   "bearing": 58,
+   "compass_was": 0,
+   "osm_dist_m": 6,
+   "chord": 31,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向331公里",
+   "lat": 23.20134,
+   "lng": 120.35549,
+   "bearing": 1,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 14,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向342.1公里",
+   "lat": 23.10712,
+   "lng": 120.3275,
+   "bearing": 178,
+   "compass_was": 180,
+   "osm_dist_m": 8,
+   "chord": 187,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向342.1公里",
+   "lat": 23.11042,
+   "lng": 120.32729,
+   "bearing": 182,
+   "compass_was": 180,
+   "osm_dist_m": 21,
+   "chord": 187,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向344.7公里",
+   "lat": 23.08338,
+   "lng": 120.32922,
+   "bearing": 358,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 3,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向358.6公里",
+   "lat": 22.97058,
+   "lng": 120.33847,
+   "bearing": 115,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 171,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向372.3公里",
+   "lat": 22.8624,
+   "lng": 120.36923,
+   "bearing": 134,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 133,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向374.3公里",
+   "lat": 22.84931,
+   "lng": 120.38294,
+   "bearing": 331,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 313,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向378.85公里",
+   "lat": 22.82084,
+   "lng": 120.41966,
+   "bearing": 149,
+   "compass_was": 180,
+   "osm_dist_m": 11,
+   "chord": 141,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向386公里",
+   "lat": 22.76922,
+   "lng": 120.44159,
+   "bearing": 115,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 138,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向389.3公里",
+   "lat": 22.75802,
+   "lng": 120.47148,
+   "bearing": 280,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 318,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號南向423.1公里",
+   "lat": 22.50815,
+   "lng": 120.52481,
+   "bearing": 179,
+   "compass_was": 180,
+   "osm_dist_m": 2,
+   "chord": 150,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道三號北向423.2公里",
+   "lat": 22.50716,
+   "lng": 120.52493,
+   "bearing": 358,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 330,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道四號西向4.4公里",
+   "lat": 24.30277,
+   "lng": 120.63327,
+   "bearing": 299,
+   "compass_was": 270,
+   "osm_dist_m": 9,
+   "chord": 311,
+   "chord_agree": 0.8
+  },
+  {
+   "road": "國道四號西向4.4公里",
+   "lat": 24.30509,
+   "lng": 120.62779,
+   "bearing": 292,
+   "compass_was": 270,
+   "osm_dist_m": 4,
+   "chord": 311,
+   "chord_agree": 0.8
+  },
+  {
+   "road": "國道四號西向23.3公里",
+   "lat": 24.23028,
+   "lng": 120.73259,
+   "bearing": 5,
+   "compass_was": 270,
+   "osm_dist_m": 3,
+   "chord": 311,
+   "chord_agree": 0.8
+  },
+  {
+   "road": "國道四號東向24.778公里",
+   "lat": 24.22084,
+   "lng": 120.72527,
+   "bearing": 102,
+   "compass_was": 90,
+   "osm_dist_m": 28,
+   "chord": 131,
+   "chord_agree": 0.8
+  },
+  {
+   "road": "國道五號北向5.7公里",
+   "lat": 24.99456,
+   "lng": 121.65255,
+   "bearing": 341,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 317,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向13.3公里",
+   "lat": 24.94927,
+   "lng": 121.70153,
+   "bearing": 106,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 135,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向16.9公里",
+   "lat": 24.92628,
+   "lng": 121.72481,
+   "bearing": 329,
+   "compass_was": 0,
+   "osm_dist_m": 3,
+   "chord": 318,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向16.9公里",
+   "lat": 24.92593,
+   "lng": 121.72434,
+   "bearing": 149,
+   "compass_was": 180,
+   "osm_dist_m": 4,
+   "chord": 138,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向18.3公里",
+   "lat": 24.91648,
+   "lng": 121.73331,
+   "bearing": 313,
+   "compass_was": 0,
+   "osm_dist_m": 6,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向18.3公里",
+   "lat": 24.91613,
+   "lng": 121.73286,
+   "bearing": 134,
+   "compass_was": 180,
+   "osm_dist_m": 6,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向19.7公里",
+   "lat": 24.90828,
+   "lng": 121.74382,
+   "bearing": 310,
+   "compass_was": 0,
+   "osm_dist_m": 5,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向19.7公里",
+   "lat": 24.90792,
+   "lng": 121.74337,
+   "bearing": 130,
+   "compass_was": 180,
+   "osm_dist_m": 6,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向21.1公里",
+   "lat": 24.89985,
+   "lng": 121.75418,
+   "bearing": 319,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向21.1公里",
+   "lat": 24.89953,
+   "lng": 121.75373,
+   "bearing": 139,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向22.5公里",
+   "lat": 24.88957,
+   "lng": 121.76222,
+   "bearing": 328,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向22.5公里",
+   "lat": 24.88923,
+   "lng": 121.76176,
+   "bearing": 148,
+   "compass_was": 180,
+   "osm_dist_m": 0,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向23.9公里",
+   "lat": 24.87911,
+   "lng": 121.76987,
+   "bearing": 321,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向23.9公里",
+   "lat": 24.87876,
+   "lng": 121.76942,
+   "bearing": 141,
+   "compass_was": 180,
+   "osm_dist_m": 5,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向25.3公里",
+   "lat": 24.86992,
+   "lng": 121.77933,
+   "bearing": 316,
+   "compass_was": 0,
+   "osm_dist_m": 4,
+   "chord": 319,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向25.3公里",
+   "lat": 24.8696,
+   "lng": 121.7789,
+   "bearing": 136,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 139,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向26.7公里",
+   "lat": 24.86037,
+   "lng": 121.78834,
+   "bearing": 328,
+   "compass_was": 0,
+   "osm_dist_m": 2,
+   "chord": 321,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向26.7公里",
+   "lat": 24.86013,
+   "lng": 121.78806,
+   "bearing": 146,
+   "compass_was": 180,
+   "osm_dist_m": 1,
+   "chord": 141,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號北向34.9公里",
+   "lat": 24.79156,
+   "lng": 121.78096,
+   "bearing": 17,
+   "compass_was": 0,
+   "osm_dist_m": 1,
+   "chord": 328,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道五號南向52.7公里",
+   "lat": 24.63744,
+   "lng": 121.80556,
+   "bearing": 169,
+   "compass_was": 180,
+   "osm_dist_m": 3,
+   "chord": 158,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道六號東向12.5公里",
+   "lat": 23.98553,
+   "lng": 120.77872,
+   "bearing": 44,
+   "compass_was": 90,
+   "osm_dist_m": 9,
+   "chord": 85,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道六號西向26公里",
+   "lat": 23.9811,
+   "lng": 120.89099,
+   "bearing": 282,
+   "compass_was": 270,
+   "osm_dist_m": 0,
+   "chord": 268,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道六號東向36.5公里",
+   "lat": 23.98256,
+   "lng": 120.98814,
+   "bearing": 106,
+   "compass_was": 90,
+   "osm_dist_m": 2,
+   "chord": 88,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道八號東向0公里",
+   "lat": 23.08055,
+   "lng": 120.19544,
+   "bearing": 30,
+   "compass_was": 90,
+   "osm_dist_m": 7,
+   "chord": 71,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道八號西向0公里",
+   "lat": 23.08055,
+   "lng": 120.19544,
+   "bearing": 208,
+   "compass_was": 270,
+   "osm_dist_m": 5,
+   "chord": 251,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道八號東向4.2公里",
+   "lat": 23.08252,
+   "lng": 120.23113,
+   "bearing": 115,
+   "compass_was": 90,
+   "osm_dist_m": 5,
+   "chord": 71,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道八號東向4.2公里",
+   "lat": 23.08961,
+   "lng": 120.20962,
+   "bearing": 82,
+   "compass_was": 90,
+   "osm_dist_m": 1,
+   "chord": 71,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道十號東向14.7公里",
+   "lat": 22.76033,
+   "lng": 120.3869,
+   "bearing": 74,
+   "compass_was": 90,
+   "osm_dist_m": 4,
+   "chord": 53,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道十號西向16.8公里",
+   "lat": 22.77091,
+   "lng": 120.40675,
+   "bearing": 248,
+   "compass_was": 270,
+   "osm_dist_m": 2,
+   "chord": 233,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道十號東向21.4公里",
+   "lat": 22.79557,
+   "lng": 120.43751,
+   "bearing": 64,
+   "compass_was": 90,
+   "osm_dist_m": 9,
+   "chord": 54,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道十號東向21.4公里",
+   "lat": 22.79573,
+   "lng": 120.43798,
+   "bearing": 68,
+   "compass_was": 90,
+   "osm_dist_m": 11,
+   "chord": 54,
+   "chord_agree": 1
+  },
+  {
+   "road": "國道十號西向28.3公里",
+   "lat": 22.82538,
+   "lng": 120.4881,
+   "bearing": 197,
+   "compass_was": 270,
+   "osm_dist_m": 2,
+   "chord": 234,
+   "chord_agree": 1
+  }
+ ]
+}
