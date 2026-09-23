@@ -69,6 +69,10 @@ test('shard lane 共用 19 分鐘 deadline，recovery 直接依賴自己的 prim
     assert.equal(recovery.if, undefined);
     assert.equal(recovery['timeout-minutes'], 21);
     assert.equal(recovery['continue-on-error'], true, '備援機失敗不得染紅 reusable workflow');
+    // 2026-09-23：primary 死於 setup、備援機整個接手成功時，primary 的紅燈不得染紅
+    // reusable workflow（否則 verify-all-shards 判失敗、swap 被跳過）；由 lane-gate 把關。
+    assert.equal(primary['continue-on-error'], true, 'primary 失敗交由 lane-gate 依 status 判定');
+    assert.equal(gate['continue-on-error'], undefined, 'lane-gate 必須能染紅 reusable workflow');
     assert.equal(getLaneStep('recovery', 'Setup fresh recovery runner')['timeout-minutes'], 8);
     const recoveryCrawl = getLaneStep('recovery', 'Stand by warm and take over within lane budget');
     assert.match(recoveryCrawl.run, /run-plate-shard-with-recovery\.sh.*spare/);
@@ -208,6 +212,24 @@ test('shard lane gate 只有在 primary 成功或 bounded recovery 完成時放�
     assert.match(`${primaryDiedSpareDone.stdout}`, /hot spare completed the whole shard/);
     assert.equal(primaryHardFailure.status, 1);
     assert.equal(primaryDiedSpareIdle.status, 1);
+
+    // 2026-09-23：primary 改為 continue-on-error 後 needs.primary.result 可能被遮成
+    // success；lane-gate 只看 status，結果不得因此改變。
+    const maskedHardFailure = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'success', PRIMARY_STATUS: 'HARD_FAILURE',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SUCCESS',
+    });
+    const maskedDiedSpareIdle = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'success', PRIMARY_STATUS: '',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SPARE_IDLE',
+    });
+    const maskedDiedSpareDone = runLaneGate({
+        SHARD: 'CENTRAL', PRIMARY_RESULT: 'success', PRIMARY_STATUS: '',
+        RECOVERY_RESULT: 'success', RECOVERY_STATUS: 'SUCCESS',
+    });
+    assert.equal(maskedHardFailure.status, 1);
+    assert.equal(maskedDiedSpareIdle.status, 1);
+    assert.equal(maskedDiedSpareDone.status, 0, `${maskedDiedSpareDone.stdout}${maskedDiedSpareDone.stderr}`);
 });
 
 test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries', () => {
@@ -222,10 +244,17 @@ test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries',
     assert.match(installStep.run, /Acquire::Retries=2/);
     assert.doesNotMatch(installStep.run, /sudo apt-get update &&/);
     // 2026-09-04：快取命中直裝本地 .deb（零 apt-get update）；未命中只更新 Cloudflare 單一來源
-    assert.match(installStep.run, /install -y "\$WARP_DEB"/);
+    assert.match(installStep.run, /install_warp "\$WARP_DEB"/);
     assert.match(installStep.run, /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
     assert.match(installStep.run, /APT::Get::List-Cleanup=0/);
     assert.match(cacheStep.with.key, /plate-shard-lane\.yml/);
+    // 2026-09-23：映像換版後內建索引指向已下架的相依版本（404）→ 兩條安裝路徑失敗時
+    // 都要退回有上限的完整 apt-get update 再重裝；快取鍵帶映像版本，新映像只付一次代價。
+    assert.match(installStep.run, /refresh_all_indexes\(\)/);
+    assert.match(installStep.run, /if \[ "\$WARP_INSTALLED" != "true" \]; then\s+if ! refresh_all_indexes; then/);
+    assert.match(installStep.run, /install_warp cloudflare-warp/);
+    assert.match(cacheStep.with.key, /steps\.runner-image\.outputs\.version/);
+    assert.match(getStep('Detect runner image version').run, /ImageVersion/);
     // 2026-09-10：npm ci 需重試（Puppeteer 下載 ECONNRESET 曾秒殺 primary），並快取瀏覽器
     const installDeps = getStep('Install Dependencies');
     assert.match(installDeps.run, /for attempt in 1 2 3/);
