@@ -38,6 +38,11 @@ jobs:
     name: primary-attempt (${{ inputs.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # 2026-09-23：primary 死於 setup 時，lane-gate 會因熱備援整個接手成功而放行，但
+    # primary 這個 job 本身的紅燈仍把整個 reusable workflow 染紅 → verify-all-shards
+    # 判失敗、swap 被跳過（9/22-9/23 多輪五個 lane-gate 全綠卻不 swap）。與 recovery
+    # 同樣交由 lane-gate 依 status 輸出單獨把關（lane-gate 不吃 needs.primary.result）。
+    continue-on-error: true
     outputs:
       status: ${{ steps.crawl.outputs.status }}
       deadline_epoch: ${{ steps.budget.outputs.deadline_epoch }}
@@ -220,30 +225,31 @@ jobs:
           RECOVERY_RESULT: ${{ needs.recovery.result }}
           RECOVERY_STATUS: ${{ needs.recovery.outputs.status }}
         run: |
-          if [ "$PRIMARY_RESULT" != "success" ]; then
-            # 2026-09-04：primary 死於 setup（從未開爬，沒有任何 status）而健康的備援機
-            # 整個接手成功 → 放行；primary 曾開爬（HARD_FAILURE 等必留 status）→ 維持判死。
-            if [ -z "$PRIMARY_STATUS" ] && [ "$RECOVERY_STATUS" = "SUCCESS" ]; then
-              echo "$SHARD primary died before crawling; the hot spare completed the whole shard."
-              exit 0
-            fi
-            echo "::error::Primary runner infrastructure or non-retryable failure for $SHARD."
-            exit 1
-          fi
-
+          # 只看 status 輸出：primary/recovery 都是 continue-on-error，needs.*.result
+          # 不再可靠反映失敗，僅供記錄。
+          echo "primary: result=$PRIMARY_RESULT status=${PRIMARY_STATUS:-MISSING}; recovery: result=$RECOVERY_RESULT status=${RECOVERY_STATUS:-MISSING}"
           case "$PRIMARY_STATUS" in
             SUCCESS)
               echo "$SHARD completed on its primary runner."
               ;;
             RETRY)
-              if [ "$RECOVERY_RESULT" != "success" ] || [ "$RECOVERY_STATUS" != "SUCCESS" ]; then
+              if [ "$RECOVERY_STATUS" != "SUCCESS" ]; then
                 echo "::error::Fresh-runner recovery did not complete $SHARD within its lane budget."
                 exit 1
               fi
               echo "$SHARD completed on its isolated recovery runner."
               ;;
+            "")
+              # 2026-09-04：primary 死於開爬前（setup 失敗，從未產生 status）而健康的
+              # 備援機整個接手成功 → 放行；否則判死。
+              if [ "$RECOVERY_STATUS" != "SUCCESS" ]; then
+                echo "::error::Primary runner died before crawling $SHARD and the hot spare did not complete it."
+                exit 1
+              fi
+              echo "$SHARD primary died before crawling; the hot spare completed the whole shard."
+              ;;
             *)
-              echo "::error::Missing or invalid primary status for $SHARD: ${PRIMARY_STATUS:-MISSING}."
+              echo "::error::Non-retryable or invalid primary status for $SHARD: $PRIMARY_STATUS."
               exit 1
               ;;
           esac
