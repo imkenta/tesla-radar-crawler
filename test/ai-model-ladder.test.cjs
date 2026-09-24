@@ -451,8 +451,45 @@ test('recordServerError：升級時跳過 PerDay 已標死的 combo（flash-lite
     assert.equal(s.keyName, 'GEMINI_API_KEY');
 });
 
-test('recordServerError：已在最末存活層 → escalated:false + exhausted:true（呼叫端維持退避重試）', () => {
+test('recordServerError：末層也風暴 → 繞回第一層（2026-09-24：flash-lite 零成功卻被死守）', () => {
+    const s = new LadderState(['GEMINI_API_KEY_CENTRAL']);
+    s.tierIndex = MODEL_LADDER.length - 1;
+    s.failureCount = 1;
+    s.higherTierSinceMs = 500_000;
+    const t0 = 1_000_000;
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
+        out = s.recordServerError(t0 + i * 1_000);
+    }
+    assert.equal(out.escalated, true);
+    assert.equal(out.wrapped, true);
+    assert.deepEqual(out.combo, { tierIndex: 0, model: MODEL_LADDER[0].model, keyName: 'GEMINI_API_KEY_CENTRAL' });
+    assert.equal(s.tierIndex, 0);
+    assert.equal(s.failureCount, 0);
+    assert.deepEqual(s.serverErrorTimes, []);
+    assert.equal(s.higherTierSinceMs, null);
+});
+
+test('recordServerError：26B 與 flash-lite 輪流風暴 → 在兩層間來回，不會卡死任何一層', () => {
+    const s = new LadderState(['GEMINI_API_KEY_CENTRAL']);
+    const t0 = 1_000_000;
+    const seen = [];
+    for (let round = 0; round < 4; round++) {
+        let out = null;
+        for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
+            out = s.recordServerError(t0 + round * 60_000 + i * 1_000);
+        }
+        assert.equal(out.escalated, true);
+        seen.push(s.model);
+    }
+    assert.deepEqual(seen, [
+        MODEL_LADDER[1].model, MODEL_LADDER[0].model, MODEL_LADDER[1].model, MODEL_LADDER[0].model,
+    ]);
+});
+
+test('recordServerError：只剩末層存活（第一層已 PerDay 標死）→ escalated:false + exhausted:true（呼叫端維持退避重試）', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
+    s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', MODEL_LADDER[0].model));
     s.tierIndex = MODEL_LADDER.length - 1;
     const t0 = 1_000_000;
     let out = null;

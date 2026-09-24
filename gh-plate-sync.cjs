@@ -190,6 +190,7 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 // - 5xx → 退避 5-10 秒同 combo 重試 1 次，成功不計數，再失敗才計入升級門檻。
 //   另計滑動窗風暴偵測（2026-08-30 四次修正）：同 combo 10 分鐘內累積 2 次 5xx
 //   → 判定模型端過載風暴，直接升級（成功不歸零風暴窗，見 lib/ai-model-ladder.cjs）。
+//   末層也風暴時繞回第一個存活 combo（2026-09-24 六次修正），兩層同時過載時輪替找容量。
 // - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
 // 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
 class AIManager {
@@ -354,7 +355,7 @@ class AIManager {
                     const stormBefore = `${this.currentKeyName}/${this.modelName}`;
                     const storm = this.ladder.recordServerError(Date.now());
                     if (storm.escalated) {
-                        console.log(`⚠️  [AI] ${stormBefore} 5xx 風暴（${SERVER_ERROR_STORM_WINDOW_MS / 60000} 分鐘內達 ${SERVER_ERROR_STORM_THRESHOLD} 次，模型端過載），升級 → ${this.currentKeyName}/${this.modelName}`);
+                        console.log(`⚠️  [AI] ${stormBefore} 5xx 風暴（${SERVER_ERROR_STORM_WINDOW_MS / 60000} 分鐘內達 ${SERVER_ERROR_STORM_THRESHOLD} 次，模型端過載），${storm.wrapped ? '末層也過載，輪替回' : '升級'} → ${this.currentKeyName}/${this.modelName}`);
                         this.init();
                         continue;
                     }
