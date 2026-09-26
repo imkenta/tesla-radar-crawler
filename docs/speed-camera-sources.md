@@ -206,6 +206,7 @@ national-npa 入庫後縣市分佈：臺南市 139、屏東縣 106、雲林縣 9
 - 格式：TGOS ZIP，內含一個資料 CSV 與 `manifest.csv`。parser 使用直接依賴 `yauzl` 在記憶體中讀取唯一非 manifest CSV，不把 ZIP entry 解壓到檔案系統。
 - 欄位：`設備編號,型式,縣市,行政區,設置區域描述,設置地點,取締項目,座標緯度,座標經度,拍攝方向,速限,管轄單位,備註`。
 - `SOURCES` 順序固定為 `taipei → new-taipei → new-taipei-section → kaohsiung → taoyuan → tainan → taichung → taichung-mobile → freeway-npa → national-npa`。國道專源先進入座標聯集，最後的全國集才做 30 公尺座標去重，因此同點優先保留 raw 欄位較完整的國道專源。
+- 前置來源當輪抓取失敗（黃燈／紅燈都一樣，資料庫舊資料原樣保留）時，`writeAll` 改用該來源在資料庫的既有確認點位（`getExistingConfirmedPointsForSource`，分頁避開 1000 筆截斷）當 national-npa 去重基準；連資料庫都查不到就讓 national-npa 當輪不寫入（走黃燈）。2026-09-26 實例：freeway-npa 被擋後 national-npa 多寫 314 筆重複國道桿。
 - 無效座標不導致整列消失：例如經度髒字串會保留該筆、該維度為 `null`，便於稽核與由其他來源補位。
 
 雪山隧道只對官方逐點核對的 16 個國五點位套用窄 override：南向、北向各 8 個，里程集合固定為 `16.9, 18.3, 19.7, 21.1, 22.5, 23.9, 25.3, 26.7` 公里。設備佈署依據來自 dataset 100857，點測速與雷達依據來自 dataset 13940；其他國五、其他隧道或近似文字均不得泛化。

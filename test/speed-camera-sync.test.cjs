@@ -161,6 +161,10 @@ function makeFakeSupabase({
           limit() {
             return chain;
           },
+          // getExistingConfirmedPointsForSource 分頁用；假 client 一次回全部（筆數 <1000）。
+          range() {
+            return chain;
+          },
           maybeSingle() {
             calls.select.push({ table, cols, eq: chain._eq, like: chain._like });
             if (table === 'sync_logs') {
@@ -1007,4 +1011,60 @@ test('resolveFreewayNpaZipUrl：向 data.gov.tw 資料集 API 取當前連結', 
   assert.deepEqual(calls, ['https://data.gov.tw/api/v2/rest/dataset/13940']);
   assert.match(url, /1151015-/);
   assert.equal(typeof SOURCES.find((s) => s.name === 'freeway-npa').resolveUrl, 'function', 'freeway-npa 要接上 resolveUrl');
+});
+
+// ── 前置來源本輪沒更新時，national-npa 改用資料庫既有點位去重（2026-09-26）────────
+// 實例：GitHub runner 被 TGOS 擋 → freeway-npa 黃燈 → national-npa 少了國道座標，多寫 314 筆重複國道桿。
+
+const NATIONAL_NPA_WITH_FREEWAY_CSV = Buffer.from(
+  'CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit\n' +
+    '設置縣市,設置市區鄉鎮,設置地址,管轄警局,管轄分局,經度,緯度,拍攝方向,速限\n' +
+    '新北市,林口區,國道一號南向34.4公里(全國集重複點),國道公路警察局,,121.42438,25.06723,北往南,50\n' +
+    '金門縣,金湖鎮,金湖鎮黃海路(陽明湖路段),金門縣警察局,金湖分局,118.43147,24.458809,南北雙向,60\n',
+  'utf8'
+);
+
+test('writeAll：freeway-npa 本輪抓取失敗 → national-npa 仍用資料庫既有國道點位去重，不重複收錄', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchReturning({ 'new-taipei': NTPC_CSV, 'national-npa': NATIONAL_NPA_WITH_FREEWAY_CSV });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const queried = [];
+  const { from, calls } = makeFakeSupabase({
+    existingCoordsImpl: (sourceName) => {
+      queried.push(sourceName);
+      return sourceName === 'freeway-npa'
+        ? { data: [{ lat: 25.067222, lng: 121.424368 }], error: null }
+        : { data: [], error: null };
+    },
+  });
+
+  const summary = await writeAll({ from }, { geocoder: fakeGeocoder().geocoder });
+
+  assert.equal(summary.sourceResults.find((r) => r.name === 'freeway-npa').written, 0, 'freeway-npa 本輪沒寫');
+  assert.ok(queried.includes('freeway-npa'), '要回頭查 freeway-npa 在資料庫的既有點位');
+  const nationalUpsertCall = calls.upsert.find((c) => c.payload[0].source === 'national-npa');
+  assert.equal(nationalUpsertCall.payload.length, 1, '與既有國道點位重疊的那筆必須丟掉');
+  assert.equal(nationalUpsertCall.payload[0].city, '金門縣');
+});
+
+test('writeAll：前置來源沒更新又查不到資料庫既有點位 → national-npa 本輪不寫入（不清 stale）', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchReturning({ 'new-taipei': NTPC_CSV, 'national-npa': NATIONAL_NPA_WITH_FREEWAY_CSV });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const { from, calls } = makeFakeSupabase({
+    existingCoordsImpl: (sourceName) =>
+      sourceName === 'freeway-npa' ? { data: null, error: { message: 'boom' } } : { data: [], error: null },
+  });
+
+  const summary = await writeAll({ from }, { geocoder: fakeGeocoder().geocoder });
+
+  const national = summary.sourceResults.find((r) => r.name === 'national-npa');
+  assert.match(national.error, /去重基準不完整（freeway-npa/);
+  assert.equal(national.written, 0);
+  assert.equal(calls.upsert.filter((c) => c.payload[0].source === 'national-npa').length, 0, '不得 upsert');
+  assert.equal(calls.delete.filter((c) => c.eq.source === 'national-npa').length, 0, '不得清 stale');
 });

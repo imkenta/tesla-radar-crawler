@@ -477,6 +477,30 @@ async function getExistingCoordsForSource(supabase, sourceName) {
   return map;
 }
 
+/**
+ * 某來源在資料庫裡既有的「確認」點位，給 national-npa 聯集去重當基準（該來源本輪沒更新時用）。
+ * 分頁讀取，避開 PostgREST max-rows 1000 的靜默截斷。
+ * @returns {Promise<{lat:number,lng:number}[]|null>} 查詢失敗回 null（呼叫端要當成「基準不完整」）
+ */
+async function getExistingConfirmedPointsForSource(supabase, sourceName) {
+  const PAGE = 1000;
+  const points = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from('speed_cameras')
+      .select('lat, lng')
+      .eq('source', sourceName)
+      .eq('speed_status', 'confirmed')
+      .not('lat', 'is', null)
+      .not('lng', 'is', null)
+      .order('id', { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error || !Array.isArray(data)) return null;
+    for (const row of data) points.push({ lat: row.lat, lng: row.lng });
+    if (data.length < PAGE) return points;
+  }
+}
+
 async function syncAll() {
   const fetchedAt = new Date().toISOString();
   const results = [];
@@ -554,6 +578,8 @@ async function writeAll(supabase, opts = {}) {
   // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析（含台南 geocode
   // 補值後）的座標點位，見 SOURCES 內 national-npa 項與 dedupeAgainstExisting 說明。
   const collectedPoints = [];
+  // 本輪沒更新、又查不到資料庫既有點位的前置來源（見下方 catch）。非空時 national-npa 本輪不寫入。
+  const dedupeBasisMissing = [];
 
   for (const source of SOURCES) {
     const result = { name: source.name, ok: false, stale: false, staleDays: null, written: 0, staleDeleted: 0, error: null };
@@ -589,6 +615,13 @@ async function writeAll(supabase, opts = {}) {
       records = collapseSourceRecords(records, source.name);
 
       if (source.dedupeAgainstOtherSources) {
+        if (dedupeBasisMissing.length > 0) {
+          // 去重基準缺一塊＝會把那個來源已收錄的桿再寫一次（2026-09-26 實例：freeway-npa 被擋，
+          // national-npa 多寫 314 筆重複國道桿）。寧可本輪不寫（走黃燈，既有資料原封不動）。
+          throw new Error(
+            `去重基準不完整（${dedupeBasisMissing.join('、')} 本輪未更新且查不到資料庫既有點位），本輪不寫入以免重複收錄`
+          );
+        }
         const before = records.length;
         const { kept, droppedCount } = dedupeAgainstExisting(
           records,
@@ -670,6 +703,24 @@ async function writeAll(supabase, opts = {}) {
           result.staleDays = staleDays;
           console.error(
             `[speed-camera-sync] ⚠️ ${source.name} 抓取失敗但庫存資料仍新鮮（${staleDays.toFixed(1)} 天前），視為可容忍`
+          );
+        }
+      }
+
+      // 本輪沒寫成的前置來源：資料庫裡它的舊資料原樣保留（沒清 stale），national-npa 仍要拿它們去重，
+      // 否則會把同一批桿再寫一次。2026-09-26 實例：GitHub runner 被 TGOS 擋，freeway-npa 黃燈，
+      // national-npa 少了國道座標，多寫進 314 筆重複的國道桿（其中 24 筆是舊羅盤方位）。
+      if (!source.dedupeAgainstOtherSources) {
+        const existingPoints = await getExistingConfirmedPointsForSource(supabase, source.name);
+        if (existingPoints) {
+          for (const p of existingPoints) collectedPoints.push(p);
+          console.error(
+            `[speed-camera-sync] ${source.name} 本輪未更新，改用資料庫既有 ${existingPoints.length} 個確認點位當 national-npa 去重基準`
+          );
+        } else {
+          dedupeBasisMissing.push(source.name);
+          console.error(
+            `[speed-camera-sync] ⚠️ ${source.name} 本輪未更新且查不到資料庫既有點位 ⇒ national-npa 本輪將不寫入`
           );
         }
       }
@@ -811,6 +862,7 @@ module.exports = {
   resolveTaichungFixedPdfUrl,
   resolveFreewayNpaZipUrl,
   pickFreewayNpaZipUrl,
+  getExistingConfirmedPointsForSource,
   GEOCODE_MAX_CALLS_PER_RUN,
   ROW_COLLAPSE_MIN_RATIO,
 };
