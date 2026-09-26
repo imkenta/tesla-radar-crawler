@@ -202,6 +202,7 @@ national-npa 入庫後縣市分佈：臺南市 139、屏東縣 106、雲林縣 9
 ## `freeway-npa` 國道固定式專源
 
 - 資料集：國道公路固定式測速照相地點（[data.gov.tw/dataset/13940](https://data.gov.tw/dataset/13940)）。
+- 下載連結（2026-09-26 起）：每輪先打 `https://data.gov.tw/api/v2/rest/dataset/13940`，取 `distribution[].resourceDownloadUrl` 裡的 TGOS ZIP（`resolveFreewayNpaZipUrl`）。檔名含發布日（`1150720-…zip`），官方換新檔時舊檔可能照樣 200，寫死網址會靜默過期；解析失敗才退回 `SOURCES` 內建網址。同步 log 出現 `freeway-npa 解析到的當前檔案與內建網址不同（官方已換檔）` ＝官方換檔了：資料照新檔寫入，但**國道方位表要重跑**（新桿不在表內會印 `⚠️ … 不在方位表內`），並把內建網址更新成新檔。
 - 格式：TGOS ZIP，內含一個資料 CSV 與 `manifest.csv`。parser 使用直接依賴 `yauzl` 在記憶體中讀取唯一非 manifest CSV，不把 ZIP entry 解壓到檔案系統。
 - 欄位：`設備編號,型式,縣市,行政區,設置區域描述,設置地點,取締項目,座標緯度,座標經度,拍攝方向,速限,管轄單位,備註`。
 - `SOURCES` 順序固定為 `taipei → new-taipei → new-taipei-section → kaohsiung → taoyuan → tainan → taichung → taichung-mobile → freeway-npa → national-npa`。國道專源先進入座標聯集，最後的全國集才做 30 公尺座標去重，因此同點優先保留 raw 欄位較完整的國道專源。

@@ -140,6 +140,10 @@ const SOURCES = [
     // 高速公路局／警政署國道固定式測速照相點位（TGOS ZIP）。
     // 放在 national-npa 之前，讓較豐富的國道設備／取締欄位在 30m 去重時優先保留。
     name: 'freeway-npa',
+    // ⚠️ 2026-09-26：檔名含發布日（1150720＝民國 115/07/20），官方換新檔時舊檔可能照樣 200 ⇒
+    // 寫死網址會**靜默過期**（同 9/16 台中 PDF 那一類）。每輪先從 data.gov.tw 資料集 API 取當前
+    // 下載連結（resolveUrl），url 僅作為解析失敗時的保底。
+    resolveUrl: resolveFreewayNpaZipUrl,
     url: 'https://www.tgos.tw/tgos/VirtualDir/Product/c2dd3a68-cafc-48fc-8a4a-7215ddc24cd3/1150720-%E5%9C%8B%E9%81%93%E5%85%AC%E8%B7%AF%E5%9B%BA%E5%AE%9A%E5%BC%8F%E6%B8%AC%E9%80%9F%E7%85%A7%E7%9B%B8%E5%9C%B0%E9%BB%9E.zip',
     parse: parseFreewayNpa,
     fallbackUrls: [],
@@ -315,6 +319,32 @@ async function resolveTaichungFixedPdfUrl() {
   throw new Error('公告頁找不到「固定式…一覽表」PDF 連結');
 }
 
+const FREEWAY_NPA_DATASET_API = 'https://data.gov.tw/api/v2/rest/dataset/13940';
+
+/**
+ * 從 data.gov.tw 資料集 API（v2）的回應挑出國道固定式清單當前的 TGOS ZIP 連結。
+ * 中文檔名轉成百分比編碼（`new URL().href`），與內建 url 同一格式，未換檔時兩者相等、不印換檔 log。
+ * @returns {string} 絕對 URL
+ */
+function pickFreewayNpaZipUrl(payload) {
+  const distribution = (payload && payload.result && payload.result.distribution) || [];
+  for (const item of distribution) {
+    const raw = String((item && item.resourceDownloadUrl) || '').trim();
+    if (!/^https:\/\/www\.tgos\.tw\//i.test(raw) || !/\.zip$/i.test(raw)) continue;
+    return new URL(raw).href;
+  }
+  throw new Error('資料集 API 找不到 TGOS ZIP 下載連結');
+}
+
+/**
+ * 國道固定式清單（data.gov.tw/dataset/13940）當前的下載連結。解析不到就讓呼叫端退回寫死的 url。
+ * @returns {Promise<string>}
+ */
+async function resolveFreewayNpaZipUrl() {
+  const buffer = await fetchWithRetry(FREEWAY_NPA_DATASET_API, 'freeway-npa 資料集 API', 2, FETCH_RETRY_DELAYS_MS);
+  return pickFreewayNpaZipUrl(JSON.parse(buffer.toString('utf8')));
+}
+
 async function fetchSourceBuffer(source) {
   let totalAttempts = 0;
   const primaryAttempts = Math.min(FETCH_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS);
@@ -326,11 +356,11 @@ async function fetchSourceBuffer(source) {
     try {
       primaryUrl = await source.resolveUrl();
       if (primaryUrl !== source.url) {
-        console.error(`[speed-camera-sync] ${source.name} 公告頁解析到當前檔案：${primaryUrl.slice(0, 120)}`);
+        console.error(`[speed-camera-sync] ${source.name} 解析到的當前檔案與內建網址不同（官方已換檔）：${primaryUrl.slice(0, 160)}`);
       }
     } catch (resolveErr) {
       console.error(
-        `[speed-camera-sync] ${source.name} 公告頁解析失敗（改用內建 URL）：${resolveErr.message}`
+        `[speed-camera-sync] ${source.name} 當前檔案解析失敗（改用內建 URL）：${resolveErr.message}`
       );
       primaryUrl = source.url;
     }
@@ -779,6 +809,8 @@ module.exports = {
   getExistingCoordsForSource,
   getPreviousYellowSources,
   resolveTaichungFixedPdfUrl,
+  resolveFreewayNpaZipUrl,
+  pickFreewayNpaZipUrl,
   GEOCODE_MAX_CALLS_PER_RUN,
   ROW_COLLAPSE_MIN_RATIO,
 };

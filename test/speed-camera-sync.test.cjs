@@ -960,3 +960,51 @@ test('describeUnexpectedHtml：CSV／JSON／PDF／空內容都不是網頁', () 
   assert.equal(describeUnexpectedHtml(Buffer.alloc(0)), null);
   assert.equal(describeUnexpectedHtml(null), null);
 });
+
+// ── 國道固定式清單的下載連結每輪從 data.gov.tw 解析（2026-09-26）────────────────
+// 檔名含發布日（1150720-…zip）：官方換新檔時舊檔可能照樣 200，寫死網址會靜默過期。
+
+const FREEWAY_DATASET_PAYLOAD = (downloadUrl) => ({
+  success: true,
+  result: {
+    datasetId: 13940,
+    modifiedDate: '2026-07-22 15:10:28',
+    distribution: [{ resourceFormat: 'CSV', resourceDownloadUrl: downloadUrl }],
+  },
+});
+
+test('pickFreewayNpaZipUrl：未換檔時解析結果與內建網址完全相同（不會誤印換檔）', () => {
+  const builtIn = SOURCES.find((s) => s.name === 'freeway-npa').url;
+  const url = speedCameraSync.pickFreewayNpaZipUrl(FREEWAY_DATASET_PAYLOAD(
+    'https://www.tgos.tw/tgos/VirtualDir/Product/c2dd3a68-cafc-48fc-8a4a-7215ddc24cd3/1150720-國道公路固定式測速照相地點.zip'
+  ));
+  assert.equal(url, builtIn);
+});
+
+test('pickFreewayNpaZipUrl：官方換新檔 → 回傳新檔（百分比編碼）；沒有 TGOS ZIP → 丟錯交給保底', () => {
+  const url = speedCameraSync.pickFreewayNpaZipUrl(FREEWAY_DATASET_PAYLOAD(
+    'https://www.tgos.tw/tgos/VirtualDir/Product/c2dd3a68-cafc-48fc-8a4a-7215ddc24cd3/1151015-國道公路固定式測速照相地點.zip'
+  ));
+  assert.match(url, /\/1151015-%E5%9C%8B%E9%81%93/);
+  assert.throws(() => speedCameraSync.pickFreewayNpaZipUrl(FREEWAY_DATASET_PAYLOAD('https://example.com/a.csv')), /找不到 TGOS ZIP/);
+  assert.throws(() => speedCameraSync.pickFreewayNpaZipUrl({ success: false }), /找不到 TGOS ZIP/);
+});
+
+test('resolveFreewayNpaZipUrl：向 data.gov.tw 資料集 API 取當前連結', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const buf = Buffer.from(JSON.stringify(FREEWAY_DATASET_PAYLOAD(
+    'https://www.tgos.tw/tgos/VirtualDir/Product/x/1151015-國道公路固定式測速照相地點.zip'
+  )), 'utf8');
+  const calls = [];
+  globalThis.fetch = mock.fn(async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) };
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const url = await speedCameraSync.resolveFreewayNpaZipUrl();
+  assert.deepEqual(calls, ['https://data.gov.tw/api/v2/rest/dataset/13940']);
+  assert.match(url, /1151015-/);
+  assert.equal(typeof SOURCES.find((s) => s.name === 'freeway-npa').resolveUrl, 'function', 'freeway-npa 要接上 resolveUrl');
+});
