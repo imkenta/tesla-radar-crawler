@@ -26,6 +26,16 @@ function robustIncreasing(list, x, WIN) {
   if (kept.length) m = cmean(kept);
   return { b: m, pairs: bs.length, agree: kept.length / bs.length };
 }
+// 局部「里程遞增方向」（2026-09-26，C-64 國四東向 24.778K 算反）：只取里程差 0.5–3km 的鄰桿
+// （兩個方向的桿都算，同一條路幾何相同），由低里程指向高里程取圓平均。
+// 為什麼要有：整條路的平均方向在轉彎的國道上沒有意義——國四西段東西向、東段轉南北向，
+// 平均出 131°，拿它去挑 OSM 車道會挑到對向車道（真實 ≈280°、表上寫成 102°，9/25 實車漏報）。
+function localIncreasing(list, x) {
+  const near = list.filter(y => y !== x && y.onRoad && Math.abs(y.p.km - x.p.km) >= 0.5 && Math.abs(y.p.km - x.p.km) <= 3);
+  if (!near.length) return null;
+  const bs = near.map(y => (y.p.km > x.p.km ? bearing(x.pt, y.pt) : bearing(y.pt, x.pt)));
+  return { b: cmean(bs), n: bs.length };
+}
 const out = [];
 for (const fw of Object.keys(byFw)) {
   const list = byFw[fw].sort((a, b) => a.p.km - b.p.km);
@@ -33,13 +43,20 @@ for (const fw of Object.keys(byFw)) {
     let inc = null; for (const W of [8, 15, 30, 60]) { inc = robustIncreasing(list, x, W); if (inc && inc.pairs >= 3) break; }
     const increasing = (x.p.dir === '南' || x.p.dir === '東');
     const chord = inc ? norm(increasing ? inc.b : inc.b + 180) : null;
+    const loc = localIncreasing(list, x);
+    const local = loc ? norm(increasing ? loc.b : loc.b + 180) : null;
+    // 挑車道用的參考方向：有局部鄰桿就用局部，沒有才退回整段平均。
+    const ref = local != null ? local : chord;
     const cands = [];
     for (const w of ways) { const g = w.geometry; let best = null; for (let i = 0; i + 1 < g.length; i++) { const d = distToSeg(x.pt, g[i], g[i + 1]); if (!best || d < best.d) best = { d, b: bearing(g[i], g[i + 1]) }; } if (best && best.d <= 400) { let b = best.b; if (w.tags.oneway === '-1') b = norm(b + 180); cands.push({ d: best.d, b, hw: w.tags.highway, ref: w.tags.ref || '', id: w.id }); } }
     const rank = k => (k.hw === 'motorway' ? 0 : k.hw === 'trunk' ? 1 : 2);
-    const ok = chord == null ? [] : cands.filter(k => adiff(k.b, chord) < 60).sort((a, b) => rank(a) - rank(b) || a.d - b.d);
+    // 局部參考容許到 <90°（彎道上鄰桿弦與切線可差 60° 以上，國四 24.778K：弦 215°、切線 280°），
+    // 只要求「同側」；整段平均仍維持 <60°。
+    const tol = local != null ? 90 : 60;
+    const ok = ref == null ? [] : cands.filter(k => adiff(k.b, ref) < tol).sort((a, b) => rank(a) - rank(b) || a.d - b.d);
     const pick = ok[0] || null;
     const newB = pick ? Math.round(pick.b) : (chord != null ? Math.round(chord) : null);
-    out.push({ id: x.c.id, road: x.c.road, fw, km: x.p.km, dir: x.p.dir, lat: x.c.lat, lng: x.c.lng, old: x.c.direction_bearing, chord: chord == null ? null : Math.round(chord), chordPairs: inc ? inc.pairs : 0, chordAgree: inc ? +inc.agree.toFixed(2) : null, osm: pick ? Math.round(pick.b) : null, osmDist: pick ? Math.round(pick.d) : null, osmHw: pick ? pick.hw : null, nCands: cands.length, newB, method: pick ? 'osm' : (chord != null ? 'chord' : 'none'), dOldNew: newB == null ? null : Math.round(adiff(newB, x.c.direction_bearing)), dChordOsm: pick && chord != null ? Math.round(adiff(pick.b, chord)) : null });
+    out.push({ id: x.c.id, road: x.c.road, fw, km: x.p.km, dir: x.p.dir, lat: x.c.lat, lng: x.c.lng, old: x.c.direction_bearing, chord: chord == null ? null : Math.round(chord), chordPairs: inc ? inc.pairs : 0, chordAgree: inc ? +inc.agree.toFixed(2) : null, osm: pick ? Math.round(pick.b) : null, osmDist: pick ? Math.round(pick.d) : null, osmHw: pick ? pick.hw : null, nCands: cands.length, newB, method: pick ? 'osm' : (chord != null ? 'chord' : 'none'), dOldNew: newB == null ? null : Math.round(adiff(newB, x.c.direction_bearing)), dChordOsm: pick && chord != null ? Math.round(adiff(pick.b, chord)) : null, local: local == null ? null : Math.round(local), localPairs: loc ? loc.n : 0, dLocalNew: newB == null || local == null ? null : Math.round(adiff(newB, local)) });
   }
 }
 fs.writeFileSync(process.argv[5], JSON.stringify(out, null, 1));
@@ -49,3 +66,5 @@ console.log('\n=== 舊值已判反（≥90°）===');
 for (const o of out.filter(o => o.dOldNew >= 90).sort((a, b) => b.dOldNew - a.dOldNew)) console.log(`${String(o.dOldNew).padStart(3)}°  ${o.road.padEnd(18)} 舊=${o.old} 新=${o.newB}（${o.method}${o.osmDist != null ? ' ' + o.osmDist + 'm' : ''}；弦=${o.chord} 對數=${o.chordPairs} 一致=${o.chordAgree}）`);
 console.log('\n=== 需人工看：非 OSM／OSM 距離>40m／弦一致度<0.7／OSM 與弦差>45° ===');
 for (const o of out.filter(o => o.method !== 'osm' || o.osmDist > 40 || (o.chordAgree != null && o.chordAgree < 0.7) || (o.dChordOsm != null && o.dChordOsm > 45))) console.log(`${o.road.padEnd(18)} 新=${o.newB} method=${o.method} osmDist=${o.osmDist} 弦=${o.chord} 對數=${o.chordPairs} 一致=${o.chordAgree} 弦↔osm=${o.dChordOsm} 舊=${o.old} (${o.lat},${o.lng})`);
+console.log('\n=== 與局部鄰桿方向差 ≥90°（必定算反，不得寫進表）===');
+for (const o of out.filter(o => o.dLocalNew != null && o.dLocalNew >= 90)) console.log(`${o.road.padEnd(18)} 新=${o.newB} 局部=${o.local} 差=${o.dLocalNew}`);

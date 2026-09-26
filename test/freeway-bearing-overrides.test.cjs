@@ -143,3 +143,64 @@ test('方位表：同一里程點的南北（東西）向兩支桿方位必須�
   }
   assert.ok(pairs >= 10, `應有足夠的對向配對可驗（實得 ${pairs}）`);
 });
+
+// 2026-09-25 宜蘭→台中長途實車（TeslaToolbox C-64 續驗）：軌跡 60m 內經過當下的 GPS course。
+// 國四東向 24.778K 在 S 形彎上（車頭 280°），表上原本寫 102°＝對向車道的切線 ⇒ 真桿被當對向排除、漏報。
+const GROUND_TRUTH_0925 = [
+  ['國道四號東向24.778公里', 280, true],
+  ['國道四號西向23.3公里', 185, false],
+  ['國道一號南向60.1公里', 226, true],
+  ['國道一號南向78.2公里', 261, true],
+  ['國道一號南向81.8公里', 274, true],
+  ['國道一號南向86.5公里', 200, true],
+  ['國道一號南向124公里', 178, true],
+  ['國道一號南向129.15公里', 200, true],
+  ['國道一號南向165.3公里', 180, true],
+  ['國道一號北向63.7公里', 192, false],
+  ['國道一號北向82.1公里', 275, false],
+  ['國道一號北向127.5公里', 215, false],
+  ['國道一號北向157.4公里', 207, false],
+];
+
+test('方位表：2026-09-25 實車（含國四 S 形彎）真桿同向、對向桿判成對向', () => {
+  for (const [road, course, shouldMatch] of GROUND_TRUTH_0925) {
+    const e = table.entries.find((x) => x.road === road && !x.keep_compass);
+    assert.ok(e, `${road} 應在表內且有方位`);
+    const d = angleDiff(e.bearing, course);
+    if (shouldMatch) assert.ok(d < 45, `${road} 車頭 ${course}° 應同向，實得夾角 ${d}°`);
+    else assert.ok(d > 135, `${road} 車頭 ${course}° 應為對向，實得夾角 ${d}°`);
+  }
+});
+
+// 局部鄰桿守門（2026-09-26）：同一條國道、里程差 0.5–3km 的鄰桿連線給出「里程遞增方向」；
+// 表上的方位與它（依南／東＝遞增、北／西＝遞減換算後）差 ≥90° ＝挑到對向車道，必須擋下。
+// 彎道上鄰桿弦與切線可差 60° 以上（國四 24.778K：弦 215°、切線 281°），所以門檻只要求「同側」。
+test('方位表：每支改寫的桿與局部鄰桿方向同側（差 <90°）', () => {
+  const R = 6371000;
+  const rad = (x) => (x * Math.PI) / 180;
+  const brg = (a, b) => {
+    const y = Math.sin(rad(b.lng - a.lng)) * Math.cos(rad(b.lat));
+    const x = Math.cos(rad(a.lat)) * Math.sin(rad(b.lat)) - Math.sin(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.cos(rad(b.lng - a.lng));
+    return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+  };
+  const cmean = (bs) => ((Math.atan2(bs.reduce((s, b) => s + Math.sin(rad(b)), 0), bs.reduce((s, b) => s + Math.cos(rad(b)), 0)) * 180) / Math.PI + 360) % 360;
+  const dist = (a, b) => Math.hypot(rad(b.lng - a.lng) * Math.cos(rad(a.lat)), rad(b.lat - a.lat)) * R;
+  const parsed = table.entries.filter((e) => !e.keep_compass).map((e) => {
+    const m = /^國道(.+?號(?:甲線)?)(?:五楊|汐五)?(北|南|東|西)向([0-9.]+)公里$/.exec(e.road);
+    return m && { e, fw: m[1], inc: m[2] === '南' || m[2] === '東', km: parseFloat(m[3]) };
+  }).filter(Boolean);
+  let checked = 0;
+  for (const x of parsed) {
+    // 座標距離也要合理（≤ 里程差×1.6＋300m），排除來源座標錯置的鄰桿
+    const near = parsed.filter((y) => y !== x && y.fw === x.fw
+      && Math.abs(y.km - x.km) >= 0.5 && Math.abs(y.km - x.km) <= 3
+      && dist(x.e, y.e) <= Math.abs(y.km - x.km) * 1000 * 1.6 + 300);
+    if (!near.length) continue;
+    const local = cmean(near.map((y) => (y.km > x.km ? brg(x.e, y.e) : brg(y.e, x.e))));
+    const expect = x.inc ? local : (local + 180) % 360;
+    const d = angleDiff(x.e.bearing, expect);
+    assert.ok(d < 90, `${x.e.road} 表上 ${x.e.bearing}° 與局部鄰桿方向 ${Math.round(expect)}° 差 ${Math.round(d)}°（疑似挑到對向車道）`);
+    checked += 1;
+  }
+  assert.ok(checked >= 80, `應有足夠的桿可驗（實得 ${checked}）`);
+});
