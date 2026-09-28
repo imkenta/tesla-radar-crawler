@@ -133,6 +133,15 @@ test('道路類別只用可驗證文字判斷：國道、快速道路、一般�
   assert.equal(inferRoadLevel('國道五號南下'), 'unknown');
 });
 
+test('inferRoadClass：「中彰快速道路」（台74）與「快速道路86線」歸快速道路；市區「快速道路／快速路」維持一般道路（2026-09-28）', () => {
+  // 9/25、9/28 實車：中彰快速道路 25.9K／27.5K 被判成 ordinary，App 不做方向排除，對向桿兩度出聲。
+  assert.equal(inferRoadClass({ city: '臺中市', road: '太平區中彰快速道路27.5K (往大里方向)', address: '' }), 'expressway');
+  assert.equal(inferRoadClass({ city: '臺中市', road: '太平區中彰快速道路25.9K(往潭子方向)', address: '' }), 'expressway');
+  assert.equal(inferRoadClass({ city: '臺南市', road: '快速道路86線西向3.9K處', address: '' }), 'expressway');
+  assert.equal(inferRoadClass({ city: '臺北市', road: '水源快速道路', address: '' }), 'ordinary');
+  assert.equal(inferRoadClass({ city: '高雄市', road: '金陵路與快速路口', address: '' }), 'ordinary');
+});
+
 test('inferRoadClass：freeway-npa 縣市留白時仍能從 road 判斷國道（2026-08-03 雪隧對向測速誤放行事故回歸測試）', () => {
   // data.gov.tw/dataset/13940（freeway-npa）的「縣市」「行政區」欄位固定留白，路名只
   // 出現在「設置地點」（parser 對應到 road 欄，例：「國道五號北向16.9公里」）。
