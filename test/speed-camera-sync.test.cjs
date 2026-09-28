@@ -1068,3 +1068,44 @@ test('writeAll：前置來源沒更新又查不到資料庫既有點位 → nati
   assert.equal(calls.upsert.filter((c) => c.payload[0].source === 'national-npa').length, 0, '不得 upsert');
   assert.equal(calls.delete.filter((c) => c.eq.source === 'national-npa').length, 0, '不得清 stale');
 });
+
+// ── 國道桿同名去重（2026-09-28）──────────────────────────────────────────────
+// 實車：國四西向 4.4K 在 freeway-npa 與 national-npa 各一筆、座標差 613m，30m 座標去重擋不到 ⇒ 預警兩次。
+
+test('dropFreewayNameDuplicates：專屬清單已有的國道桿丟掉；非國道、專屬清單沒有的國道桿保留', () => {
+  const { dropFreewayNameDuplicates, normalizeRoadName } = require('../lib/speed-camera-writer.cjs');
+  const names = new Set([normalizeRoadName('國道四號西向4.4公里')]);
+  const { kept, dropped } = dropFreewayNameDuplicates([
+    { road: '國道四號西向 4.4公里', road_class: 'freeway' },
+    { road: '國道三號南向262.1公里', road_class: 'freeway' },
+    { road: '國道四號西向4.4公里', road_class: 'ordinary' },
+  ], names);
+  assert.deepEqual(dropped, ['國道四號西向4.4公里']);
+  assert.deepEqual(kept.map((r) => r.road), ['國道三號南向262.1公里', '國道四號西向4.4公里']);
+});
+
+test('writeAll：freeway-npa 本輪失敗時，national-npa 仍用資料庫既有國道路名做同名去重', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const nationalCsv = Buffer.from(
+    'CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit\n' +
+      '設置縣市,設置市區鄉鎮,設置地址,管轄警局,管轄分局,經度,緯度,拍攝方向,速限\n' +
+      '臺中市,清水區,國道四號西向4.4公里,國道公路警察局,,120.63327,24.302769,往西,100\n' +
+      '金門縣,金湖鎮,金湖鎮黃海路(陽明湖路段),金門縣警察局,金湖分局,118.43147,24.458809,南北雙向,60\n',
+    'utf8'
+  );
+  globalThis.fetch = fetchReturning({ 'new-taipei': NTPC_CSV, 'national-npa': nationalCsv });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const { from, calls } = makeFakeSupabase({
+    existingCoordsImpl: (sourceName) =>
+      sourceName === 'freeway-npa'
+        ? { data: [{ lat: 24.305093, lng: 120.62779, road: '國道四號西向4.4公里', road_class: 'freeway' }], error: null }
+        : { data: [], error: null },
+  });
+
+  await writeAll({ from }, { geocoder: fakeGeocoder().geocoder });
+
+  const nationalUpsertCall = calls.upsert.find((c) => c.payload[0].source === 'national-npa');
+  assert.deepEqual(nationalUpsertCall.payload.map((p) => p.city), ['金門縣'], '座標差 613m 的同名國道桿必須丟掉');
+});

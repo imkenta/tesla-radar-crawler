@@ -48,6 +48,8 @@ const {
   fillMissingCoords,
   collapseSourceConflictDuplicates,
   dedupeAgainstExisting,
+  dropFreewayNameDuplicates,
+  normalizeRoadName,
 } = require('./lib/speed-camera-writer.cjs');
 const { createGeocoder } = require('./lib/geocoder.cjs');
 
@@ -480,7 +482,8 @@ async function getExistingCoordsForSource(supabase, sourceName) {
 /**
  * 某來源在資料庫裡既有的「確認」點位，給 national-npa 聯集去重當基準（該來源本輪沒更新時用）。
  * 分頁讀取，避開 PostgREST max-rows 1000 的靜默截斷。
- * @returns {Promise<{lat:number,lng:number}[]|null>} 查詢失敗回 null（呼叫端要當成「基準不完整」）
+ * 也帶回 road／road_class，給國道桿同名去重（dropFreewayNameDuplicates）用。
+ * @returns {Promise<{lat:number,lng:number,road:string,road_class:string}[]|null>} 查詢失敗回 null（呼叫端要當成「基準不完整」）
  */
 async function getExistingConfirmedPointsForSource(supabase, sourceName) {
   const PAGE = 1000;
@@ -488,7 +491,7 @@ async function getExistingConfirmedPointsForSource(supabase, sourceName) {
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
       .from('speed_cameras')
-      .select('lat, lng')
+      .select('lat, lng, road, road_class')
       .eq('source', sourceName)
       .eq('speed_status', 'confirmed')
       .not('lat', 'is', null)
@@ -496,7 +499,7 @@ async function getExistingConfirmedPointsForSource(supabase, sourceName) {
       .order('id', { ascending: true })
       .range(from, from + PAGE - 1);
     if (error || !Array.isArray(data)) return null;
-    for (const row of data) points.push({ lat: row.lat, lng: row.lng });
+    for (const row of data) points.push({ lat: row.lat, lng: row.lng, road: row.road, road_class: row.road_class });
     if (data.length < PAGE) return points;
   }
 }
@@ -508,6 +511,8 @@ async function syncAll() {
   // （dry-run 不連 DB，台南無 geocode 補值，座標為 null，不會參與比對，見
   // dedupeAgainstExisting 的說明；行為與 --write 模式一致地繼承這個既有限制）。
   const collectedPoints = [];
+  // 國道桿同名去重用：前置來源已收錄的國道桿路名（見 dropFreewayNameDuplicates）。
+  const collectedFreewayRoads = new Set();
 
   for (const source of SOURCES) {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
@@ -519,6 +524,14 @@ async function syncAll() {
       records = collapseSourceRecords(records, source.name);
 
       if (source.dedupeAgainstOtherSources) {
+        const nameDedupe = dropFreewayNameDuplicates(records, collectedFreewayRoads);
+        if (nameDedupe.dropped.length > 0) {
+          console.error(
+            `[speed-camera-sync] ${source.name} 國道桿同名去重：丟棄 ${nameDedupe.dropped.length} 筆（國道專屬清單已收錄）：` +
+              nameDedupe.dropped.slice(0, 20).join('、') + (nameDedupe.dropped.length > 20 ? '…' : '')
+          );
+        }
+        records = nameDedupe.kept;
         const before = records.length;
         const { kept, droppedCount } = dedupeAgainstExisting(
           records,
@@ -533,6 +546,9 @@ async function syncAll() {
         for (const r of records) {
           if (isConfirmedSpeedRecord(r) && r.lat != null && r.lng != null) {
             collectedPoints.push({ lat: r.lat, lng: r.lng });
+          }
+          if (isConfirmedSpeedRecord(r) && r.road_class === 'freeway') {
+            collectedFreewayRoads.add(normalizeRoadName(r.road));
           }
         }
       }
@@ -578,6 +594,8 @@ async function writeAll(supabase, opts = {}) {
   // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析（含台南 geocode
   // 補值後）的座標點位，見 SOURCES 內 national-npa 項與 dedupeAgainstExisting 說明。
   const collectedPoints = [];
+  // 國道桿同名去重用：前置來源已收錄的國道桿路名（見 dropFreewayNameDuplicates）。
+  const collectedFreewayRoads = new Set();
   // 本輪沒更新、又查不到資料庫既有點位的前置來源（見下方 catch）。非空時 national-npa 本輪不寫入。
   const dedupeBasisMissing = [];
 
@@ -622,6 +640,14 @@ async function writeAll(supabase, opts = {}) {
             `去重基準不完整（${dedupeBasisMissing.join('、')} 本輪未更新且查不到資料庫既有點位），本輪不寫入以免重複收錄`
           );
         }
+        const nameDedupe = dropFreewayNameDuplicates(records, collectedFreewayRoads);
+        if (nameDedupe.dropped.length > 0) {
+          console.error(
+            `[speed-camera-sync] ${source.name} 國道桿同名去重：丟棄 ${nameDedupe.dropped.length} 筆（國道專屬清單已收錄）：` +
+              nameDedupe.dropped.slice(0, 20).join('、') + (nameDedupe.dropped.length > 20 ? '…' : '')
+          );
+        }
+        records = nameDedupe.kept;
         const before = records.length;
         const { kept, droppedCount } = dedupeAgainstExisting(
           records,
@@ -636,6 +662,9 @@ async function writeAll(supabase, opts = {}) {
         for (const r of records) {
           if (isConfirmedSpeedRecord(r) && r.lat != null && r.lng != null) {
             collectedPoints.push({ lat: r.lat, lng: r.lng });
+          }
+          if (isConfirmedSpeedRecord(r) && r.road_class === 'freeway') {
+            collectedFreewayRoads.add(normalizeRoadName(r.road));
           }
         }
       }
@@ -713,7 +742,10 @@ async function writeAll(supabase, opts = {}) {
       if (!source.dedupeAgainstOtherSources) {
         const existingPoints = await getExistingConfirmedPointsForSource(supabase, source.name);
         if (existingPoints) {
-          for (const p of existingPoints) collectedPoints.push(p);
+          for (const p of existingPoints) {
+            collectedPoints.push({ lat: p.lat, lng: p.lng });
+            if (p.road_class === 'freeway') collectedFreewayRoads.add(normalizeRoadName(p.road));
+          }
           console.error(
             `[speed-camera-sync] ${source.name} 本輪未更新，改用資料庫既有 ${existingPoints.length} 個確認點位當 national-npa 去重基準`
           );
