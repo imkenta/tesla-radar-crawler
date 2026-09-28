@@ -87,8 +87,9 @@ test('方位表：每筆不是 0–359 的整數方位就是 keep_compass，且 
     assert.ok(!seen.has(key), `重複：${key}`);
     seen.add(key);
   }
-  assert.equal(table.entries.filter((e) => !e.keep_compass).length, 170);
-  assert.equal(table.entries.filter((e) => e.keep_compass).length, 18);
+  // 2026-09-28：18 支 keep_compass 中 5 支以 9/26 OSM（國道主線 1–9m）＋局部鄰桿方向複核後改寫。
+  assert.equal(table.entries.filter((e) => !e.keep_compass).length, 175);
+  assert.equal(table.entries.filter((e) => e.keep_compass).length, 13);
 });
 
 // 2026-09-19 實車 ground truth（TeslaToolbox C-64）：通過／預警當下的 GPS course。
@@ -160,6 +161,8 @@ const GROUND_TRUTH_0925 = [
   ['國道一號北向82.1公里', 275, false],
   ['國道一號北向127.5公里', 215, false],
   ['國道一號北向157.4公里', 207, false],
+  // 2026-09-28 霧峰→頭城：國三北向 30.1K 原為 keep_compass（0°），車頭 134–142° 貼桿 6m 通過卻零預警（漏報）。
+  ['國道三號北向30.1公里', 138, true],
 ];
 
 test('方位表：2026-09-25 實車（含國四 S 形彎）真桿同向、對向桿判成對向', () => {
