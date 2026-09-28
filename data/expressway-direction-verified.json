@@ -1,0 +1,431 @@
+{
+ "version": 1,
+ "generated_at": "2026-09-28",
+ "how": "tools/expressway-directions/README.md",
+ "entries": [
+  {
+   "road": "中環路2段台65線高架下（新泰路401巷29號對面）",
+   "lat": 25.043478,
+   "lng": 121.44227,
+   "label_bearing": 0,
+   "lane_bearing": 1,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "中環路3段台65線下橋墩（往中原路）",
+   "lat": 25.051252,
+   "lng": 121.442406,
+   "label_bearing": 0,
+   "lane_bearing": 1,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "口湖鄉台61線快速道路246K+100m",
+   "lat": 23.585243,
+   "lng": 120.15164,
+   "label_bearing": 180,
+   "lane_bearing": 204,
+   "lane_distance_m": 0
+  },
+  {
+   "road": "台61線39.6K",
+   "lat": 25.044822,
+   "lng": 121.078292,
+   "label_bearing": 180,
+   "lane_bearing": 224,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "台61線8.95公里處（往林口）",
+   "lat": 25.132078,
+   "lng": 121.3567,
+   "label_bearing": 225,
+   "lane_bearing": 245,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "台61線南下平面50.8K處",
+   "lat": 25.013884,
+   "lng": 121.03625,
+   "label_bearing": 180,
+   "lane_bearing": 224,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台61線快速公路8.6公里處（往八里）",
+   "lat": 25.13318,
+   "lng": 121.35972,
+   "label_bearing": 45,
+   "lane_bearing": 65,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "台61線東石鄉257.31K處(往南)",
+   "lat": 23.503832,
+   "lng": 120.17244,
+   "label_bearing": 180,
+   "lane_bearing": 196,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台61線東石鄉264.336K處(往北)",
+   "lat": 23.441223,
+   "lng": 120.16569,
+   "label_bearing": 0,
+   "lane_bearing": 0,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "台61線與苗11線口處",
+   "lat": 24.637379,
+   "lng": 120.78327,
+   "label_bearing": 0,
+   "lane_bearing": 44,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "台62甲1號隧道出口(0.7K處)",
+   "lat": 25.13217,
+   "lng": 121.77228,
+   "label_bearing": 0,
+   "lane_bearing": 327,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "台62甲線3號隧道內北上3.7K處",
+   "lat": 25.124207,
+   "lng": 121.77978,
+   "label_bearing": 0,
+   "lane_bearing": 326,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "台62甲線3號隧道內南下3.69K處",
+   "lat": 25.12413,
+   "lng": 121.77956,
+   "label_bearing": 180,
+   "lane_bearing": 147,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台62甲線3號隧道出口處至東海街出口(南往北)區間測速",
+   "lat": 25.124674,
+   "lng": 121.77938,
+   "label_bearing": 0,
+   "lane_bearing": 325,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "台62甲線5公里處（往四腳亭方向）",
+   "lat": 25.115046,
+   "lng": 121.77535,
+   "label_bearing": 180,
+   "lane_bearing": 189,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台62線快速公路16.83公里處（往基隆方向）",
+   "lat": 25.117172,
+   "lng": 121.80307,
+   "label_bearing": 225,
+   "lane_bearing": 242,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台62線快速公路16.95公里處（往瑞芳方向）",
+   "lat": 25.117487,
+   "lng": 121.804016,
+   "label_bearing": 45,
+   "lane_bearing": 63,
+   "lane_distance_m": 0
+  },
+  {
+   "road": "台64線快速公路10.4公里（往東）",
+   "lat": 25.092154,
+   "lng": 121.44844,
+   "label_bearing": 180,
+   "lane_bearing": 194,
+   "lane_distance_m": 7
+  },
+  {
+   "road": "台64線快速公路20.24公里（往東）",
+   "lat": 25.02822,
+   "lng": 121.46512,
+   "label_bearing": 180,
+   "lane_bearing": 150,
+   "lane_distance_m": 6
+  },
+  {
+   "road": "台64線快速公路23公里（往西）",
+   "lat": 25.009008,
+   "lng": 121.48208,
+   "label_bearing": 315,
+   "lane_bearing": 319,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "台64線快速公路9.5公里（往西）",
+   "lat": 25.099508,
+   "lng": 121.45219,
+   "label_bearing": 45,
+   "lane_bearing": 35,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "台65線快速公路10.4公里（往土城）",
+   "lat": 24.980164,
+   "lng": 121.438095,
+   "label_bearing": 180,
+   "lane_bearing": 202,
+   "lane_distance_m": 7
+  },
+  {
+   "road": "台65線快速公路10.4公里（往板橋）",
+   "lat": 24.980099,
+   "lng": 121.438286,
+   "label_bearing": 0,
+   "lane_bearing": 24,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "台65線快速公路5.4公里（往土城）",
+   "lat": 25.020021,
+   "lng": 121.446014,
+   "label_bearing": 135,
+   "lane_bearing": 137,
+   "lane_distance_m": 4
+  },
+  {
+   "road": "台66線3k至14.8k",
+   "lat": 25.015636,
+   "lng": 121.07962,
+   "label_bearing": 90,
+   "lane_bearing": 123,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "台68線12.3公里處",
+   "lat": 24.7936,
+   "lng": 121.03848,
+   "label_bearing": 90,
+   "lane_bearing": 115,
+   "lane_distance_m": 4
+  },
+  {
+   "road": "台68線12公里處",
+   "lat": 24.79509,
+   "lng": 121.0357,
+   "label_bearing": 270,
+   "lane_bearing": 296,
+   "lane_distance_m": 12
+  },
+  {
+   "road": "台68線榮濱路匝道口",
+   "lat": 24.845257,
+   "lng": 120.9341,
+   "label_bearing": 270,
+   "lane_bearing": 308,
+   "lane_distance_m": 24
+  },
+  {
+   "road": "台68線竹東匝道口與北興路三段",
+   "lat": 24.74986,
+   "lng": 121.08011,
+   "label_bearing": 180,
+   "lane_bearing": 128,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "台78線快速公路29k+400m處(東向西)",
+   "lat": 23.67321,
+   "lng": 120.45193,
+   "label_bearing": 270,
+   "lane_bearing": 321,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "台88快速道西向10公里處大發交流道前",
+   "lat": 22.592665,
+   "lng": 120.433383,
+   "label_bearing": 270,
+   "lane_bearing": 262,
+   "lane_distance_m": 11
+  },
+  {
+   "road": "大安區台61線143.5K (近南埔路)",
+   "lat": 24.33989,
+   "lng": 120.57088,
+   "label_bearing": 180,
+   "lane_bearing": 194,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "太平區中彰快速道路25.9K(往潭子方向)",
+   "lat": 24.149885,
+   "lng": 120.71485,
+   "label_bearing": 0,
+   "lane_bearing": 9,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "太平區中彰快速道路27.5K(往大里方向)",
+   "lat": 24.136902,
+   "lng": 120.70988,
+   "label_bearing": 180,
+   "lane_bearing": 199,
+   "lane_distance_m": 6
+  },
+  {
+   "road": "彰化市台74甲線3.4公里(慢車道速限40公里/小時)",
+   "lat": 24.063442,
+   "lng": 120.59272,
+   "label_bearing": 180,
+   "lane_bearing": 200,
+   "lane_distance_m": 0
+  },
+  {
+   "road": "快速道路86線西向3.9K處",
+   "lat": 22.927332,
+   "lng": 120.21165,
+   "label_bearing": 270,
+   "lane_bearing": 269,
+   "lane_distance_m": 9
+  },
+  {
+   "road": "東勢鄉台78線快速公路13k處(東向西)",
+   "lat": 23.685007,
+   "lng": 120.3066,
+   "label_bearing": 270,
+   "lane_bearing": 254,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "東勢鄉台78線快速公路13k處(西向東)",
+   "lat": 23.684862,
+   "lng": 120.30067,
+   "label_bearing": 90,
+   "lane_bearing": 109,
+   "lane_distance_m": 7
+  },
+  {
+   "road": "潭子區中彰快速道路19.4K (往快官方向)",
+   "lat": 24.2006,
+   "lng": 120.71106,
+   "label_bearing": 270,
+   "lane_bearing": 270,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "潭子區中彰快速道路19.4K (往霧峰方向)",
+   "lat": 24.20046,
+   "lng": 120.71087,
+   "label_bearing": 90,
+   "lane_bearing": 90,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "潭子區中彰快速道路19.4K(往太平方向)",
+   "lat": 24.200447,
+   "lng": 120.70982,
+   "label_bearing": 90,
+   "lane_bearing": 90,
+   "lane_distance_m": 7
+  },
+  {
+   "road": "潭子區中彰快速道路19.4K(往烏日方向)",
+   "lat": 24.20075,
+   "lng": 120.70975,
+   "label_bearing": 270,
+   "lane_bearing": 270,
+   "lane_distance_m": 14
+  },
+  {
+   "road": "萬瑞快速道路(台62線)11K+280(西行)",
+   "lat": 25.10187,
+   "lng": 121.75308,
+   "label_bearing": 270,
+   "lane_bearing": 244,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "萬瑞快速道路(台62線)11K+470(東行)",
+   "lat": 25.102283,
+   "lng": 121.754326,
+   "label_bearing": 90,
+   "lane_bearing": 64,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "線西鄉台61線170.11公里(快速道路)(20公噸以上大貨車速限80公里/小時)",
+   "lat": 24.13864,
+   "lng": 120.44376,
+   "label_bearing": 180,
+   "lane_bearing": 213,
+   "lane_distance_m": 2
+  },
+  {
+   "road": "臺1線342.7公里臺86線匝道路口",
+   "lat": 22.931923,
+   "lng": 120.22093,
+   "label_bearing": 180,
+   "lane_bearing": 180,
+   "lane_distance_m": 4
+  },
+  {
+   "road": "臺61線快速公路302.3公里處",
+   "lat": 23.119587,
+   "lng": 120.08741,
+   "label_bearing": 0,
+   "lane_bearing": 2,
+   "lane_distance_m": 5
+  },
+  {
+   "road": "臺西鄉台61線快速道路226K+850m",
+   "lat": 23.727283,
+   "lng": 120.220314,
+   "label_bearing": 0,
+   "lane_bearing": 52,
+   "lane_distance_m": 1
+  },
+  {
+   "road": "西屯區中彰快速道路12.7K (往烏日方向)",
+   "lat": 24.19427,
+   "lng": 120.64369,
+   "label_bearing": 270,
+   "lane_bearing": 234,
+   "lane_distance_m": 11
+  },
+  {
+   "road": "西屯區中彰快速道路12.7K(往烏日方向)",
+   "lat": 24.194983,
+   "lng": 120.644775,
+   "label_bearing": 270,
+   "lane_bearing": 236,
+   "lane_distance_m": 7
+  },
+  {
+   "road": "西屯區中彰快速道路13.3K(往中清路方向)",
+   "lat": 24.197182,
+   "lng": 120.650085,
+   "label_bearing": 90,
+   "lane_bearing": 65,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "西濱路一段與西濱路二段265巷口(台61線)",
+   "lat": 24.86839,
+   "lng": 120.95324,
+   "label_bearing": 180,
+   "lane_bearing": 185,
+   "lane_distance_m": 3
+  },
+  {
+   "road": "鹿港鎮台61線177至168.1公里(快速道路)(20公噸以上大貨車速限80公里/小時)",
+   "lat": 24.081823,
+   "lng": 120.42038,
+   "label_bearing": 0,
+   "lane_bearing": 47,
+   "lane_distance_m": 3
+  }
+ ]
+}

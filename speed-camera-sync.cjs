@@ -28,6 +28,7 @@
 
 const fs = require('fs');
 const { applyFreewayBearingOverrides, logFreewayBearingResult } = require('./lib/freeway-bearing-overrides.cjs');
+const { applyExpresswayDirectionVerification, logExpresswayDirectionResult } = require('./lib/expressway-direction-verification.cjs');
 const {
   parseTaipei,
   parseNewTaipei,
@@ -560,6 +561,10 @@ async function syncAll() {
         const bearingResult = applyFreewayBearingOverrides(records);
         records = bearingResult.records;
         logFreewayBearingResult(source.name, bearingResult);
+        // B-14 候選①：快速道路單向桿只保留離線驗證過的方位，其餘清空（App 不做方向排除）。
+        const expresswayResult = applyExpresswayDirectionVerification(records);
+        records = expresswayResult.records;
+        logExpresswayDirectionResult(source.name, expresswayResult);
       }
 
       results.push(...records);
@@ -676,6 +681,10 @@ async function writeAll(supabase, opts = {}) {
         const bearingResult = applyFreewayBearingOverrides(records);
         records = bearingResult.records;
         logFreewayBearingResult(source.name, bearingResult);
+        // B-14 候選①：快速道路單向桿只保留離線驗證過的方位，其餘清空（App 不做方向排除）。
+        const expresswayResult = applyExpresswayDirectionVerification(records);
+        records = expresswayResult.records;
+        logExpresswayDirectionResult(source.name, expresswayResult);
       }
 
       const payloads = toUpsertPayloads(records, batchFetchedAt);
