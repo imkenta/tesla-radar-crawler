@@ -46,17 +46,31 @@ const { isConfirmedSpeedRecord } = require('./lib/speed-camera-metadata.cjs');
 const {
   toUpsertPayloads,
   coordLookupKey,
-  fillMissingCoords,
   collapseSourceConflictDuplicates,
   dedupeAgainstExisting,
   dropFreewayNameDuplicates,
   normalizeRoadName,
 } = require('./lib/speed-camera-writer.cjs');
 const { createGeocoder } = require('./lib/geocoder.cjs');
+const {
+  enrichTainanFromNpa, fillTainanMissingCoords,
+  loadTainanNegativeCache, saveTainanNegativeCache,
+} = require('./lib/tainan-camera-enrichment.cjs');
 
-// 單輪 --write 最多對 Nominatim 呼叫的 geocode 次數上限（見 fillMissingCoords）。
-// 台南首次回填 72 筆超過此上限時，需分多輪執行才能補完（下一輪起，已補到座標的
-// 地址會在 fillMissingCoords 第一步直接從 DB 沿用，不會重複呼叫 Nominatim）。
+// 台南需要逐筆官方佐證；同輪快取原始 NPA 輸入，最後仍走原有 30m 聯集去重。
+async function getTainanNpaInput(fetchedAt) {
+  const source = SOURCES.find(s => s.name === 'national-npa');
+  try {
+    const input = await fetchSourceBuffer(source);
+    return { input, records: await input.parse(input.buffer, fetchedAt) };
+  } catch (err) {
+    console.error(`[speed-camera-sync] 台南 NPA 佐證下載失敗：${err.message}，保留原分類及缺值`);
+    return { input: null, records: [] };
+  }
+}
+
+
+// 單輪台南 Nominatim 呼叫上限；先做 NPA 逐筆匹配，缺值由負快取及最久未查排序處理。
 const GEOCODE_MAX_CALLS_PER_RUN = Number(process.env.SPEEDCAM_GEOCODE_MAX_CALLS) || 100;
 
 // 全國集（national-npa）與六都自建源的執行期聯集去重距離門檻（公尺）。
@@ -115,7 +129,7 @@ const SOURCES = [
     url: 'https://data.tainan.gov.tw/File/DirectDownload/1c7e82f0-d6b2-4b20-aeff-5c768100f82c',
     parse: parseTainan,
     fallbackUrls: [],
-    // 台南來源無座標欄位，--write 模式需在 upsert 前跑 geocode 補值（見 writeAll）。
+    // 台南先做 NPA 逐筆佐證，--write 再處理缺座標及負快取。
     needsGeocode: true,
   },
   {
@@ -506,11 +520,11 @@ async function getExistingConfirmedPointsForSource(supabase, sourceName) {
 }
 
 async function syncAll() {
+  let tainanNpaInput = null;
   const fetchedAt = new Date().toISOString();
   const results = [];
   // national-npa 執行期聯集去重用：累積其他六個自建 source 已解析出的座標點位
-  // （dry-run 不連 DB，台南無 geocode 補值，座標為 null，不會參與比對，見
-  // dedupeAgainstExisting 的說明；行為與 --write 模式一致地繼承這個既有限制）。
+  // dry-run 不連 DB、不 geocode；台南可用同輪 NPA 官方座標匹配，並參與原有30m去重。
   const collectedPoints = [];
   // 國道桿同名去重用：前置來源已收錄的國道桿路名（見 dropFreewayNameDuplicates）。
   const collectedFreewayRoads = new Set();
@@ -518,8 +532,16 @@ async function syncAll() {
   for (const source of SOURCES) {
     console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
     try {
-      const { buffer, parse } = await fetchSourceBuffer(source);
+      const { buffer, parse } = source.name === 'national-npa' && tainanNpaInput
+        ? tainanNpaInput : await fetchSourceBuffer(source);
       let records = await parse(buffer, fetchedAt);
+      if (source.name === 'tainan') {
+        const reference = await getTainanNpaInput(fetchedAt);
+        tainanNpaInput = reference.input;
+        const enrichment = enrichTainanFromNpa(records, reference.records);
+        records = enrichment.records;
+        console.error(`[speed-camera-sync] tainan 官方 NPA 逐筆佐證：${enrichment.matches.length} 筆，未匹配原因 ${JSON.stringify(enrichment.reasons)}`);
+      }
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       logClassificationCounts(source.name, records);
       records = collapseSourceRecords(records, source.name);
@@ -587,6 +609,7 @@ async function syncAll() {
  * @returns {Promise<{ batchFetchedAt: string, sourceResults: Array<{name: string, ok: boolean, stale: boolean, staleDays: number|null, written: number, staleDeleted: number, error: string|null}> }>}
  */
 async function writeAll(supabase, opts = {}) {
+  let tainanNpaInput = null;
   const batchFetchedAt = new Date().toISOString();
   const sourceResults = [];
   // 共用同一個 geocoder 實例：Nominatim 1 req/s 節流是跨 source 全域的，
@@ -608,8 +631,16 @@ async function writeAll(supabase, opts = {}) {
     const result = { name: source.name, ok: false, stale: false, staleDays: null, written: 0, staleDeleted: 0, error: null };
     try {
       console.error(`[speed-camera-sync] 下載 ${source.name} ...`);
-      const { buffer, parse } = await fetchSourceBuffer(source);
+      const { buffer, parse } = source.name === 'national-npa' && tainanNpaInput
+        ? tainanNpaInput : await fetchSourceBuffer(source);
       let records = await parse(buffer, batchFetchedAt);
+      if (source.name === 'tainan') {
+        const reference = await getTainanNpaInput(batchFetchedAt);
+        tainanNpaInput = reference.input;
+        const enrichment = enrichTainanFromNpa(records, reference.records);
+        records = enrichment.records;
+        console.error(`[speed-camera-sync] tainan 官方 NPA 逐筆佐證：${enrichment.matches.length} 筆，未匹配原因 ${JSON.stringify(enrichment.reasons)}`);
+      }
       console.error(`[speed-camera-sync] ${source.name} 解析出 ${records.length} 筆`);
       logClassificationCounts(source.name, records);
 
@@ -621,17 +652,21 @@ async function writeAll(supabase, opts = {}) {
 
       if (source.needsGeocode) {
         const existingCoords = await getExistingCoordsForSource(supabase, source.name);
-        const fillResult = await fillMissingCoords(
-          records,
-          existingCoords,
-          (address) => geocoder.geocode(address),
-          GEOCODE_MAX_CALLS_PER_RUN
+        // 注入 geocoder 的 mock 測試預設用記憶體快取；正式程序才讀寫本機負快取。
+        const cache = opts.tainanNegativeCache || (opts.geocoder ? {} : loadTainanNegativeCache());
+        const fillResult = await fillTainanMissingCoords(
+          records, existingCoords, (address) => geocoder.geocode(address),
+          GEOCODE_MAX_CALLS_PER_RUN, { cache }
         );
+        if (!opts.geocoder) {
+          try { saveTainanNegativeCache(cache); }
+          catch (err) { console.error(`[speed-camera-sync] tainan 負快取保存失敗：${err.message}`); }
+        }
         records = fillResult.records;
         console.error(
           `[speed-camera-sync] ${source.name} geocode 補值：沿用 DB ${fillResult.reusedFromDb} 筆、` +
             `新查 ${fillResult.geocodeAttempted} 筆（成功 ${fillResult.geocodeSucceeded}）、` +
-            `超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
+            `負快取略過 ${fillResult.skippedNegativeCache} 筆、超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
         );
       }
 

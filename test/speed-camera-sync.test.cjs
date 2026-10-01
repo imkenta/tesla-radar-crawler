@@ -1109,3 +1109,23 @@ test('writeAll：freeway-npa 本輪失敗時，national-npa 仍用資料庫既�
   const nationalUpsertCall = calls.upsert.find((c) => c.payload[0].source === 'national-npa');
   assert.deepEqual(nationalUpsertCall.payload.map((p) => p.city), ['金門縣'], '座標差 613m 的同名國道桿必須丟掉');
 });
+
+test('writeAll：台南逐筆 NPA 佐證先補值，NPA 原始輸入只下載一次並照原有30m去重', async (t) => {
+  const originalFetch=globalThis.fetch;
+  const tainan='行政區,設置位置,"拍攝\n行向",速限\n新營區,臺1線290.3公里與東山路口,南往北向,50\n';
+  const npa='CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit\n臺南市,新營區,臺1線290.3公里與東山路口,,,120.32573,23.308907,北向,50\n';
+  globalThis.fetch=fetchReturning({taipei:TAIPEI_CSV,'new-taipei':NTPC_CSV,'new-taipei-section':NTPC_SECTION_CSV,
+    kaohsiung:KAOHSIUNG_CSV,taoyuan:TAOYUAN_CSV,tainan,taichung:TAICHUNG_PDF,
+    'taichung-mobile':TAICHUNG_MOBILE_CSV,'freeway-npa':FREEWAY_NPA_ZIP,'national-npa':npa});
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  const {from,calls}=makeFakeSupabase();
+  const {geocoder,calls:geocodeCalls}=fakeGeocoder();
+  const summary=await writeAll({from},{geocoder});
+  const payload=calls.upsert.find(c=>c.payload[0].source==='tainan').payload[0];
+  assert.equal(payload.speed_status,'confirmed');assert.equal(payload.lat,23.308907);
+  assert.equal(geocodeCalls.length,0);assert.match(payload.taxonomy_basis,/official_npa/);
+  assert.equal(calls.upsert.filter(c=>c.payload[0].source==='national-npa').length,0);
+  assert.equal(summary.sourceResults.find(r=>r.name==='national-npa').ok,true);
+  const npaUrl=SOURCES.find(s=>s.name==='national-npa').url;
+  assert.equal(globalThis.fetch.mock.calls.filter(c=>c.arguments[0]===npaUrl).length,1);
+});
