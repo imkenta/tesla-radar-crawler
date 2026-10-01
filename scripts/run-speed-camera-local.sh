@@ -1,6 +1,7 @@
 #!/bin/zsh
 # 測速照相同步——本機（台灣 IP）排程執行版
-# 由 launchd 每週觸發（~/Library/LaunchAgents/com.evstudio.speed-camera-sync.plist）。
+# 由 launchd 每週一 10:00 觸發（~/Library/LaunchAgents/com.evstudio.speed-camera-sync.plist，
+# repo 內副本 scripts/launchd/；安裝、監看、異常指紋見 docs/speed-camera-local-schedule.md）。
 # 為什麼在本機跑：高雄市政府網域對境外 IP 地理封鎖（data.kcg + openapi.kcg 雙主機實測全擋，
 # 2026-07-05），GitHub 美國 runner 永遠抓不到；台灣 IP 全源可達。
 # ⚠️ .env 含帶空白的值，不能整檔 source——只精準抽取需要的兩個變數。

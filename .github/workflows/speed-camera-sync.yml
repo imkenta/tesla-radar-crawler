@@ -1,10 +1,14 @@
 name: Speed Camera Sync
 
+# ⛔ 這不是正式同步路徑。正式同步＝維護者 Mac 的 launchd 每週一 10:00 跑
+#    scripts/run-speed-camera-local.sh（台灣 IP），plist 副本在 scripts/launchd/，
+#    操作與監看見 docs/speed-camera-local-schedule.md。
+# ⛔ 不要手動觸發本 workflow 寫正式庫：美國 runner 被高雄網域地理封鎖、TGOS 回 403；
+#    2026-09-26 實際觸發一次，freeway-npa 黃燈導致 national-npa 多寫 314 筆重複國道桿。
+#    只保留作為「台灣 IP 環境失效時」的備案，使用前先確認上述來源可達。
 on:
-  # 僅 workflow_dispatch，不設 schedule（2026-06-19 雙源觸發連鎖取消事故政策，
-  # 見 plate-sync.yml / bidding-plates-sync.yml 同一決議）。
-  # ⚠️ 啟用前置條件：production 的 public.speed_cameras 表尚未建立，
-  # 表建好、secrets 確認、cron-job.org 排程設定完成前，不可手動觸發本 workflow。
+  # 僅 workflow_dispatch，不設 schedule（避免與本機排程雙源寫入；另見 2026-06-19
+  # 雙源觸發連鎖取消事故政策，plate-sync.yml / bidding-plates-sync.yml 同一決議）。
   workflow_dispatch: {}
 
 concurrency:

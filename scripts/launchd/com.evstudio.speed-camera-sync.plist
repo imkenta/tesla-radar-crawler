@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.evstudio.speed-camera-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/juishuchang/Projects/Tesla/tesla-radar-crawler/scripts/run-speed-camera-local.sh</string>
+    </array>
+    <!-- 每週一上午 10:00（Mac 睡著錯過會在醒來時補跑） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/com.evstudio.speed-camera-sync.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/com.evstudio.speed-camera-sync.err</string>
+</dict>
+</plist>

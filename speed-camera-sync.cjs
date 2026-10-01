@@ -7,8 +7,8 @@
  *   --dry-run           輸出正規化 JSON 到 stdout（或 --out=FILE），不連 DB（預設）
  *   --write              upsert 進 public.speed_cameras + 清 stale + 寫 sync_logs（需 Supabase env）
  *
- * ⚠️ production 的 speed_cameras 表建立前，--write 不可對 production 執行
- * （見 supabase/migrations-draft/speed_cameras.sql 檔頭說明）。
+ * 正式 --write 由本機 launchd 每週執行（scripts/run-speed-camera-local.sh），⛔ 不走 GitHub Actions；
+ * 排程、監看與異常指紋見 docs/speed-camera-local-schedule.md。手動 --write 前先 --dry-run 核對。
  *
  * 資料來源盤點與各縣市格式陷阱見 docs/speed-camera-sources.md。
  * 解析邏輯單一真理：lib/speed-camera-parser.cjs（測試：test/speed-camera-parser.test.cjs）。
