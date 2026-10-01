@@ -17,8 +17,9 @@ const ladder = require('../lib/ai-model-ladder.cjs');
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'gh-plate-sync.cjs'), 'utf8');
 const CLASS_SRC = SRC.slice(SRC.indexOf('class AIManager {'), SRC.indexOf('// Multi-Key Sharding Setup'));
 const TIMEOUT_MS = 30; // 取代正式的 25s 本地逾時，讓測試跑得快
+const NO_ESCAPE_TIMEOUT_MS = 20; // 取代正式的 12s「無處可逃風暴」逾時（須與 TIMEOUT_MS 不同才能分辨）
 const M26 = 'gemma-4-26b-a4b-it';
-const LITE = 'gemini-3.1-flash-lite';
+const LITE = 'gemini-3.5-flash-lite';
 const realSetTimeout = setTimeout;
 
 function httpError(status, message, errorDetails) {
@@ -40,6 +41,7 @@ function makeHarness(script) {
     const calls = [];
     const logs = [];
     const clock = { now: 1_000_000 };
+    const waits = []; // 退避等待請求的毫秒數（退避本身立即完成，只記錄請求值供斷言）
     class FakeGenAI {
         constructor(apiKey) { this.apiKey = apiKey; }
         getGenerativeModel({ model }) {
@@ -67,12 +69,17 @@ function makeHarness(script) {
     const fakeConsole = { log: (...a) => logs.push(a.join(' ')), error: (...a) => logs.push(a.join(' ')) };
     const fakeDate = { now: () => clock.now };
     // 退避等待（5–10s、20s）一律立即完成；只保留本地逾時計時器（已縮為 TIMEOUT_MS）。
-    const fakeSetTimeout = (fn, ms) => realSetTimeout(fn, ms === TIMEOUT_MS ? ms : 0);
+    const fakeSetTimeout = (fn, ms) => {
+        if (ms === TIMEOUT_MS || ms === NO_ESCAPE_TIMEOUT_MS) return realSetTimeout(fn, ms);
+        waits.push(ms);
+        return realSetTimeout(fn, 0);
+    };
 
     const factory = new Function(
         'resolveShardKeys', 'LadderState', 'GoogleGenerativeAI', 'AI_CALL_TIMEOUT_MS', 'EXHAUSTED',
         'isUnsupportedLocationError', 'classifyQuotaError', 'QUOTA_PER_DAY', 'isServerError',
         'SERVER_ERROR_STORM_WINDOW_MS', 'SERVER_ERROR_STORM_THRESHOLD', 'FIRST_TIER_PROBE_INTERVAL_MS',
+        'NO_ESCAPE_STORM_CALL_TIMEOUT_MS', 'NO_ESCAPE_STORM_BACKOFF_MIN_MS', 'NO_ESCAPE_STORM_BACKOFF_MAX_MS',
         'console', 'process', 'Date', 'setTimeout', 'clearTimeout',
         `${CLASS_SRC}\nreturn AIManager;`,
     );
@@ -80,9 +87,10 @@ function makeHarness(script) {
         ladder.resolveShardKeys, ladder.LadderState, FakeGenAI, TIMEOUT_MS, ladder.EXHAUSTED,
         ladder.isUnsupportedLocationError, ladder.classifyQuotaError, ladder.QUOTA_PER_DAY, ladder.isServerError,
         ladder.SERVER_ERROR_STORM_WINDOW_MS, ladder.SERVER_ERROR_STORM_THRESHOLD, ladder.FIRST_TIER_PROBE_INTERVAL_MS,
+        NO_ESCAPE_TIMEOUT_MS, ladder.NO_ESCAPE_STORM_BACKOFF_MIN_MS, ladder.NO_ESCAPE_STORM_BACKOFF_MAX_MS,
         fakeConsole, fakeProcess, fakeDate, fakeSetTimeout, clearTimeout,
     );
-    return { mgr: new AIManager('NORTH'), calls, logs, clock };
+    return { mgr: new AIManager('NORTH'), calls, logs, clock, waits };
 }
 
 /** 讓 manager 停在 flash-lite 並滿足回探間隔：下一次 maybeProbeFirstTier 就會回探。 */
@@ -195,4 +203,50 @@ test('AIManager：逾時觀測只記錄不改流程——晚到的成功與失�
         process.off('unhandledRejection', onUnhandled);
     }
     assert.equal(unhandled, 0);
+});
+
+// --- 無處可逃的風暴（2026-10-01）---
+
+test('AIManager：無處可逃的風暴 → 逾時縮短、5xx 退避縮為 1–3s；一般情況仍是 25s 逾時與 5–10s 退避', async () => {
+    const h = makeHarness([
+        { model: M26, outcome: e503() },     // 呼叫 1：窗內第 1 筆，一般 5–10s 退避
+        { model: M26, outcome: e503() },     // 窗內第 2 筆 → 風暴且備援層全死 → 啟動模式；退避旗標已用 → throw
+        { model: M26, outcome: 'late-ok' },  // 呼叫 2：模式下的短逾時（NO_ESCAPE_TIMEOUT_MS）→ 視同 5xx → 短退避
+        { model: M26, outcome: 'ok' },       // 短退避後重試成功
+    ]);
+    // 備援兩層、兩把 key 全數 PerDay 標死（9/30 實況）：只剩 26B。
+    for (const k of ['GEMINI_API_KEY_NORTH', 'GEMINI_API_KEY']) {
+        h.mgr.ladder.deadCombos.add(ladder.comboId(k, ladder.MODEL_LADDER[1].model));
+        h.mgr.ladder.deadCombos.add(ladder.comboId(k, ladder.MODEL_LADDER[2].model));
+    }
+
+    await assert.rejects(() => h.mgr.generateContent(['x']), /503/);
+    assert.equal(h.waits.length, 1);
+    assert.ok(h.waits[0] >= 5000 && h.waits[0] < 10000, `一般退避應為 5–10s，實得 ${h.waits[0]}`);
+    assert.equal(h.mgr.ladder.isNoEscapeStorm(h.clock.now), true);
+
+    const r = await h.mgr.generateContent(['x']);
+    assert.equal(r.response.text(), 'ABCD');
+    assert.equal(h.waits.length, 2);
+    assert.ok(h.waits[1] >= ladder.NO_ESCAPE_STORM_BACKOFF_MIN_MS && h.waits[1] < ladder.NO_ESCAPE_STORM_BACKOFF_MAX_MS,
+        `無處可逃退避應為 1–3s，實得 ${h.waits[1]}`);
+    await new Promise((resolve) => realSetTimeout(resolve, NO_ESCAPE_TIMEOUT_MS * 8));
+    assert.ok(h.logs.some((l) => l.includes('逾時後觀測') && l.includes(`已被 ${NO_ESCAPE_TIMEOUT_MS / 1000}s 逾時捨棄`)),
+        '呼叫 2 應使用短逾時');
+    assert.ok(h.logs.some((l) => l.includes('無處可逃的風暴')));
+});
+
+test('AIManager：還有存活的備援層時照舊升級，逾時與退避維持一般值', async () => {
+    const h = makeHarness([
+        { model: M26, outcome: 'late-ok' },  // 一般逾時（TIMEOUT_MS）
+        { model: M26, outcome: e503() },     // 窗內第 2 筆 → 升級到 3.5
+        { model: LITE, outcome: 'ok' },
+    ]);
+    const r = await h.mgr.generateContent(['x']);
+    assert.equal(r.response.text(), 'ABCD');
+    assert.equal(h.mgr.ladder.tierIndex, 1);
+    assert.equal(h.mgr.ladder.isNoEscapeStorm(h.clock.now), false);
+    await new Promise((resolve) => realSetTimeout(resolve, TIMEOUT_MS * 8));
+    assert.ok(h.logs.some((l) => l.includes(`已被 ${TIMEOUT_MS / 1000}s 逾時捨棄`)));
+    assert.ok(h.waits.every((w) => w >= 5000), '一般退避 5–10s');
 });

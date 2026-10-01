@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS, NO_ESCAPE_STORM_CALL_TIMEOUT_MS, NO_ESCAPE_STORM_BACKOFF_MIN_MS, NO_ESCAPE_STORM_BACKOFF_MAX_MS } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 
@@ -173,8 +173,9 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 //
 // 狀態機純邏輯在 lib/ai-model-ladder.cjs 的 LadderState（可測）；此處只做 I/O（API 呼叫、
 // 退避 sleep、log、SDK 重建）。2026-07-05 三次修正，依三 shard 實戰 log：
-// - 一般失敗階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemini-3.1-flash-lite(敗2)
-//   （2026-09-15 起兩層，31B 與 flash-preview 已依多日統計移除）。PerDay 死亡卡在末層時
+// - 一般失敗階梯（sticky 只升不降）：gemma-4-26b-a4b-it(敗3) → gemini-3.5-flash-lite(敗2)
+//   → gemini-3.1-flash-lite(敗2)（2026-10-01 插入 3.5 層，見 lib/ai-model-ladder.cjs 七次修正；
+//   31B 與 flash-preview 已於 2026-09-15 依多日統計移除）。PerDay 死亡卡在末層時
 //   可回找仍存活的前層；只有全部 key×model 都有明確 PerDay 429 才是 EXHAUSTED。
 // - 回探第一層（2026-09-15）：停在較高層滿 5 分鐘後，下一張驗證碼改用 26B 試一次，
 //   成功就留在 26B、失敗立即回到原層（不計入任何門檻），見 maybeProbeFirstTier。
@@ -191,6 +192,8 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 //   另計滑動窗風暴偵測（2026-08-30 四次修正）：同 combo 10 分鐘內累積 2 次 5xx
 //   → 判定模型端過載風暴，直接升級（成功不歸零風暴窗，見 lib/ai-model-ladder.cjs）。
 //   末層也風暴時繞回第一個存活 combo（2026-09-24 六次修正），兩層同時過載時輪替找容量。
+// - 無處可逃的風暴（2026-10-01）：風暴門檻已到卻沒有其他存活 combo 可換 → 逾時縮為 12s、
+//   退避縮為 1-3s（LadderState.isNoEscapeStorm），不再每張驗證碼付 8s 退避＋25s 逾時。
 // - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
 // 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
 class AIManager {
@@ -257,6 +260,7 @@ class AIManager {
         let timer;
         const label = `${this.currentKeyName}/${this.modelName}`;
         const startedAt = Date.now();
+        const timeoutMs = this.ladder.isNoEscapeStorm(startedAt) ? NO_ESCAPE_STORM_CALL_TIMEOUT_MS : AI_CALL_TIMEOUT_MS;
         const inflight = this.model.generateContent(payload);
         inflight.catch(() => {});
         try {
@@ -265,13 +269,13 @@ class AIManager {
                 new Promise((_resolve, reject) => {
                     timer = setTimeout(() => {
                         inflight.then(
-                            () => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應成功（已被 ${AI_CALL_TIMEOUT_MS / 1000}s 逾時捨棄）`),
+                            () => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應成功（已被 ${timeoutMs / 1000}s 逾時捨棄）`),
                             (lateErr) => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應失敗（${(lateErr && lateErr.status) || 'unknown'}）`),
                         );
-                        const err = new Error(`[AI] generateContent 本地硬逾時 ${AI_CALL_TIMEOUT_MS / 1000}s（視同暫時性 5xx）`);
+                        const err = new Error(`[AI] generateContent 本地硬逾時 ${timeoutMs / 1000}s（視同暫時性 5xx）`);
                         err.status = 503;
                         reject(err);
-                    }, AI_CALL_TIMEOUT_MS);
+                    }, timeoutMs);
                 }),
             ]);
         } finally {
@@ -361,8 +365,12 @@ class AIManager {
                     }
                     if (!serverRetried) {
                         serverRetried = true;
-                        const waitMs = 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
-                        console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
+                        // 無處可逃的風暴：沒有別的 combo 可換，長退避只是白付時間稅，縮為 1-3 秒。
+                        const noEscape = this.ladder.isNoEscapeStorm(Date.now());
+                        const waitMs = noEscape
+                            ? NO_ESCAPE_STORM_BACKOFF_MIN_MS + Math.floor(Math.random() * (NO_ESCAPE_STORM_BACKOFF_MAX_MS - NO_ESCAPE_STORM_BACKOFF_MIN_MS))
+                            : 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
+                        console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，${noEscape ? '無處可逃的風暴（短逾時 ' + NO_ESCAPE_STORM_CALL_TIMEOUT_MS / 1000 + 's）' : ''}退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
                         await new Promise((resolve) => setTimeout(resolve, waitMs));
                         continue;
                     }

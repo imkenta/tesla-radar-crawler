@@ -14,6 +14,9 @@ const {
     SERVER_ERROR_STORM_THRESHOLD,
     SERVER_ERROR_STORM_WINDOW_MS,
     FIRST_TIER_PROBE_INTERVAL_MS,
+    NO_ESCAPE_STORM_CALL_TIMEOUT_MS,
+    NO_ESCAPE_STORM_BACKOFF_MIN_MS,
+    NO_ESCAPE_STORM_BACKOFF_MAX_MS,
     nextLadderState,
     comboId,
     selectAliveCombo,
@@ -51,15 +54,18 @@ test('isUnsupportedLocationError：429 配額錯誤不得誤判', () => {
     assert.equal(isUnsupportedLocationError(err), false);
 });
 
-test('階梯定義：兩層模型與升級門檻符合規格（2026-09-15 依多日統計移除 31B 與 flash-preview）', () => {
-    assert.equal(MODEL_LADDER.length, 2);
+test('階梯定義：三層模型與升級門檻符合規格（2026-10-01 在 26B 與 3.1 之間插入 3.5）', () => {
+    assert.equal(MODEL_LADDER.length, 3);
     assert.equal(MODEL_LADDER[0].model, 'gemma-4-26b-a4b-it');
     assert.equal(MODEL_LADDER[0].failuresToEscalate, 3);
-    assert.equal(MODEL_LADDER[1].model, 'gemini-3.1-flash-lite');
+    assert.equal(MODEL_LADDER[1].model, 'gemini-3.5-flash-lite');
     assert.equal(MODEL_LADDER[1].failuresToEscalate, 2);
+    assert.equal(MODEL_LADDER[2].model, 'gemini-3.1-flash-lite');
+    assert.equal(MODEL_LADDER[2].failuresToEscalate, 2);
     const models = MODEL_LADDER.map((t) => t.model);
     assert.ok(!models.includes('gemma-4-31b-it'), '31B 風暴中終局成功率 47%，已移除');
     assert.ok(!models.includes('gemini-3-flash-preview'), 'flash-preview 日配額一碰就死、觸發全部重爬，已移除');
+    assert.ok(!models.includes('gemini-2.5-flash-lite'), '2.5-flash-lite 對新用戶已 404 停用');
 });
 
 test('Tier 0：失敗次數未達門檻 → 停留在 gemma-4-26b-a4b-it', () => {
@@ -68,27 +74,33 @@ test('Tier 0：失敗次數未達門檻 → 停留在 gemma-4-26b-a4b-it', () =>
     assert.deepEqual(nextLadderState(0, 2), { tierIndex: 0, model: 'gemma-4-26b-a4b-it' });
 });
 
-test('Tier 0：累計滿 3 次失敗 → 升級至 gemini-3.1-flash-lite', () => {
-    assert.deepEqual(nextLadderState(0, 3), { tierIndex: 1, model: 'gemini-3.1-flash-lite' });
+test('Tier 0：累計滿 3 次失敗 → 升級至 gemini-3.5-flash-lite', () => {
+    assert.deepEqual(nextLadderState(0, 3), { tierIndex: 1, model: 'gemini-3.5-flash-lite' });
 });
 
-test('Tier 1（末層 flash-lite）：失敗次數未達門檻 → 停留', () => {
-    assert.deepEqual(nextLadderState(1, 0), { tierIndex: 1, model: 'gemini-3.1-flash-lite' });
-    assert.deepEqual(nextLadderState(1, 1), { tierIndex: 1, model: 'gemini-3.1-flash-lite' });
+test('Tier 1（3.5-flash-lite）：未達門檻停留；滿 2 次失敗 → 升級至 3.1-flash-lite', () => {
+    assert.deepEqual(nextLadderState(1, 0), { tierIndex: 1, model: 'gemini-3.5-flash-lite' });
+    assert.deepEqual(nextLadderState(1, 1), { tierIndex: 1, model: 'gemini-3.5-flash-lite' });
+    assert.deepEqual(nextLadderState(1, 2), { tierIndex: 2, model: 'gemini-3.1-flash-lite' });
 });
 
-test('Tier 1（末層）：失敗達 2 次 → EXHAUSTED（交給既有失敗處理）', () => {
-    assert.equal(nextLadderState(1, 2), EXHAUSTED);
+test('Tier 2（末層 3.1-flash-lite）：失敗次數未達門檻 → 停留', () => {
+    assert.deepEqual(nextLadderState(2, 0), { tierIndex: 2, model: 'gemini-3.1-flash-lite' });
+    assert.deepEqual(nextLadderState(2, 1), { tierIndex: 2, model: 'gemini-3.1-flash-lite' });
 });
 
-test('Tier 1（末層）：失敗數超過門檻仍是 EXHAUSTED（不會拋錯或越界）', () => {
-    assert.equal(nextLadderState(1, 5), EXHAUSTED);
+test('Tier 2（末層）：失敗達 2 次 → EXHAUSTED（交給既有失敗處理）', () => {
+    assert.equal(nextLadderState(2, 2), EXHAUSTED);
+});
+
+test('Tier 2（末層）：失敗數超過門檻仍是 EXHAUSTED（不會拋錯或越界）', () => {
+    assert.equal(nextLadderState(2, 5), EXHAUSTED);
 });
 
 test('sticky：nextLadderState 不存在「降級」路徑（回到 26B 只能經由回探或 PerDay 回填）', () => {
     const escalated = nextLadderState(0, 3);
     assert.equal(escalated.tierIndex, 1);
-    assert.deepEqual(nextLadderState(escalated.tierIndex, 0), { tierIndex: 1, model: 'gemini-3.1-flash-lite' });
+    assert.deepEqual(nextLadderState(escalated.tierIndex, 0), { tierIndex: 1, model: 'gemini-3.5-flash-lite' });
 });
 
 test('邊界：tierIndex 超出範圍會拋 RangeError', () => {
@@ -259,7 +271,7 @@ test('selectAliveCombo：tier0 兩把 key 全死 → 升 tier1（flash-lite）�
         comboId('GEMINI_API_KEY', 'gemma-4-26b-a4b-it'),
     ]);
     assert.deepEqual(selectAliveCombo(0, KEYS, dead), {
-        tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL',
+        tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL',
     });
 });
 
@@ -267,10 +279,10 @@ test('selectAliveCombo：tier0 整層死＋下一層 shard key 死 → 選到下
     const dead = new Set([
         comboId('GEMINI_API_KEY_CENTRAL', 'gemma-4-26b-a4b-it'),
         comboId('GEMINI_API_KEY', 'gemma-4-26b-a4b-it'),
-        comboId('GEMINI_API_KEY_CENTRAL', 'gemini-3.1-flash-lite'),
+        comboId('GEMINI_API_KEY_CENTRAL', 'gemini-3.5-flash-lite'),
     ]);
     assert.deepEqual(selectAliveCombo(0, KEYS, dead), {
-        tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY',
+        tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY',
     });
 });
 
@@ -289,7 +301,7 @@ test('selectAliveCombo：startTierIndex 超過最後一層 → EXHAUSTED（最�
 test('selectAliveCombo：單一 key（無 shard key 的部署場景）也可運作', () => {
     const dead = new Set([comboId('GEMINI_API_KEY', 'gemma-4-26b-a4b-it')]);
     assert.deepEqual(selectAliveCombo(0, ['GEMINI_API_KEY'], dead), {
-        tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY',
+        tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY',
     });
 });
 
@@ -322,7 +334,7 @@ test('LadderState：連續 3 次失敗 → 升級 tier1，計數歸零，key 回
     assert.equal(s.recordFailure().escalated, false);
     const out = s.recordFailure();
     assert.equal(out.escalated, true);
-    assert.deepEqual(out.combo, { tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
+    assert.deepEqual(out.combo, { tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
     assert.equal(s.failureCount, 0);
 });
 
@@ -338,7 +350,7 @@ test('LadderState：同層兩把 key 先後判死 → 跳層，且已死 combo �
     const s = new LadderState(KEYS);
     s.markCurrentComboDead(); // (CENTRAL, 26b) 死 → (DEFAULT, 26b)
     const next = s.markCurrentComboDead(); // (DEFAULT, 26b) 也死 → 跳 tier1
-    assert.deepEqual(next, { tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
+    assert.deepEqual(next, { tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
     assert.equal(s.deadCombos.has(comboId('GEMINI_API_KEY_CENTRAL', 'gemma-4-26b-a4b-it')), true);
     assert.equal(s.deadCombos.has(comboId('GEMINI_API_KEY', 'gemma-4-26b-a4b-it')), true);
 });
@@ -351,7 +363,7 @@ test('LadderState：最後一層兩把 key 判死但前層仍活著 → 回到�
     const sameTierFallback = s.markCurrentComboDead();
     assert.deepEqual(sameTierFallback, {
         tierIndex: MODEL_LADDER.length - 1,
-        model: 'gemini-3.1-flash-lite',
+        model: MODEL_LADDER[MODEL_LADDER.length - 1].model,
         keyName: 'GEMINI_API_KEY',
     });
 
@@ -367,12 +379,12 @@ test('LadderState：最後一層兩把 key 判死但前層仍活著 → 回到�
 
 test('LadderState：門檻升級時自動跳過已判死的 combo（flash-lite 的 shard key 已死 → 改用 DEFAULT key）', () => {
     const s = new LadderState(KEYS);
-    s.deadCombos.add(comboId('GEMINI_API_KEY_CENTRAL', 'gemini-3.1-flash-lite'));
+    s.deadCombos.add(comboId('GEMINI_API_KEY_CENTRAL', 'gemini-3.5-flash-lite'));
     s.recordFailure();
     s.recordFailure();
     const out = s.recordFailure(); // 連續 3 敗達 tier0 門檻
     assert.equal(out.escalated, true);
-    assert.equal(s.model, 'gemini-3.1-flash-lite');
+    assert.equal(s.model, 'gemini-3.5-flash-lite');
     assert.equal(s.keyName, 'GEMINI_API_KEY');
 });
 
@@ -421,7 +433,7 @@ test('recordServerError：窗內達門檻 → 升級到下一層，且「中間�
         s.recordSuccess(); // 實戰情境：503 之間夾雜成功的 CAPTCHA 解答
     }
     assert.equal(out.escalated, true);
-    assert.equal(s.model, 'gemini-3.1-flash-lite');
+    assert.equal(s.model, 'gemini-3.5-flash-lite');
     assert.equal(s.failureCount, 0); // combo 變更後計數歸零
     assert.deepEqual(s.serverErrorTimes, []); // 風暴窗歸零
 });
@@ -440,14 +452,14 @@ test('recordServerError：事件散落在窗外（間歇性 500）→ 永遠達�
 
 test('recordServerError：升級時跳過 PerDay 已標死的 combo（flash-lite 的 shard key 已死 → DEFAULT key）', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH', 'GEMINI_API_KEY']);
-    s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', 'gemini-3.1-flash-lite'));
+    s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', 'gemini-3.5-flash-lite'));
     const t0 = 1_000_000;
     let out = null;
     for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) {
         out = s.recordServerError(t0 + i * 1_000);
     }
     assert.equal(out.escalated, true);
-    assert.equal(s.model, 'gemini-3.1-flash-lite');
+    assert.equal(s.model, 'gemini-3.5-flash-lite');
     assert.equal(s.keyName, 'GEMINI_API_KEY');
 });
 
@@ -470,7 +482,7 @@ test('recordServerError：末層也風暴 → 繞回第一層（2026-09-24：fla
     assert.equal(s.higherTierSinceMs, null);
 });
 
-test('recordServerError：26B 與 flash-lite 輪流風暴 → 在兩層間來回，不會卡死任何一層', () => {
+test('recordServerError：三層輪流風暴 → 0→1→2→繞回 0→1，不會卡死任何一層', () => {
     const s = new LadderState(['GEMINI_API_KEY_CENTRAL']);
     const t0 = 1_000_000;
     const seen = [];
@@ -483,13 +495,14 @@ test('recordServerError：26B 與 flash-lite 輪流風暴 → 在兩層間來回
         seen.push(s.model);
     }
     assert.deepEqual(seen, [
-        MODEL_LADDER[1].model, MODEL_LADDER[0].model, MODEL_LADDER[1].model, MODEL_LADDER[0].model,
+        MODEL_LADDER[1].model, MODEL_LADDER[2].model, MODEL_LADDER[0].model, MODEL_LADDER[1].model,
     ]);
 });
 
-test('recordServerError：只剩末層存活（第一層已 PerDay 標死）→ escalated:false + exhausted:true（呼叫端維持退避重試）', () => {
+test('recordServerError：只剩末層存活（前兩層已 PerDay 標死）→ escalated:false + exhausted:true（呼叫端維持退避重試）', () => {
     const s = new LadderState(['GEMINI_API_KEY_SOUTH']);
     s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', MODEL_LADDER[0].model));
+    s.deadCombos.add(comboId('GEMINI_API_KEY_SOUTH', MODEL_LADDER[1].model));
     s.tierIndex = MODEL_LADDER.length - 1;
     const t0 = 1_000_000;
     let out = null;
@@ -499,6 +512,75 @@ test('recordServerError：只剩末層存活（第一層已 PerDay 標死）→ 
     assert.equal(out.escalated, false);
     assert.equal(out.exhausted, true);
     assert.equal(s.model, MODEL_LADDER[MODEL_LADDER.length - 1].model); // 停留原層，不污染狀態
+});
+
+// --- 無處可逃的風暴（2026-10-01）：9/30 22:03 UTC 起 flash-lite 全 key 日配額死、26B 持續 5xx ---
+
+function noEscapeState() {
+    // 9/30 實況重現：單一 key、備援兩層全數 PerDay 標死，只剩正在風暴的 26B。
+    const s = new LadderState(['GEMINI_API_KEY_NORTH']);
+    s.deadCombos.add(comboId('GEMINI_API_KEY_NORTH', MODEL_LADDER[1].model));
+    s.deadCombos.add(comboId('GEMINI_API_KEY_NORTH', MODEL_LADDER[2].model));
+    return s;
+}
+
+test('無處可逃的風暴：常數固定（12s 逾時、1–3s 退避）且遠小於一般值', () => {
+    assert.equal(NO_ESCAPE_STORM_CALL_TIMEOUT_MS, 12_000);
+    assert.equal(NO_ESCAPE_STORM_BACKOFF_MIN_MS, 1_000);
+    assert.equal(NO_ESCAPE_STORM_BACKOFF_MAX_MS, 3_000);
+});
+
+test('無處可逃的風暴：初始與未達風暴門檻時不啟動', () => {
+    const s = noEscapeState();
+    const t0 = 1_000_000;
+    assert.equal(s.isNoEscapeStorm(t0), false);
+    s.recordServerError(t0); // 窗內 1 筆，未達門檻
+    assert.equal(s.isNoEscapeStorm(t0), false);
+});
+
+test('無處可逃的風暴：門檻到達且沒有其他存活 combo → 啟動；超過風暴窗後自動解除', () => {
+    const s = noEscapeState();
+    const t0 = 1_000_000;
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) out = s.recordServerError(t0 + i * 1_000);
+    assert.equal(out.exhausted, true);
+    assert.equal(s.isNoEscapeStorm(t0 + 5_000), true);
+    assert.equal(s.isNoEscapeStorm(t0 + SERVER_ERROR_STORM_WINDOW_MS + 5_000), false);
+});
+
+test('無處可逃的風暴：中間夾成功不解除（風暴與成功交錯是常態）', () => {
+    const s = noEscapeState();
+    const t0 = 1_000_000;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) s.recordServerError(t0 + i * 1_000);
+    s.recordSuccess();
+    assert.equal(s.isNoEscapeStorm(t0 + 5_000), true);
+});
+
+test('無處可逃的風暴：還有其他存活 combo 時走升級，不啟動此模式', () => {
+    const s = new LadderState(['GEMINI_API_KEY_NORTH']);
+    const t0 = 1_000_000;
+    let out = null;
+    for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) out = s.recordServerError(t0 + i * 1_000);
+    assert.equal(out.escalated, true);
+    assert.equal(s.isNoEscapeStorm(t0 + 5_000), false);
+});
+
+test('無處可逃的風暴：換 combo（markCurrentComboDead）即清除', () => {
+    const t0 = 1_000_000;
+    const enter = (s) => { for (let i = 0; i < SERVER_ERROR_STORM_THRESHOLD; i++) s.recordServerError(t0 + i * 1_000); };
+
+    // 只剩 (K1, 26B) 存活 → 進入模式；其後 (K1, 26B) 被標死並換到別的 combo → 模式解除。
+    const a = new LadderState(['K1', 'K2']);
+    a.deadCombos.add(comboId('K1', MODEL_LADDER[1].model));
+    a.deadCombos.add(comboId('K2', MODEL_LADDER[1].model));
+    a.deadCombos.add(comboId('K1', MODEL_LADDER[2].model));
+    a.deadCombos.add(comboId('K2', MODEL_LADDER[2].model));
+    a.deadCombos.add(comboId('K2', MODEL_LADDER[0].model)); // 只剩 (K1, 26B)
+    enter(a);
+    assert.equal(a.isNoEscapeStorm(t0 + 5_000), true);
+    a.deadCombos.delete(comboId('K2', MODEL_LADDER[0].model)); // 模擬別處復活
+    assert.notEqual(a.markCurrentComboDead(), EXHAUSTED); // (K1,26B) 死 → 換到 (K2,26B)
+    assert.equal(a.isNoEscapeStorm(t0 + 5_000), false);
 });
 
 test('recordFailure 升級時同步清空 5xx 風暴窗（計數屬於 combo）', () => {
@@ -576,7 +658,7 @@ test('回探失敗：原封還原較高層 combo（含失敗計數與風暴窗�
 
     const tFail = t0 + FIRST_TIER_PROBE_INTERVAL_MS + 30_000;
     const restored = s.abortFirstTierProbe(tFail);
-    assert.deepEqual(restored, { tierIndex: 1, model: 'gemini-3.1-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
+    assert.deepEqual(restored, { tierIndex: 1, model: 'gemini-3.5-flash-lite', keyName: 'GEMINI_API_KEY_CENTRAL' });
     assert.equal(s.isProbing, false);
     assert.equal(s.failureCount, 1);
     assert.deepEqual(s.serverErrorTimes, [t0 - 1_000]);
@@ -625,7 +707,7 @@ test('回探中不重複開新回探；未在回探中 abort 回傳 null 且不�
 
 test('回探：PerDay 回填回到第一層後計時清空', () => {
     const s = new LadderState(KEYS);
-    s.tierIndex = 1; // 置於末層 flash-lite
+    s.tierIndex = MODEL_LADDER.length - 1; // 置於末層 flash-lite
     const t0 = 1_000_000;
     s.maybeStartFirstTierProbe(t0); // 起算
     assert.equal(s.higherTierSinceMs, t0);
