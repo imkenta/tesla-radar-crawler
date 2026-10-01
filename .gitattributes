@@ -1,0 +1,4 @@
+
+# Preserve official CSV bytes (CRLF records and embedded LF cells) for schema regression.
+test/fixtures/speed-camera-tainan-20261001.csv -text whitespace=cr-at-eol
+test/fixtures/speed-camera-npa-tainan-20261001.csv -text whitespace=cr-at-eol

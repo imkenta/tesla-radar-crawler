@@ -714,6 +714,7 @@ test('writeAll：台南 geocode 查無結果 → 該筆 lat/lng 留 null 入庫�
     kaohsiung: null,
     taoyuan: null,
     tainan: TAINAN_CSV,
+    'national-npa': NATIONAL_NPA_CSV, // 佐證可用，但這個位置不在 NPA；本測試只驗補值流程。
   });
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -743,6 +744,7 @@ test('writeAll：台南地址在 DB 已有座標（同一 source,address,directi
     kaohsiung: null,
     taoyuan: null,
     tainan: TAINAN_CSV,
+    'national-npa': NATIONAL_NPA_CSV, // 佐證可用，但這個位置不在 NPA；本測試只驗補值流程。
   });
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -1108,4 +1110,105 @@ test('writeAll：freeway-npa 本輪失敗時，national-npa 仍用資料庫既�
 
   const nationalUpsertCall = calls.upsert.find((c) => c.payload[0].source === 'national-npa');
   assert.deepEqual(nationalUpsertCall.payload.map((p) => p.city), ['金門縣'], '座標差 613m 的同名國道桿必須丟掉');
+});
+
+test('writeAll：台南逐筆 NPA 佐證先補值，NPA 原始輸入只下載一次並照原有30m去重', async (t) => {
+  const originalFetch=globalThis.fetch;
+  const tainan='行政區,設置位置,"拍攝\n行向",速限\n新營區,臺1線290.3公里與東山路口,南往北向,50\n';
+  const npa='CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit\n臺南市,新營區,臺1線290.3公里與東山路口,,,120.32573,23.308907,北向,50\n';
+  globalThis.fetch=fetchReturning({taipei:TAIPEI_CSV,'new-taipei':NTPC_CSV,'new-taipei-section':NTPC_SECTION_CSV,
+    kaohsiung:KAOHSIUNG_CSV,taoyuan:TAOYUAN_CSV,tainan,taichung:TAICHUNG_PDF,
+    'taichung-mobile':TAICHUNG_MOBILE_CSV,'freeway-npa':FREEWAY_NPA_ZIP,'national-npa':npa});
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  const {from,calls}=makeFakeSupabase();
+  const {geocoder,calls:geocodeCalls}=fakeGeocoder();
+  const summary=await writeAll({from},{geocoder});
+  const payload=calls.upsert.find(c=>c.payload[0].source==='tainan').payload[0];
+  assert.equal(payload.speed_status,'confirmed');assert.equal(payload.lat,23.308907);
+  assert.equal(geocodeCalls.length,0);assert.match(payload.taxonomy_basis,/official_npa/);
+  assert.equal(calls.upsert.filter(c=>c.payload[0].source==='national-npa').length,0);
+  assert.equal(summary.sourceResults.find(r=>r.name==='national-npa').ok,true);
+  const npaUrl=SOURCES.find(s=>s.name==='national-npa').url;
+  assert.equal(globalThis.fetch.mock.calls.filter(c=>c.arguments[0]===npaUrl).length,1);
+});
+
+
+test('台南全生命週期：平均速率不被單點取代、verified方向保留、NPA連續失敗不覆寫整源', async (t) => {
+  const originalFetch=globalThis.fetch;t.after(()=>{globalThis.fetch=originalFetch;});
+  const tainan=fs.readFileSync(path.join(__dirname,'fixtures','speed-camera-tainan-20261001.csv'));
+  const npa=fs.readFileSync(path.join(__dirname,'fixtures','speed-camera-npa-tainan-20261001.csv'));
+  const fixtures={taipei:TAIPEI_CSV,'new-taipei':NTPC_CSV,'new-taipei-section':NTPC_SECTION_CSV,
+    kaohsiung:KAOHSIUNG_CSV,taoyuan:TAOYUAN_CSV,tainan,taichung:TAICHUNG_PDF,
+    'taichung-mobile':TAICHUNG_MOBILE_CSV,'freeway-npa':FREEWAY_NPA_ZIP,'national-npa':npa};
+  const {parseTainan}=require('../lib/speed-camera-parser.cjs');
+  const key=r=>JSON.stringify([r.source,r.address,r.direction]);
+  // 模擬舊流程曾把第123筆區間 geocode 成一個市內點；新流程必須清掉這個假單點。
+  const oldSection={...parseTainan(tainan)[122],speed_measurement_mode:'point',sensor_technology:'unknown',
+    equipment_type_raw:null,camera_type:'unknown',taxonomy_basis:'speed_measurement_mode:explicit_token:超速',
+    lat:22.950447,lng:120.38326,fetched_at:'2026-09-01T00:00:00Z'};
+  const state=new Map([[key(oldSection),oldSection]]);
+  const {from,calls}=makeFakeSupabase({
+    upsertImpl:(_table,payload)=>{for(const r of payload)state.set(key(r),{...r});return {error:null};},
+    deleteImpl:(_table,eq,lt)=>{const data=[];for(const [k,r] of state)if(r.source===eq.source&&r.fetched_at<lt.fetched_at){state.delete(k);data.push({id:k});}return {data,error:null};},
+    selectImpl:(_table,eq)=>({data:[...state.values()].find(r=>r.source===eq.source)||null,error:null}),
+    rowCountImpl:source=>[...state.values()].filter(r=>r.source===source).length,
+    existingCoordsImpl:source=>({data:[...state.values()].filter(r=>r.source===source&&r.speed_status==='confirmed'&&r.lat!=null&&r.lng!=null),error:null}),
+  });
+  const {geocoder,calls:geocodeCalls}=fakeGeocoder({[`臺南市${oldSection.address}`]:{lat:22.950447,lng:120.38326}});
+  globalThis.fetch=fetchReturning(fixtures);
+  const dry=await speedCameraSync.syncAll();
+  const dryRamp=dry.find(r=>r.source==='tainan'&&r.address.includes('342.7公里'));
+  assert.equal(dryRamp.direction_bearing,180,'dry-run 最終 verified 南向不可變 null');
+  await writeAll({from},{geocoder});
+  const local=[...state.values()].filter(r=>r.source==='tainan');
+  assert.equal(local.length,191);
+  const section=local.find(r=>r.address===oldSection.address);
+  assert.equal(section.speed_measurement_mode,'section_average');assert.equal(section.sensor_technology,'average_speed');
+  assert.equal(section.lat,null);assert.equal(section.lng,null);
+  assert.ok(!geocodeCalls.includes(`臺南市${section.address}`),'區間不可呼叫 geocoder');
+  const ramp=local.find(r=>r.address.includes('342.7公里'));
+  assert.equal(ramp.road,'臺1線342.7公里臺86線匝道路口');
+  assert.equal(ramp.direction_bearing,180,'DB/App payload 必須保留已驗證南向');
+  const app=()=>[...state.values()].filter(r=>r.city==='臺南市'&&r.speed_status==='confirmed'&&r.lat!=null&&r.lng!=null);
+  assert.equal(app().length,139);
+  assert.equal(app().filter(r=>r.speed_measurement_mode==='section_average'&&r.sensor_technology==='average_speed').length,1,'NPA平均速率設備不可被點位去重刪掉');
+  const {parseNationalNpa}=require('../lib/speed-camera-parser.cjs');
+  const {applyExpresswayDirectionVerification}=require('../lib/expressway-direction-verification.cjs');
+  const {directionKey}=require('../lib/tainan-camera-enrichment.cjs');
+  const originalApp=applyExpresswayDirectionVerification(parseNationalNpa(npa)).records;
+  for(const original of originalApp){
+    const replacement=app().find(r=>r.lat===original.lat&&r.lng===original.lng&&directionKey(r.direction)===directionKey(original.direction));
+    assert.ok(replacement,`原NPA點位不可遺失：${original.address}`);
+    for(const field of ['speed_status','speed_limit','speed_measurement_mode','sensor_technology','camera_type','road_class','direction_mode','direction_bearing']){
+      if(original[field]==='unknown')continue; // 新佐證可補unknown，但已知值不可退化。
+      assert.equal(replacement[field],original[field],`${original.address} 最終App欄位${field}不得退化`);
+    }
+  }
+
+  const snapshot=JSON.stringify([...state.values()].filter(r=>['tainan','national-npa'].includes(r.source)));
+  calls.upsert.length=0;calls.delete.length=0;geocodeCalls.length=0;
+  globalThis.fetch=fetchReturning({...fixtures,'national-npa':null});
+  const failure=await writeAll({from},{geocoder});
+  const failedLocal=failure.sourceResults.find(r=>r.name==='tainan');
+  assert.equal(failedLocal.written,0);assert.equal(failedLocal.staleDeleted,0);
+  assert.match(failedLocal.error,/NPA.*佐證/);
+  assert.equal(failedLocal.stale,true,'沿用原新鮮度黃燈政策');
+  const repeated=await writeAll({from},{geocoder,previousYellowSources:['tainan','national-npa']});
+  assert.equal(repeated.sourceResults.find(r=>r.name==='tainan').ok,false,'連續失敗必須顯示紅燈');
+  assert.equal(JSON.stringify([...state.values()].filter(r=>['tainan','national-npa'].includes(r.source))),snapshot);
+  assert.equal(app().length,139);assert.equal(app().find(r=>r.address.includes('342.7公里')).direction_bearing,180);
+  assert.equal(calls.upsert.filter(c=>['tainan','national-npa'].includes(c.payload[0]?.source)).length,0);
+  assert.equal(calls.delete.filter(c=>['tainan','national-npa'].includes(c.eq.source)).length,0);
+  assert.equal(geocodeCalls.length,0,'NPA佐證失敗應在座標補值之前中止');
+  // HTTP 200 但改版/空資料解析成0筆，也不能覆寫已佐證的台南資料。
+  globalThis.fetch=fetchReturning({...fixtures,'national-npa':'CityName,RegionName,Address,DeptNm,BranchNm,Longitude,Latitude,direct,limit\n'});
+  const emptyReference=await writeAll({from},{geocoder});
+  assert.match(emptyReference.sourceResults.find(r=>r.name==='tainan').error,/NPA.*0 筆/);
+  assert.equal(JSON.stringify([...state.values()].filter(r=>['tainan','national-npa'].includes(r.source))),snapshot);
+  globalThis.fetch=fetchReturning(fixtures);
+  const recovery=await writeAll({from},{geocoder});
+  assert.equal(recovery.sourceResults.find(r=>r.name==='tainan').stale,false);
+  assert.equal(app().length,139);
+  assert.equal(app().find(r=>r.address.includes('342.7公里')).direction_bearing,180);
+  assert.equal(app().filter(r=>r.speed_measurement_mode==='section_average'&&r.sensor_technology==='average_speed').length,1);
 });
