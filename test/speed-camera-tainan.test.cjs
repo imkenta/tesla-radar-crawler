@@ -121,3 +121,27 @@ test('完整官方快照：106 筆借座標後原有139筆臺南 NPA 點位覆�
   assert.equal(enrichment.records.filter(r=>r.speed_status==='confirmed').length,107);
   assert.equal(enrichment.records.filter(r=>r.speed_status==='unknown').length,83);
 });
+
+
+test('官方第123筆區間：保持平均速率類型，既有/DB/geocode 都不得變單點', async () => {
+  const row = parseTainan(fs.readFileSync(`${__dirname}/fixtures/speed-camera-tainan-20261001.csv`))[122];
+  assert.equal(row.speed_measurement_mode, 'section_average');
+  assert.equal(row.sensor_technology, 'average_speed');
+  assert.equal(row.camera_type, 'section');
+  assert.match(row.taxonomy_basis, /official_record_override:tainan_pdf:123:page8/);
+  for (const existingLat of [null, 22.950447]) {
+    const r = {...row, lat:existingLat, lng:existingLat == null ? null : 120.38326};
+    const db = new Map([[coordLookupKey(r.source,r.address,r.direction),{lat:22.950447,lng:120.38326}]]);
+    const fill = await fillTainanMissingCoords([r],db,async()=>{throw new Error('禁止區間 geocode');},100);
+    assert.equal(fill.records[0].lat,null);assert.equal(fill.records[0].lng,null);
+    assert.equal(fill.reusedFromDb,0);assert.equal(fill.geocodeAttempted,0);
+    assert.equal(fill.skippedNonPoint,1);
+  }
+  const changedCsv='行政區,設置位置,拍攝行向,速限\n龍崎區,一、市道182線27公里至28公里，超速,雙向,50\n';
+  const changed=parseTainan(Buffer.from(changedCsv))[0];
+  assert.equal(changed.speed_measurement_mode,'unknown','未核對的新版範圍不可誤套第123筆或推測point');
+  assert.match(changed.taxonomy_basis,/ambiguous_non_point_location/);
+  const ambiguous = point({address:'新營區 一、某路1公里至2公里處',speed_measurement_mode:'point'});
+  const result=await fillTainanMissingCoords([ambiguous],new Map(),async()=>({lat:23.308907,lng:120.32573}),100);
+  assert.equal(result.records[0].lat,null);assert.equal(result.geocodeAttempted,0);
+});

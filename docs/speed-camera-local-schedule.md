@@ -64,7 +64,7 @@ zsh scripts/run-speed-camera-local.sh                                           
 | `清除 stale N 筆` 的 N 突然很大 | 官方資料大量下架，或解析壞了 | 先 dry-run 比對筆數再判斷，勿直接重跑 `--write` |
 | 某來源 `解析出` 筆數比上週驟降（例如掉一半以上） | 官方改格式或下載到錯誤頁 | 回報維護者 |
 
-已知現況（2026-10-01）：正式 `main` 尚未套用台南修復，anon 唯讀回讀為191筆／方向0／座標0，confirmed 1、rejected 1、unknown 189；App 可見0，覆蓋來自 NPA 台南139筆。獨立分支安全 dry run 已得到方向191／confirmed 107／座標106，原有30m去重後台南106＋NPA33仍覆蓋139筆；加入市界驗證、負快取及公平重試。修復尚待維護者核准合併；未對正式庫執行 `--write`，排程未更動。驗收見 `docs/tainan-speed-camera-verification-20261001.md`。
+已知現況（2026-10-01）：正式 `main` 尚未套用台南修復，anon 唯讀回讀為191筆／方向0／座標0，confirmed 1、rejected 1、unknown 189；App 可見0，覆蓋來自 NPA 台南139筆。獨立分支安全 dry run 已得到方向191／confirmed 107／座標106，原有30m去重後台南106＋NPA33仍覆蓋139筆；加入市界驗證、負快取及公平重試；NPA佐證取得失敗保留台南整源，區間設備不補單點，台86匝道verified方向保留180°。兩次dry run皆9來源成功；桃園下載後CSV解析失敗，前後錯誤相同，屬既有非台南故障，本次未修改。修復尚待維護者核准合併；未對正式庫執行 `--write`，排程未更動。驗收見 `docs/tainan-speed-camera-verification-20261001.md`。
 
 4. **anon 回讀**（走 App 實際用的 PostgREST＋anon key，只讀）：
 

@@ -1,0 +1,35 @@
+{
+  "description": "人工核對官方 PDF 的台南逐筆取締證據；僅完整地址、方向、速限相符時套用。複合區間不映射成單點。",
+  "source_url": "https://www.tnpd.gov.tw/upfiles/files/115-_%e8%87%ba%e5%8d%97%e5%b8%82%e6%94%bf%e5%ba%9c%e8%ad%a6%e5%af%9f%e5%b1%80%e5%9b%ba%e5%ae%9a%e5%bc%8f%e4%ba%a4%e9%80%9a%e9%81%95%e8%a6%8f%e7%85%a7%e7%9b%b8%e8%b7%af%e6%ae%b5%e8%a8%ad%e7%bd%ae%e4%b8%80%e8%a6%bd%e8%a1%a8-0626%e5%ae%89%e5%b9%b3%e5%8d%80%e8%bf%91%e5%ae%89%e5%8c%97%e8%b7%af%e8%88%87%e5%b7%9e%e5%ae%89%e4%b8%80%e8%a1%97%e8%b7%af%e5%8f%a3.pdf",
+  "notice_url": "https://www.tnpd.gov.tw/Article/71d16651-5929-91c8-8a06-039fc3dbee6c",
+  "source_sha256": "ff8a9d89418f3345aa3424cd4cd598c18b9d26bcdd3d86e5ac3d03cfd170bf65",
+  "observed_at": "2026-10-01",
+  "entries": [
+    {
+      "official_number": 123,
+      "page": 8,
+      "address": "龍崎區 一、市道182線27.2248公里至28.358公里處(往高雄)，速限50公里，取締項目：超速，偵測長度：1133.2公尺。\n二、市道182線28.3378公里至27.1907公里處(往關廟)，速限50公里，取締項目：超速，偵測長度：1147.1公尺。",
+      "direction": "雙向",
+      "speed_limit": 50,
+      "equipment_type_raw": "區間平均速率執法系統",
+      "speed_measurement_mode": "section_average",
+      "sensor_technology": "average_speed",
+      "sections": [
+        {
+          "road": "市道182線",
+          "start_km": 27.2248,
+          "end_km": 28.358,
+          "toward": "高雄",
+          "length_m": 1133.2
+        },
+        {
+          "road": "市道182線",
+          "start_km": 28.3378,
+          "end_km": 27.1907,
+          "toward": "關廟",
+          "length_m": 1147.1
+        }
+      ]
+    }
+  ]
+}

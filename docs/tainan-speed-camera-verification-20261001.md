@@ -21,7 +21,7 @@ node --env-file=.env --require ./evidence/no-side-effects.cjs speed-camera-sync.
 node evidence/analyze.cjs
 ```
 
-`npm test`：tests290／pass290／fail0。測試全mock下載、DB與geocode，未真打Nominatim。新增新舊schema、區名／代碼、方向、必要欄位、NPA嚴格配對、區間拒絕、外市座標、負快取跨程序、191筆公平輪詢與整合去重測試。
+`npm test`（review修正後）：tests292／pass292／fail0。測試全mock下載、DB與geocode，未真打Nominatim。新增新舊schema、區名／代碼、方向、必要欄位、NPA嚴格配對、區間拒絕、外市座標、負快取跨程序、191筆公平輪詢與整合去重測試。
 
 | 台南指標 | 修前 | 修後（安全dry run） |
 |---|---:|---:|
@@ -33,7 +33,7 @@ node evidence/analyze.cjs
 | 有座標 | 0 | 106 |
 | App可見confirmed＋座標 | 0 | 106 |
 
-兩次十來源dry run全部下載解析成功。去除批次時間後，台北、新北、新北區間、高雄、桃園、台中、台中移動式、國道專源八來源輸出逐欄完全相同；共用parser、writer、geocoder與NPA30m聯集去重函式未改。
+兩次dry run皆9個來源解析成功；桃園下載內容以 `{` 開頭，CSV parser報 `Invalid Opening Quote`，前後同樣失敗且沒有輸出列。先前「十來源全部下載解析成功」的描述不正確，已更正。去除批次時間後，台北、新北、新北區間、高雄、台中、台中移動式、國道專源七個成功來源輸出逐欄完全相同；桃園錯誤也未變。桃園為既有、非本任務故障，這次未修改它。共用方向分類器、writer、geocoder與NPA30m聯集去重函式未改；共用parser檔只變更台南函式。
 
 正式庫另以既有anon client純SELECT回讀（2026-10-01T09:40:38Z）：台南191／方向0／座標0／confirmed1／rejected1／unknown189／App可見0；NPA台南139／座標139／confirmed139／App可見139。沒有service role查詢或DB寫入。此結果與附件一致，但本次係獨立查證。
 
@@ -66,7 +66,7 @@ node evidence/analyze.cjs
 
 ## 30m聯集去重與剩餘缺口
 
-139筆NPA台南全部在官方市界內。原有去重函式移除106筆、保留33筆；台南可見106＋NPA33＝139。對原有139筆逐點檢查，30m內有保留點的139筆，缺漏0。所有借值皆已有NPA點位，所以地理覆蓋沒有新增，也沒有降低；沒有把106筆借值計為新攝影桿。完整快照回歸測試鎖住此結果。
+139筆NPA台南全部在官方市界內。原有去重函式移除106筆、保留33筆；台南可見106＋NPA33＝139。對原有139筆逐點檢查，30m內有保留點的139筆，缺漏0。所有借值皆已有NPA點位，所以地理覆蓋沒有新增，也沒有降低；沒有把106筆借值計為新攝影桿。完整快照回歸測試鎖住此結果。另以最終dry run逐筆對照原139筆NPA：所有已知分類、速限、感測類型、道路分類、方向mode及非null bearing退化0；106筆測量方式由unknown轉point，依據為嚴格NPA同點佐證，trace可查。最終可見平均速率設備仍1筆，匝道路口bearing仍180°，不以總數相同取代資料品質核對。
 
 剩餘85筆無座標：
 
@@ -77,13 +77,34 @@ node evidence/analyze.cjs
 | 速限衝突 | 2 |
 | 明確非測速 | 1 |
 
-速限衝突為安南區公學路六段418號前、南區濱南路與喜樹路340巷口：台南60、NPA50，保留unknown及null。現有confirmed區間測速1筆沒有可靠起訖座標，仍null。其餘未知設備需要逐筆取締證據及可信座標，不能靠 geocode 或資料集名稱升級。
+速限衝突為安南區公學路六段418號前、南區濱南路與喜樹路340巷口：台南60、NPA50，保留unknown及null。第123筆confirmed設備經官方PDF第8頁核對為 `section_average`／`average_speed`／`camera_type=section`，完整保留兩個方向的里程範圍；沒有可靠起訖座標，仍null。其餘未知設備需要逐筆取締證據及可信座標，不能靠 geocode 或資料集名稱升級。
 
 負快取 `.cache/tainan-geocode-v1.json` 忽略於git，30天TTL；查詢先從未查過，再最久未查，輸出順序不變。全191筆無結果mock：第一輪100次、略過上限91；下一週91次、負快取略過100；到期依最久未查排序。未改Nominatim1req/s及User-Agent限制。
 
+## 獨立review阻擋修正與全生命週期驗證
+
+在初版commit `e9fdeacd1914c552eaf0ea99a755d8d4e40b0747` 上追加修正，未改其他來源或原有去重政策。
+
+1. **NPA佐證失敗保留整個台南來源**：下載、解析失敗或解析0筆直接拋錯，在geocode／upsert／stale清理之前中止台南本輪。原有DB列與逐筆provenance保持不變，沿用既有新鮮度政策；首輪新鮮庫存黃燈，連續第二輪紅燈。若NPA後續入口恢復，只能以DB既有confirmed點做原有聯集去重，不會把台南unknown覆寫入庫。
+2. **區間禁止變單點**：[台南警局官方表格](https://www.tnpd.gov.tw/Article/71d16651-5929-91c8-8a06-039fc3dbee6c)的11506 PDF第8頁第123筆明載區間平均速率。已視覺核對，PDF423431 bytes，SHA256 `ff8a9d89418f3345aa3424cd4cd598c18b9d26bcdd3d86e5ac3d03cfd170bf65`。`data/tainan-enforcement-verified.json`記錄網址、雜湊、完整地址、方向、速限、27.2248→28.358公里往高雄1133.2m及28.3378→27.1907公里往關廟1147.1m。僅這些欄位完全相符時套用官方分類；未核對的複合範圍不推測point。區間／複合位置不借NPA單點、不沿用DB單點、不geocode，且清空既有錯誤單點；起訖座標和單一section_length_m維持null，不把兩個不同範圍壓成一段。
+3. **台86匝道保留verified identity**：僅NPA嚴格匹配成功後將台南 `road` 採用官方NPA原文，另把road加入trace；地方address、direction及enforcement原文不變。仁德區臺1線342.7公里的road變為 `臺1線342.7公里臺86線匝道路口`，原有離線驗證表正常命中，最終JSON與upsert payload均保留180°。未放寬共用方向驗證或擅自設定bearing。
+4. **更正桃園狀態**：兩次log均為既有CSV解析失敗，已列入驗收限制；本次不修非台南來源。
+
+新增相關回歸先重現point分類與最終bearing=null；修後43項相關測試全綠，完整292項全綠。有狀態Supabase mock以實際191/139官方快照完成「舊區間錯座標 → 正常同步 → NPA所有入口HTTP失敗 → 連續第二輪失敗 → HTTP200但空參照 → 恢復」：
+
+| 階段 | 台南／NPA動作 | App可見 | 可見平均速率 | 台86匝道bearing |
+|---|---|---:|---:|---:|
+| 正常同步 | 台南191 upsert（106座標）、NPA保留33；清掉舊區間假單點 | 139 | 1 | 180° |
+| NPA全入口失敗 | 兩來源upsert0、stale delete0；既有列逐欄不變，台南補值未啟動 | 139 | 1 | 180° |
+| 連續第二輪失敗 | 台南顯示紅燈；兩來源仍逐欄不變 | 139 | 1 | 180° |
+| HTTP200／參照0筆 | 中止更新，既有列逐欄不變 | 139 | 1 | 180° |
+| 恢復 | 正常更新；第123筆仍section且無單點 | 139 | 1 | 180° |
+
+以上writeAll僅呼叫mock client，沒有正式 `--write`、沒有DB存取。真實公開資料驗收僅跑dry run，guard阻擋所有非官方主機與Nominatim。
+
 ## 交接與可重現證據
 
-本地 `evidence/` 已忽略於git，包含前後JSON／log、production-statistics.json、verification.json、matches.json、完整npm-test.txt及red/green輸出。106筆完整trace在 `evidence/matches.json`；來源快照則納入測試fixture。
+本地 `evidence/` 已忽略於git，包含前後JSON／log、production-statistics.json、verification.json、matches.json、完整npm-test.txt及review-red/review-green輸出、官方PDF與第8頁PNG。106筆完整trace在 `evidence/matches.json`；來源快照則納入測試fixture。
 
 - `test/fixtures/speed-camera-tainan-20261001.csv` SHA256 `2275c9d13024d72686d12f7875772ef3be8753b12b361ac15d01a4b87352d36f`
 - `test/fixtures/speed-camera-npa-tainan-20261001.csv` SHA256 `20d3e8092e33a249a29e79cfc853cc7b79b1c0f74a8d34e51d63d22bdceb534d`

@@ -62,10 +62,12 @@ async function getTainanNpaInput(fetchedAt) {
   const source = SOURCES.find(s => s.name === 'national-npa');
   try {
     const input = await fetchSourceBuffer(source);
-    return { input, records: await input.parse(input.buffer, fetchedAt) };
+    const records = await input.parse(input.buffer, fetchedAt);
+    if (records.length === 0) throw new Error('解析出 0 筆，不能作逐筆佐證');
+    return { input, records };
   } catch (err) {
-    console.error(`[speed-camera-sync] 台南 NPA 佐證下載失敗：${err.message}，保留原分類及缺值`);
-    return { input: null, records: [] };
+    // 佐證失效時必須在 upsert／geocode 前中止台南整源，交由原有 stale 政策保留 DB。
+    throw new Error(`台南 NPA 逐筆佐證取得失敗，本輪不更新台南以保留既有分類與座標：${err.message}`);
   }
 }
 
@@ -666,7 +668,7 @@ async function writeAll(supabase, opts = {}) {
         console.error(
           `[speed-camera-sync] ${source.name} geocode 補值：沿用 DB ${fillResult.reusedFromDb} 筆、` +
             `新查 ${fillResult.geocodeAttempted} 筆（成功 ${fillResult.geocodeSucceeded}）、` +
-            `負快取略過 ${fillResult.skippedNegativeCache} 筆、超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
+            `非單點略過 ${fillResult.skippedNonPoint} 筆、負快取略過 ${fillResult.skippedNegativeCache} 筆、超過單輪上限未處理 ${fillResult.skippedOverCap} 筆`
         );
       }
 

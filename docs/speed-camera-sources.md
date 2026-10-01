@@ -13,7 +13,7 @@
 | 桃園市 | [桃園市固定式測速照相](https://data.gov.tw/dataset/25935) | CSV | 有（現行 schema 為座標緯度/座標經度） | 不定期 | **Big5**（需轉碼） | 118 筆（2026-07-28） | ✅（現行與舊 schema） |
 | 高雄市 | [111年固定式違規照相設備及科技執法](https://data.gov.tw/dataset/148455) | CSV/JSON | 有（座標緯N度/座標經E度，非標準欄位命名） | 不定期 | UTF-8 (BOM) | 248 筆 | ✅ |
 | 台中市 | [固定式科學儀器執法設備取締地點一覽表](https://www.police.taichung.gov.tw/traffic/home.jsp?id=55&parentpath=0,5,53) | PDF（文字型） | 有（座標緯度/座標經度） | 不定期 | UTF-8（PDF 文字層） | 229 筆 | ✅（R8，PDF spike 判定為文字型，已實作） |
-| 台南市 | [智慧管理科技執法設備設置地點](https://data.tainan.gov.tw/Resource/1c7e82f0-d6b2-4b20-aeff-5c768100f82c) | CSV/JSON | 無（geocode 補值） | 最後更新 2025-12-26 | UTF-8 (BOM) | 72 筆 | ✅（R8，geocode） |
+| 台南市 | [智慧管理科技執法設備設置地點](https://data.tainan.gov.tw/Resource/1c7e82f0-d6b2-4b20-aeff-5c768100f82c) | CSV/JSON | 無（NPA逐筆借值；最後geocode） | 2026-10-01核對 | UTF-8 (BOM) | 191 筆 | 本地修復待合併；106筆借值 |
 
 ## 逐縣市細節
 
@@ -99,11 +99,14 @@
 - `parseTainan` 只在台南正規化表頭空白／換行，必要欄位缺失或欄名碰撞時報錯。行政區接受 37 區官方代碼或區名；位置仍保留舊版【取締項目】清理與原始證據。`南往北向` 等值保留原文，另換算行車方位，不更動共用方向 parser。舊 fixture 保留，新增今天完整官方 fixture。
 - **分類仍 fail closed**：混合設備資料集名稱與速限值都不能證明測速。沒有逐筆取締文字或可核對的 NPA 同點證據就保留 unknown；明確非測速維持 rejected。confirmed 附 `classification_basis`、`taxonomy_basis`、`taxonomy_source_url`。NPA 證據只確認測速點，不推測感測器或固定設備型式。
 - `lib/tainan-camera-enrichment.cjs` 只處理台南。使用同輪下載的[警政署測速執法設置點](https://data.gov.tw/dataset/7320)原始資料；最後 `national-npa` 重用同輪輸入，仍照原有30m聯集去重。要求 **台南行政區＋完整位置（含所有路名、里程和附註）＋相同方向＋相同速限**，僅接受唯一候選。只消除分隔符、台／臺與「公里處」差異；不補路名、不猜里程、不容許單向與雙向互借。東西／南北雙向也不等於無軸向的雙向。矛盾、歧義、複合區間全部拒絕。
+- **佐證失效不覆寫**：NPA下載／解析失敗或0筆時中止台南整源，發生在geocode、upsert和stale清理之前；沿用DB既有列與原有黃燈／連續第二輪紅燈政策。取得佐證失敗不能用空陣列讓已confirmed資料降成unknown。
+- **複合區間不補單點**：官方警局11506 PDF第8頁第123筆明確為區間平均速率。`data/tainan-enforcement-verified.json`保留PDF來源、雜湊和兩個完整里程範圍，僅地址／方向／速限完全相符才套 `section_average`／`average_speed`。所有區間／複合位置拒絕NPA單點、DB單點沿用、geocode，既有錯誤單點清null；未知範圍不推測point。可靠起訖座標取得前不把區間當成單一攝影桿。
+- **方向驗證identity**：NPA嚴格命中後，`road`採官方NPA原文並加入trace，地方address、direction、取締原文保持不變；讓仁德臺1線342.7公里臺86線匝道正確命中既有方向驗證表，最終保留180°。共用方向驗證表與門檻不變。
 - 每個座標必須通過官方台南**市界多邊形**，涵蓋 NPA 借值、DB 沿用和 geocode。`data/tainan-boundary.json` 從[國土測繪中心縣市界線](https://data.gov.tw/dataset/7442) `COUNTY_MOI_1140318.gml` 擷取臺南市，9,824 個頂點不簡化、不取 bbox；保留來源網址、SHA256 與 CRS。官方 TWD97 經緯度供 WGS84 點位作市界閘門，接近邊界的點可能被保守拒絕。
 - 2026-10-01 安全 dry run：解析 **191**、方向非空 **191**、confirmed **107**／rejected **1**／unknown **83**、座標 **106**、App 可見 **106**。106 筆（55.5%）來自唯一 NPA 相符點，原有區間測速 confirmed 1 筆仍無座標。
 - 剩餘 **85 筆**無座標：無完整位置與方向匹配 17；不可用位置／方向或複合區間 65；速限衝突 2（安南區公學路六段418號前、南區濱南路與喜樹路340巷口，台南60、NPA50）；明確非測速 1。寧留 null，不模糊比對。未匹配紀錄不因 geocode 成功而升級測速分類。
 - 139 筆 NPA 台南原始資料全部在市界內。以原有30m去重移除 **106** 筆、保留 **33**，台南來源106＋NPA33仍覆蓋原來139筆，逐點缺漏 **0**。本次增加台南來源的可用列，沒有新增地理覆蓋；不能把106筆借值稱為106個新點。
-- **台南 geocode 負快取及公平處理**：正式 `--write` 對剩餘缺值先沿用同key且在市界內的DB座標；其餘使用原有 Nominatim 1 req/s、自訂 User-Agent、台灣限定。單輪預設最多100次。查無結果、服務失敗或市外結果記錄在 `.cache/tainan-geocode-v1.json`（忽略於git），30天後可重試；先從未查過，再最久未查的地址，輸出順序不變。快取原子保存、移除已下架key；讀寫失敗有log。測試注入mock使用記憶體快取，絕不打真實Nominatim。191筆全失敗模擬第一輪100、下一輪91，到期仍按最久未查排序。
+- **台南 geocode 負快取及公平處理**：正式 `--write` 對非區間／非複合位置的剩餘缺值先沿用同key且在市界內的DB座標；其餘使用原有 Nominatim 1 req/s、自訂 User-Agent、台灣限定。單輪預設最多100次。查無結果、服務失敗或市外結果記錄在 `.cache/tainan-geocode-v1.json`（忽略於git），30天後可重試；先從未查過，再最久未查的地址，輸出順序不變。快取原子保存、移除已下架key；讀寫失敗有log。測試注入mock使用記憶體快取，絕不打真實Nominatim。191筆全失敗模擬第一輪100、下一輪91，到期仍按最久未查排序。
 - **座標來源調查**：今天核對的台南智慧設備與[固定式交通違規設備資料集](https://data.tainan.gov.tw/Resource/14d5b56b-ae37-4566-a742-1744ff8bff46)皆未提供座標或完整取締類型，不能整批確認；已找到可用座標的官方來源是 NPA。[省道里程牌座標](https://data.gov.tw/dataset/7040)是里程牌位置，不能證明測速設備的精確位置或分類，這版不內插、不當成攝影桿座標。未申請TGOS門牌服務、帳戶、API key或接受條款。
 - 歷史：2026-07-05 首次 geocode 17/72，其中15筆是中國誤配；7/6修台灣限定後剩2筆沿用、新查70成功0。新版資料8月起改地址／方向key後，正式台南座標降為0（2026-10-01 anon唯讀回讀確認）。本次未真geocode、未寫正式庫；完整驗收見 `docs/tainan-speed-camera-verification-20261001.md`。
 
