@@ -9,7 +9,7 @@
 |---|---|---|
 | launchd 排程（副本） | `scripts/launchd/com.evstudio.speed-camera-sync.plist` | 每週一 10:00 觸發。實際生效的是安裝在 `~/Library/LaunchAgents/` 的那份，repo 這份是備份＋版本紀錄 |
 | 執行腳本 | `scripts/run-speed-camera-local.sh` | 從 `.env` 只抽 `VITE_SUPABASE_URL`、`SUPABASE_SERVICE_ROLE_KEY`，跑 `node speed-camera-sync.cjs --write`；失敗跳 macOS 通知 |
-| 執行 log | `logs/speed-camera-local.log` | 每輪以 `===== <時間> speed-camera-sync 開始 =====` 開頭、`===== exit=<碼> =====` 結尾；超過 1MB 砍半。`logs/` 不進 git |
+| 執行 log | `logs/speed-camera-local.log` | 每輪記錄開始、完成時間（完成時間含時區），保留 `===== exit=<碼> =====` 結尾；runner 回傳同一退出碼；超過 1MB 砍半。`logs/` 不進 git |
 | 同步本體 | `speed-camera-sync.cjs` | 來源盤點與格式陷阱見 `docs/speed-camera-sources.md` |
 
 plist 寫死了 `/Users/juishuchang/...` 的絕對路徑（launchd 不展開 `~`），換機器或換帳號要先改 plist 與腳本內的 `REPO`、`NODE` 路徑。
@@ -54,9 +54,12 @@ zsh scripts/run-speed-camera-local.sh                                           
 2. **有沒有成功**：該輪結尾 `===== exit=0 =====`，且摘要行是 `摘要：成功 N／黃燈 0／失敗 0`（2026-09-28 為 `成功 10／黃燈 0／失敗 0`）。
 3. **異常指紋**（在該輪區段內 grep）：
 
+`exit=0` 仍可能含黃燈：摘要與完成訊息會明確區分已更新來源及沿用舊資料來源，不能當成全來源都已更新。
+
 | 指紋 | 代表 | 處理 |
 |---|---|---|
 | `Cannot find module`（該輪沒有摘要行就結束） | `node_modules` 不見了（2026-09-07 實例：9/04 根目錄大掃除刪掉 node_modules，該輪整個沒跑） | 在 repo 跑 `npm ci` 後手動補跑一輪 |
+| `來源回傳官方錯誤 JSON` | 官方以 HTTP 200 回 `success=false` 錯誤物件，並非有效 CSV／JSON 資料 | 自動嘗試既有備援；全敗依原有黃燈／紅燈政策保留舊資料，不清 stale；回報來源異常 |
 | `exit=` 不是 0、或 `失敗` > 0 | 至少一個來源紅燈（下載失敗且庫存過期／無資料） | 看該來源的錯誤訊息；回報維護者 |
 | `黃燈` > 0 | 某來源當輪抓不到，資料庫沿用舊資料 | 若是 `freeway-npa` 黃燈，檢查同輪 `national-npa 聯集去重` 的丟棄筆數：2026-07-05～09-28 正常輪觀測區間為 445–624 筆（9/28 為 533），明顯低於此區間＝可能多寫了重複國道桿（2026-09-26 事故，已於 `a836768` 修正，仍要盯） |
 | `官方已換檔` | `freeway-npa` 官方發布新 ZIP | 資料照寫；需重跑 `tools/freeway-bearings/` 方位表並更新內建網址（見該目錄 README） |

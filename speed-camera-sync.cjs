@@ -279,9 +279,24 @@ function describeUnexpectedHtml(buffer) {
   return `來源回傳的是網頁而不是資料檔（網頁標題：「${title || '無標題'}」）——多半是維護公告、登入頁或平台改版`;
 }
 
-/** 下載成功但內容是網頁 → 直接丟錯（不重試：維護頁重抓幾次都一樣），交給鏡像或黃燈／紅燈判定。 */
-function assertNotHtml(buffer) {
-  const problem = describeUnexpectedHtml(buffer);
+/** HTTP 200 仍可能是官方錯誤 JSON（例如桃園 success=false、code=500），不是資料格式改為 JSON。 */
+function describeUnexpectedErrorJson(buffer) {
+  if (!buffer || buffer.length === 0) return null;
+  const head = buffer.subarray(0, 4096).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+  if (!head.startsWith('{')) return null;
+  try {
+    const payload = JSON.parse(buffer.toString('utf8').replace(/^\uFEFF/, ''));
+    if (payload.success !== false) return null;
+    const code = Number.isFinite(payload.code) ? `，code=${payload.code}` : '';
+    return `來源回傳官方錯誤 JSON（success=false${code}），不是資料檔`;
+  } catch {
+    return null;
+  }
+}
+
+/** 網頁／官方錯誤 JSON 直接交給備援或黃燈／紅燈判定，不送入資料 parser。 */
+function assertSourceData(buffer) {
+  const problem = describeUnexpectedHtml(buffer) || describeUnexpectedErrorJson(buffer);
   if (problem) throw new Error(problem);
   return buffer;
 }
@@ -386,7 +401,7 @@ async function fetchSourceBuffer(source) {
   }
 
   try {
-    const buffer = assertNotHtml(
+    const buffer = assertSourceData(
       await fetchWithRetry(primaryUrl, source.name, primaryAttempts, FETCH_RETRY_DELAYS_MS)
     );
     return { buffer, parse: source.parse };
@@ -397,11 +412,11 @@ async function fetchSourceBuffer(source) {
     for (const fallback of source.fallbackUrls || []) {
       if (totalAttempts >= MAX_TOTAL_ATTEMPTS) break;
       const host = new URL(fallback.url).host;
-      console.error(`[speed-camera-sync] ${source.name} 主來源失敗，改用鏡像 ${host} ...`);
+      console.error(`[speed-camera-sync] ${source.name} 主來源失敗（${err.message}），改用鏡像 ${host} ...`);
 
       const attemptsLeft = Math.min(FALLBACK_MAX_ATTEMPTS, MAX_TOTAL_ATTEMPTS - totalAttempts);
       try {
-        const buffer = assertNotHtml(await fetchWithRetry(
+        const buffer = assertSourceData(await fetchWithRetry(
           fallback.url,
           `${source.name} 鏡像(${host})`,
           attemptsLeft,
@@ -890,7 +905,11 @@ async function runWriteMode() {
     );
     process.exit(1);
   }
-  console.error('[speed-camera-sync] 全部 source 寫入成功（含黃燈容忍）。');
+  console.error(
+    staleSources.length > 0
+      ? `[speed-camera-sync] 同步完成：${okSources.length} 個 source 已更新，${staleSources.length} 個 source 沿用舊資料（本輪未更新）。`
+      : '[speed-camera-sync] 全部 source 寫入成功。'
+  );
 }
 
 async function main() {
@@ -930,6 +949,7 @@ if (require.main === module) {
 
 module.exports = {
   describeUnexpectedHtml,
+  describeUnexpectedErrorJson,
   syncAll,
   writeAll,
   writeSyncLog,

@@ -22,6 +22,7 @@ export SUPABASE_SERVICE_ROLE_KEY="$(sed -n 's/^SUPABASE_SERVICE_ROLE_KEY=//p' .e
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') speed-camera-sync 開始 ====="
   "$NODE" speed-camera-sync.cjs --write
   RC=$?
+  echo "===== $(date '+%Y-%m-%d %H:%M:%S %z') speed-camera-sync 完成 ====="
   echo "===== exit=$RC ====="
 } >> "$LOG" 2>&1
 
@@ -34,3 +35,6 @@ fi
 if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG")" -gt 1048576 ]; then
   tail -c 524288 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 fi
+
+# 通知與 log 維護不得掩蓋爬蟲退出碼；launchd 應收到同一個結果。
+exit "$RC"

@@ -1212,3 +1212,112 @@ test('台南全生命週期：平均速率不被單點取代、verified方向保
   assert.equal(app().find(r=>r.address.includes('342.7公里')).direction_bearing,180);
   assert.equal(app().filter(r=>r.speed_measurement_mode==='section_average'&&r.sensor_technology==='average_speed').length,1);
 });
+
+
+// 桃園下載端點可能以 HTTP 200 回官方錯誤 JSON；不能交給 CSV parser 或跳過備援。
+const TAOYUAN_ERROR_JSON = fs.readFileSync(path.join(__dirname, 'fixtures', 'speed-camera-taoyuan-error.json'));
+const TAOYUAN_VALID_CSV = Buffer.from(
+  fs.readFileSync(path.join(__dirname, 'fixtures', 'speed-camera-taoyuan-v2.csv.b64'), 'utf8').trim(),
+  'base64'
+);
+
+function mockTaoyuanDownloads(t, primaryBody, fallbackBody) {
+  const originalSources = [...SOURCES];
+  const originalFetch = globalThis.fetch;
+  const source = SOURCES.find((s) => s.name === 'taoyuan');
+  SOURCES.splice(0, SOURCES.length, source);
+  const fetch = mock.fn(async (url) => {
+    let body;
+    if (url === source.url) body = primaryBody;
+    else if (url === source.fallbackUrls[0].url) body = fallbackBody;
+    else throw new Error(`unexpected test URL: ${url}`);
+    return {
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  });
+  globalThis.fetch = fetch;
+  t.after(() => {
+    SOURCES.splice(0, SOURCES.length, ...originalSources);
+    globalThis.fetch = originalFetch;
+  });
+  return { source, fetch };
+}
+
+test('官方錯誤 JSON：辨識 success=false，CSV／有效 JSON／其他資料不誤判', () => {
+  const { describeUnexpectedErrorJson } = speedCameraSync;
+  assert.match(describeUnexpectedErrorJson(TAOYUAN_ERROR_JSON), /官方錯誤 JSON.*success=false.*code=500/);
+  assert.match(describeUnexpectedErrorJson(Buffer.concat([Buffer.from('\uFEFF \n'), TAOYUAN_ERROR_JSON])), /code=500/);
+  for (const body of [
+    TAOYUAN_VALID_CSV,
+    Buffer.from('id,note\n1,"{""success"":false,""code"":500}"\n'),
+    Buffer.from('{"success":true,"result":{"records":[]}}'),
+    Buffer.from('[{"success":false}]'),
+    Buffer.from('{"success":false'),
+    Buffer.from('%PDF-1.7\n'),
+    Buffer.alloc(0),
+    null,
+  ]) assert.equal(describeUnexpectedErrorJson(body), null);
+});
+
+test('HTTP 200 錯誤 JSON：桃園主來源失敗後使用有效 CSV 備援，才寫入並清 stale', async (t) => {
+  const { source, fetch } = mockTaoyuanDownloads(t, TAOYUAN_ERROR_JSON, TAOYUAN_VALID_CSV);
+  const { from, calls } = makeFakeSupabase();
+  const summary = await writeAll({ from }, { geocoder: fakeGeocoder().geocoder });
+  assert.deepEqual(fetch.mock.calls.map((c) => c.arguments[0]), [source.url, source.fallbackUrls[0].url]);
+  const [result] = summary.sourceResults;
+  assert.equal(result.ok, true);
+  assert.equal(result.stale, false);
+  assert.equal(result.error, null);
+  assert.equal(result.written, 3);
+  assert.equal(calls.upsert.length, 1);
+  assert.equal(calls.upsert[0].payload[0].source, 'taoyuan');
+  assert.equal(calls.upsert[0].payload[0].lat, 25.00729);
+  assert.equal(calls.delete.length, 1);
+  assert.equal(calls.delete[0].eq.source, 'taoyuan');
+});
+
+test('有效 CSV：桃園主來源正常，不切備援也不誤判成錯誤 JSON', async (t) => {
+  const { source, fetch } = mockTaoyuanDownloads(t, TAOYUAN_VALID_CSV, TAOYUAN_ERROR_JSON);
+  const { from, calls } = makeFakeSupabase();
+  const summary = await writeAll({ from }, { geocoder: fakeGeocoder().geocoder });
+  assert.deepEqual(fetch.mock.calls.map((c) => c.arguments[0]), [source.url]);
+  assert.equal(summary.sourceResults[0].written, 3);
+  assert.equal(summary.sourceResults[0].ok, true);
+  assert.equal(calls.upsert.length, 1);
+});
+
+test('HTTP 200 錯誤 JSON：桃園主備援皆失敗，不寫入／不清 stale，保留原有黃燈及紅燈政策', async (t) => {
+  for (const scenario of [
+    { name: '新鮮庫存沿用舊資料', days: 7, previous: [], ok: true, stale: true },
+    { name: '過期庫存判失敗', days: 90, previous: [], ok: false, stale: false },
+    { name: '沒有庫存判失敗', days: null, previous: [], ok: false, stale: false },
+    { name: '連續黃燈升級失敗', days: 7, previous: ['taoyuan'], ok: false, stale: false },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const { source, fetch } = mockTaoyuanDownloads(t, TAOYUAN_ERROR_JSON, TAOYUAN_ERROR_JSON);
+      const { from, calls } = makeFakeSupabase({
+        selectImpl: () => ({
+          data: scenario.days == null ? null : {
+            fetched_at: new Date(Date.now() - scenario.days * 24 * 60 * 60 * 1000).toISOString(),
+          },
+          error: null,
+        }),
+      });
+      const summary = await writeAll({ from }, {
+        geocoder: fakeGeocoder().geocoder,
+        previousYellowSources: scenario.previous,
+      });
+      assert.deepEqual(fetch.mock.calls.map((c) => c.arguments[0]), [source.url, source.fallbackUrls[0].url]);
+      const [result] = summary.sourceResults;
+      assert.equal(result.ok, scenario.ok);
+      assert.equal(result.stale, scenario.stale);
+      assert.equal(result.written, 0);
+      assert.equal(result.staleDeleted, 0);
+      assert.match(result.error, /官方錯誤 JSON.*code=500/);
+      assert.equal(calls.upsert.length, 0);
+      assert.equal(calls.delete.length, 0);
+    });
+  }
+});
