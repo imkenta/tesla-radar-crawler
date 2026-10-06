@@ -655,7 +655,17 @@ test('toSpeedLimit：非數字/空值一律回傳 null，不可拋例外', () =>
   assert.equal(toSpeedLimit(''), null);
   assert.equal(toSpeedLimit(null), null);
   assert.equal(toSpeedLimit(undefined), null);
-  assert.equal(toSpeedLimit('50(往北)\n60(往南)'), null);
+  assert.equal(toSpeedLimit('50(往北)\n60(往南)'), null);});
+
+test('toSpeedLimit：超出 10–130 km/h 視為來源錯誤回傳 null（臺中移動式「5060」）', () => {
+  assert.equal(toSpeedLimit('5060'), null);
+  assert.equal(toSpeedLimit('0'), null);
+  assert.equal(toSpeedLimit('5'), null);
+  assert.equal(toSpeedLimit('135'), null);
+  assert.equal(toSpeedLimit('10'), 10);
+  assert.equal(toSpeedLimit('25'), 25);
+  assert.equal(toSpeedLimit('110'), 110);
+  assert.equal(toSpeedLimit('130'), 130);
 });
 
 test('toCoord：非數字/空值一律回傳 null', () => {
