@@ -86,6 +86,10 @@ const NATIONAL_NPA_DEDUPE_THRESHOLD_M = 30;
 // 正常，高度懷疑地理封鎖；openapi.kcg.gov.tw 是不同主機（不同 IP），JSON 格式，
 // 輸出 schema 經 248 筆全量比對與 CSV 版逐欄位一致（見 lib/speed-camera-parser.cjs
 // parseKaohsiungJson 與 test/speed-camera-parser.test.cjs）。
+const TAOYUAN_DATASET_ID = 'ecd45ee5-4489-436b-bd08-7d4e4111c4a4';
+const TAOYUAN_DATASET_PAGE_URL = `https://opendata.tycg.gov.tw/datalist/${TAOYUAN_DATASET_ID}`;
+const TAOYUAN_DEFAULT_RESOURCE_URL = `https://opendata.tycg.gov.tw/api/dataset/${TAOYUAN_DATASET_ID}/resource/6aa72aaf-d703-4a9e-acd7-24c17e934dc3/download`;
+
 const SOURCES = [
   {
     name: 'taipei',
@@ -117,14 +121,16 @@ const SOURCES = [
     ],
   },
   {
+    // ⚠️ 2026-10-08 修：桃園平台改版成按月換檔——每月資料集底下的 resource id 都不同（檔名「桃園市測速照相
+    // 設備(115年7月).csv」），舊 resource（36e77f60／6feee4ed）10/5 起下載一律回 HTTP 200 +
+    // `{"success":false,"code":500}`（資料集 API 本身沒壞，是舊 resource 被下架）。
+    // ⇒ 每輪先從資料集頁（/datalist/<id>）解析當前 resource（resolveUrl）；url 為解析失敗時的保底
+    // （2026-10-08 實證可下載的 115年7月版，118 筆）。舊 resource 已死，不再當 fallback。
     name: 'taoyuan',
-    url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/36e77f60-dabe-4fd0-8f69-a99f9acfd6f4/download',
+    url: TAOYUAN_DEFAULT_RESOURCE_URL,
+    resolveUrl: resolveTaoyuanResourceUrl,
     parse: parseTaoyuan,
-    fallbackUrls: [
-      {
-        url: 'https://opendata.tycg.gov.tw/api/dataset/ecd45ee5-4489-436b-bd08-7d4e4111c4a4/resource/6feee4ed-0221-40f2-bca1-980669e8d554/download',
-      },
-    ],
+    fallbackUrls: [],
   },
   {
     name: 'tainan',
@@ -377,6 +383,31 @@ function pickFreewayNpaZipUrl(payload) {
 async function resolveFreewayNpaZipUrl() {
   const buffer = await fetchWithRetry(FREEWAY_NPA_DATASET_API, 'freeway-npa 資料集 API', 2, FETCH_RETRY_DELAYS_MS);
   return pickFreewayNpaZipUrl(JSON.parse(buffer.toString('utf8')));
+}
+
+/**
+ * 從桃園資料開放平台資料集頁（Nuxt SSR，payload 內路徑以 `\u002F` 轉義）挑出當前的下載連結。
+ * 平台按月換 resource（舊 resource 下架後下載回 HTTP 200 的錯誤 JSON），所以不能寫死 resource id。
+ * 只認本資料集（TAOYUAN_DATASET_ID）底下的 `/resource/<uuid>/download`；頁面上出現多個時取最後一個
+ * （平台新版本附在後面），全沒有就丟錯讓呼叫端退回內建 url。
+ * @param {string} html 資料集頁原始 HTML
+ * @returns {string} 絕對 URL
+ */
+function pickTaoyuanResourceUrl(html) {
+  const text = String(html || '').replace(/\\u002F/gi, '/');
+  const re = new RegExp(`/api/dataset/${TAOYUAN_DATASET_ID}/resource/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/download`, 'g');
+  const rids = [];
+  for (const m of text.matchAll(re)) {
+    if (!rids.includes(m[1])) rids.push(m[1]);
+  }
+  if (rids.length === 0) throw new Error('資料集頁找不到桃園測速照相的 resource 下載連結');
+  return `https://opendata.tycg.gov.tw/api/dataset/${TAOYUAN_DATASET_ID}/resource/${rids[rids.length - 1]}/download`;
+}
+
+/** 桃園測速照相當前下載連結。解析不到就讓呼叫端退回內建 url。 */
+async function resolveTaoyuanResourceUrl() {
+  const buffer = await fetchWithRetry(TAOYUAN_DATASET_PAGE_URL, 'taoyuan 資料集頁', 2, FETCH_RETRY_DELAYS_MS);
+  return pickTaoyuanResourceUrl(buffer.toString('utf8'));
 }
 
 async function fetchSourceBuffer(source) {
@@ -960,6 +991,8 @@ module.exports = {
   resolveTaichungFixedPdfUrl,
   resolveFreewayNpaZipUrl,
   pickFreewayNpaZipUrl,
+  resolveTaoyuanResourceUrl,
+  pickTaoyuanResourceUrl,
   getExistingConfirmedPointsForSource,
   GEOCODE_MAX_CALLS_PER_RUN,
   ROW_COLLAPSE_MIN_RATIO,

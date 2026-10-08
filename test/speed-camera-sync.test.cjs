@@ -1224,7 +1224,14 @@ const TAOYUAN_VALID_CSV = Buffer.from(
 function mockTaoyuanDownloads(t, primaryBody, fallbackBody) {
   const originalSources = [...SOURCES];
   const originalFetch = globalThis.fetch;
-  const source = SOURCES.find((s) => s.name === 'taoyuan');
+  // 這組測試驗的是「HTTP 200 錯誤 JSON → 備援／黃燈」通用機制，用桃園的 parser／名稱但固定主備援 URL；
+  // 真實 taoyuan 來源改走 resolveUrl（2026-10-08），解析器另有專屬測試。
+  const source = {
+    ...SOURCES.find((s) => s.name === 'taoyuan'),
+    url: 'https://example.test/taoyuan-primary.csv',
+    resolveUrl: undefined,
+    fallbackUrls: [{ url: 'https://example.test/taoyuan-fallback.csv' }],
+  };
   SOURCES.splice(0, SOURCES.length, source);
   const fetch = mock.fn(async (url) => {
     let body;
@@ -1320,4 +1327,40 @@ test('HTTP 200 錯誤 JSON：桃園主備援皆失敗，不寫入／不清 stale
       assert.equal(calls.delete.length, 0);
     });
   }
+});
+
+test('pickTaoyuanResourceUrl：從資料集頁 payload（\\u002F 轉義）挑出本資料集當前 resource；多個取最後；沒有就丟錯', () => {
+  const ds = 'ecd45ee5-4489-436b-bd08-7d4e4111c4a4';
+  const esc = (rid) => `"\\u002Fapi\\u002Fdataset\\u002F${ds}\\u002Fresource\\u002F${rid}\\u002Fdownload"`;
+  const rid1 = '6aa72aaf-d703-4a9e-acd7-24c17e934dc3';
+  const rid2 = '11111111-2222-4333-8444-555555555555';
+  const builtIn = SOURCES.find((s) => s.name === 'taoyuan').url;
+  // 未換檔：解析結果與內建網址相同
+  assert.equal(speedCameraSync.pickTaoyuanResourceUrl(`x ${esc(rid1)} ${esc(rid1)} y`), builtIn);
+  // 官方換月：回傳新 resource；其他資料集的 resource 不算
+  const other = '"\\u002Fapi\\u002Fdataset\\u002Fdeadbeef-0000-4000-8000-000000000000\\u002Fresource\\u002F99999999-9999-4999-8999-999999999999\\u002Fdownload"';
+  const url = speedCameraSync.pickTaoyuanResourceUrl(`${other} ${esc(rid1)} ${esc(rid2)}`);
+  assert.equal(url, `https://opendata.tycg.gov.tw/api/dataset/${ds}/resource/${rid2}/download`);
+  assert.throws(() => speedCameraSync.pickTaoyuanResourceUrl(other), /找不到桃園測速照相/);
+  assert.throws(() => speedCameraSync.pickTaoyuanResourceUrl(''), /找不到桃園測速照相/);
+});
+
+test('resolveTaoyuanResourceUrl：向資料集頁取當前連結，且 taoyuan 已接上 resolveUrl、不再掛死掉的舊 resource', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const ds = 'ecd45ee5-4489-436b-bd08-7d4e4111c4a4';
+  const html = Buffer.from(`<html>"\\u002Fapi\\u002Fdataset\\u002F${ds}\\u002Fresource\\u002F22222222-3333-4444-8555-666666666666\\u002Fdownload"</html>`, 'utf8');
+  const calls = [];
+  globalThis.fetch = mock.fn(async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, arrayBuffer: async () => html.buffer.slice(html.byteOffset, html.byteOffset + html.byteLength) };
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const url = await speedCameraSync.resolveTaoyuanResourceUrl();
+  assert.deepEqual(calls, [`https://opendata.tycg.gov.tw/datalist/${ds}`]);
+  assert.match(url, /resource\/22222222-3333-4444-8555-666666666666\/download$/);
+  const source = SOURCES.find((s) => s.name === 'taoyuan');
+  assert.equal(typeof source.resolveUrl, 'function');
+  assert.doesNotMatch(JSON.stringify(source), /36e77f60|6feee4ed/);
 });
