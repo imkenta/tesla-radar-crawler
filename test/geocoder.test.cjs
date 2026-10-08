@@ -136,3 +136,91 @@ test('geocode：連續呼叫確實節流至少 minIntervalMs（用假的 sleepIm
 test('createGeocoder：傳入非函式的 fetchImpl 應拋出明確錯誤', () => {
   assert.throws(() => createGeocoder({ fetchImpl: 'not-a-function', minIntervalMs: 0 }), /fetch/);
 });
+
+// ---- geocodeIntersection：路口 = 兩條路線幾何的最近頂點（一律 mock fetch，絕不真打 Nominatim）----
+const line = (coords) => ({ geojson: { type: 'LineString', coordinates: coords } });
+function roadFetch(byQuery) {
+  const calls = [];
+  const fetchImpl = mock.fn(async (url, options) => {
+    const q = decodeURIComponent(/[?&]q=([^&]*)/.exec(url)[1]);
+    calls.push({ url, q, options });
+    return jsonResponse(byQuery[q] || []);
+  });
+  return { fetchImpl, calls };
+}
+
+test('geocodeIntersection：兩路有共享頂點 → 回傳該點；兩次請求都帶 polygon_geojson=1&limit=5 與自訂 UA', async () => {
+  const { fetchImpl, calls } = roadFetch({
+    '臺南市中西區西華南街': [line([[120.2090, 22.9950], [120.2098173, 22.9955535]]), line([[120.2098173, 22.9955535], [120.2105, 22.9960]])],
+    '臺南市中西區中山路': [line([[120.2098173, 22.9955535], [120.2100, 22.9970]]), { geojson: { type: 'MultiLineString', coordinates: [[[120.2070, 22.9940], [120.2085, 22.9948]]] } }],
+  });
+  const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 0 });
+  const result = await geocoder.geocodeIntersection('臺南市中西區', '西華南街', '中山路');
+  assert.deepEqual(result, { lat: 22.9955535, lng: 120.2098173 });
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.match(c.url, /polygon_geojson=1/);
+    assert.match(c.url, /limit=5/);
+    assert.match(c.options.headers['User-Agent'], /tesla-radar-crawler/);
+  }
+  assert.deepEqual(calls.map((c) => c.q), ['臺南市中西區西華南街', '臺南市中西區中山路']);
+});
+
+test('geocodeIntersection：最近頂點 ≤25 m 取中點；>25 m（兩路不相交）回 null；查無／無線幾何回 null', async () => {
+  // 緯度 0.0001 度 ≈ 11.1 m：0.0002 ≈ 22 m（接受），0.0003 ≈ 33 m（拒絕）
+  const near = roadFetch({
+    '臺南市中西區甲路': [line([[120.2, 22.9990]])],
+    '臺南市中西區乙路': [line([[120.2, 22.9992]])],
+  });
+  const ok = await createGeocoder({ fetchImpl: near.fetchImpl, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路');
+  assert.ok(Math.abs(ok.lat - 22.9991) < 1e-9 && ok.lng === 120.2);
+
+  const far = roadFetch({
+    '臺南市中西區甲路': [line([[120.2, 22.9990]])],
+    '臺南市中西區乙路': [line([[120.2, 22.9993]])],
+  });
+  assert.equal(await createGeocoder({ fetchImpl: far.fetchImpl, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路'), null);
+
+  const empty = roadFetch({});
+  assert.equal(await createGeocoder({ fetchImpl: empty.fetchImpl, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路'), null);
+
+  // 只有 Point／Polygon 沒有線幾何
+  const noLine = roadFetch({
+    '臺南市中西區甲路': [{ geojson: { type: 'Point', coordinates: [120.2, 22.999] } }],
+    '臺南市中西區乙路': [line([[120.2, 22.999]])],
+  });
+  assert.equal(await createGeocoder({ fetchImpl: noLine.fetchImpl, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路'), null);
+});
+
+test('geocodeIntersection：座標在台灣 bbox 外判誤配回 null；HTTP 錯誤回 null 不丟例外；缺參數不發請求', async () => {
+  const out = roadFetch({
+    '臺南市中西區甲路': [line([[110.0, 30.0]])],
+    '臺南市中西區乙路': [line([[110.0, 30.0]])],
+  });
+  assert.equal(await createGeocoder({ fetchImpl: out.fetchImpl, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路'), null);
+
+  const failing = mock.fn(async () => jsonResponse(null, false, 503));
+  assert.equal(await createGeocoder({ fetchImpl: failing, minIntervalMs: 0 }).geocodeIntersection('臺南市中西區', '甲路', '乙路'), null);
+
+  const none = mock.fn(async () => jsonResponse([]));
+  const g = createGeocoder({ fetchImpl: none, minIntervalMs: 0 });
+  assert.equal(await g.geocodeIntersection('', '甲路', '乙路'), null);
+  assert.equal(await g.geocodeIntersection('臺南市中西區', '甲路', ''), null);
+  assert.equal(none.mock.calls.length, 0);
+});
+
+test('geocodeIntersection：兩次請求間節流 ≥1.1 秒；同輪重複的路用快取不再請求', async () => {
+  const { fetchImpl } = roadFetch({
+    '臺南市中西區甲路': [line([[120.2, 22.999]])],
+    '臺南市中西區乙路': [line([[120.2, 22.999]])],
+    '臺南市中西區丙路': [line([[120.2, 22.999]])],
+  });
+  const sleepCalls = [];
+  const geocoder = createGeocoder({ fetchImpl, minIntervalMs: 1000, sleepImpl: async (ms) => { sleepCalls.push(ms); } });
+  await geocoder.geocodeIntersection('臺南市中西區', '甲路', '乙路');
+  assert.equal(fetchImpl.mock.calls.length, 2);
+  assert.equal(sleepCalls.length, 1);
+  assert.ok(sleepCalls[0] > 1000 && sleepCalls[0] <= 1100, `等待 ${sleepCalls[0]}ms 應 ≤1100 且超過 1000（至少 1.1s 間隔）`);
+  await geocoder.geocodeIntersection('臺南市中西區', '甲路', '丙路'); // 甲路已快取，只多查丙路
+  assert.equal(fetchImpl.mock.calls.length, 3);
+});

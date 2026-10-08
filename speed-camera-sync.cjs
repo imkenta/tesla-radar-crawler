@@ -704,7 +704,14 @@ async function writeAll(supabase, opts = {}) {
         const cache = opts.tainanNegativeCache || (opts.geocoder ? {} : loadTainanNegativeCache());
         const fillResult = await fillTainanMissingCoords(
           records, existingCoords, (address) => geocoder.geocode(address),
-          GEOCODE_MAX_CALLS_PER_RUN, { cache }
+          GEOCODE_MAX_CALLS_PER_RUN,
+          {
+            cache,
+            // 路口型地址走兩路交點法；注入的 mock geocoder 沒有此方法就維持舊路徑。
+            geocodeIntersectionFn: typeof geocoder.geocodeIntersection === 'function'
+              ? (district, roadA, roadB) => geocoder.geocodeIntersection(district, roadA, roadB)
+              : null,
+          }
         );
         if (!opts.geocoder) {
           try { saveTainanNegativeCache(cache); }

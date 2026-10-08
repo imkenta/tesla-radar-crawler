@@ -145,3 +145,57 @@ test('官方第123筆區間：保持平均速率類型，既有/DB/geocode 都�
   const result=await fillTainanMissingCoords([ambiguous],new Map(),async()=>({lat:23.308907,lng:120.32573}),100);
   assert.equal(result.records[0].lat,null);assert.equal(result.geocodeAttempted,0);
 });
+
+const { parseIntersectionAddress } = require('../lib/tainan-camera-enrichment.cjs');
+
+test('parseIntersectionAddress：路口型拆兩路，路名含「段」整個保留；非路口型回 null', () => {
+  assert.deepEqual(parseIntersectionAddress('中西區 中山路與西華南街口'), { district: '中西區', roadA: '中山路', roadB: '西華南街' });
+  assert.deepEqual(parseIntersectionAddress('中西區 中華西路二段與民權路口'), { district: '中西區', roadA: '中華西路二段', roadB: '民權路' });
+  assert.deepEqual(parseIntersectionAddress('仁德區 中山路與中正路三段路口'), { district: '仁德區', roadA: '中山路', roadB: '中正路三段' });
+  assert.deepEqual(parseIntersectionAddress('永康區 中華路與中山南路交叉口'), { district: '永康區', roadA: '中華路', roadB: '中山南路' });
+  for (const addr of ['新營區 臺1線290.3公里與東山路', '新營區 中山路一段', '中山路與中正路口', '', null, undefined])
+    assert.equal(parseIntersectionAddress(addr), null);
+});
+
+test('台南路口型地址走交點法（一筆計 2 次呼叫）；非路口型維持整串查；上限與負快取沿用', async () => {
+  const records = [
+    point({ address: '中西區 中山路與西華南街口', direction: '多向' }),
+    point({ address: '新營區 某某路一段', direction: '南往北向' }),
+  ];
+  const full = [], inter = [];
+  const fillWith = (cap, cache = {}, extra = {}) => fillTainanMissingCoords(records, new Map(),
+    async (q) => (full.push(q), { lat: 23.308907, lng: 120.32573 }), cap,
+    { cache, geocodeIntersectionFn: async (...args) => (inter.push(args), { lat: 22.9955535, lng: 120.2098173 }), ...extra });
+  const r = await fillWith(100);
+  assert.deepEqual(inter, [['臺南市中西區', '中山路', '西華南街']]);
+  assert.deepEqual(full, ['臺南市新營區 某某路一段']);
+  assert.equal(r.geocodeAttempted, 3); // 交點 2 + 整串 1
+  assert.equal(r.geocodeSucceeded, 2);
+  assert.equal(r.records[0].lat, 22.9955535);
+  assert.match(r.records[0].taxonomy_basis, /coords:nominatim:intersection:tainan_city_boundary/);
+  assert.doesNotMatch(r.records[1].taxonomy_basis, /intersection/);
+
+  // 上限 2：交點法吃掉 2，整串那筆超過上限
+  inter.length = 0; full.length = 0;
+  const capped = await fillWith(2);
+  assert.equal(capped.geocodeAttempted, 2);
+  assert.equal(capped.skippedOverCap, 1);
+  assert.equal(full.length, 0);
+
+  // 上限 1：交點法放不下（需 2）→ 略過；整串那筆仍可查
+  inter.length = 0; full.length = 0;
+  const one = await fillWith(1);
+  assert.equal(inter.length, 0);
+  assert.equal(full.length, 1);
+  assert.equal(one.geocodeAttempted, 1);
+
+  // 交點法失敗 → 寫負快取；沒傳 geocodeIntersectionFn 就走舊的整串路徑
+  const cache = {};
+  const failed = await fillTainanMissingCoords([records[0]], new Map(), async () => null, 100,
+    { cache, now: 1800000000000, geocodeIntersectionFn: async () => null });
+  assert.equal(failed.geocodeSucceeded, 0);
+  assert.equal(Object.keys(cache).length, 1);
+  const legacy = [];
+  await fillTainanMissingCoords([records[0]], new Map(), async (q) => (legacy.push(q), null), 100, {});
+  assert.deepEqual(legacy, ['臺南市中西區 中山路與西華南街口']);
+});
