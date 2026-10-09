@@ -17,6 +17,9 @@ cd "$REPO" || exit 1
 
 export VITE_SUPABASE_URL="$(sed -n 's/^VITE_SUPABASE_URL=//p' .env | tr -d '"' | head -1)"
 export SUPABASE_SERVICE_ROLE_KEY="$(sed -n 's/^SUPABASE_SERVICE_ROLE_KEY=//p' .env | tr -d '"' | head -1)"
+# 台南路口型地址改走兩路交點 geocode（C-84，2026-10-09 使用者裁決）：一支桿計 2 次呼叫，
+# 預設 100 只夠 50 支；設 200 讓 85 支一輪補完。Nominatim 仍受 1.1s 節流，約 3–4 分鐘。
+export SPEEDCAM_GEOCODE_MAX_CALLS=200
 
 {
   echo "===== $(date '+%Y-%m-%d %H:%M:%S') speed-camera-sync 開始 ====="
