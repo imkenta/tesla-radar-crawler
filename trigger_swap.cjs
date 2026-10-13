@@ -1,6 +1,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 const { SHARD_NAMES } = require('./lib/shard-config.cjs');
+const { fetchWatchesByPlate } = require('./lib/watchlist-lookup.cjs');
 require('dotenv').config();
 
 // 最低筆數／最大下降比例保護：擋「幾乎全空但非 0」或「相對正式表暴跌」的殘缺批次。
@@ -168,14 +169,11 @@ async function processSoldNotifications() {
 
         console.log(`📊 Processing ${removed.length} removed plates...`);
 
-        for (const item of removed) {
-            const { data: watches, error: watchErr } = await supabase
-                .from('watchlist')
-                .select('*')
-                .eq('plate_no', item.plate_no)
-                .eq('source', 'available');
+        const watchesByPlate = await fetchWatchesByPlate(supabase, 'available', removed.map((r) => r.plate_no));
 
-            if (watchErr || !watches || watches.length === 0) continue;
+        for (const item of removed) {
+            const watches = watchesByPlate.get(item.plate_no);
+            if (!watches || watches.length === 0) continue;
 
             for (const watch of watches) {
                 console.log(`🚨 Alert! Watchlist plate ${item.plate_no} has been sold/removed. Notifying ${watch.email}`);

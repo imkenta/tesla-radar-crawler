@@ -10,6 +10,7 @@ const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
 const dotenv = require('dotenv');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
+const { fetchWatchesByPlate } = require('./lib/watchlist-lookup.cjs');
 const {
   groupActiveEvAnnouncements,
   partitionEligibleBiddingPlates
@@ -153,19 +154,16 @@ async function loadActiveStations() {
 
 async function processWatchlistAlerts(plates) {
   console.log('🔔 Checking watchlist alerts for updated bids...');
+  let watchesByPlate;
+  try {
+    watchesByPlate = await fetchWatchesByPlate(supabase, 'bidding', plates.map((p) => p.plate_no));
+  } catch (err) {
+    console.error('[Watchlist] Fetch watch error:', err.message);
+    return;
+  }
   for (const plate of plates) {
     try {
-      // Find watch records for this plate
-      const { data: watches, error } = await supabase
-        .from('watchlist')
-        .select('*')
-        .eq('plate_no', plate.plate_no)
-        .eq('source', 'bidding');
-
-      if (error) {
-        console.error(`[Watchlist] Fetch watch error for ${plate.plate_no}:`, error.message);
-        continue;
-      }
+      const watches = watchesByPlate.get(plate.plate_no);
 
       for (const watch of watches || []) {
         // Trigger alert if it's the first known bid or the bid has increased
@@ -236,14 +234,11 @@ async function processEndedAuctions() {
       return;
     }
 
-    for (const plate of expired) {
-      const { data: watches, error: watchErr } = await supabase
-        .from('watchlist')
-        .select('*')
-        .eq('plate_no', plate.plate_no)
-        .eq('source', 'bidding');
+    const watchesByPlate = await fetchWatchesByPlate(supabase, 'bidding', expired.map((p) => p.plate_no));
 
-      if (watchErr || !watches || watches.length === 0) continue;
+    for (const plate of expired) {
+      const watches = watchesByPlate.get(plate.plate_no);
+      if (!watches || watches.length === 0) continue;
 
       const finalBid = parseFloat(plate.current_bid || 0);
       const formattedEnd = new Date(plate.end_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
