@@ -302,6 +302,36 @@ run_fresh() {
   done
 }
 
+# primary result artifact 的 id；API 失敗或回傳非數字一律輸出空字串（＝還沒看到）。
+# stderr 不再丟掉：`gh: Server Error (HTTP 5xx)` 要留在 log 裡。
+spare_find_primary_artifact() {
+  local out
+  if ! out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+      --jq '[.artifacts[] | select(.name == "plate-sync-result-'"$SHARD"'")][0].id // ""'); then
+    echo "::warning::Spare could not list run artifacts (GitHub API error); will poll again." >&2
+    return 0
+  fi
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$out"
+  fi
+}
+
+# primary job 的 conclusion；只輸出 GitHub 定義的 conclusion 字面值，
+# API 失敗、job 未結束（null）或任何其他形狀都輸出空字串。
+spare_primary_conclusion() {
+  local out
+  if ! out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+      --jq '[.jobs[] | select(.name | endswith("primary-attempt ('"$SHARD"')"))][0].conclusion // ""'); then
+    echo "::warning::Spare could not read the primary job conclusion (GitHub API error); will poll again." >&2
+    return 0
+  fi
+  case "$out" in
+    success|failure|cancelled|timed_out|skipped|neutral|action_required|stale)
+      printf '%s' "$out"
+      ;;
+  esac
+}
+
 # 熱備援（2026-09-01）：與 primary 平行啟動，setup 完先暖身驗票，等 primary
 # 的 result artifact 出現後接棒——省掉舊 recovery 路徑上 2.5 分鐘的 setup
 # 關鍵路徑（昨天多場敗局差距正是 2-3 分鐘）。swap 全有全無語義完全不動。
@@ -329,28 +359,44 @@ run_spare() {
   done
 
   # 2) 等 primary 的 result artifact（或 primary 沒留下 artifact 就終局）。
+  # 2026-10-14：gh api 遇 HTTP 錯誤會把錯誤 JSON 印到 stdout（不經 --jq），舊寫法
+  # `2>/dev/null || true` 把 `{"message":"Server Error"}` 當成 primary 的 conclusion
+  # → 判定「primary 死於 setup」→ 五台備援機與仍在跑的 primary 同時整區重爬，
+  # staging 每張牌寫兩次並被 swap 上線（10/13 20:43-21:23 連三輪），之後乾淨的
+  # 輪次全被 20% 下降閘擋下。現在 API 失敗或回傳形狀不對一律視為「還不知道」，
+  # 繼續等；只有明確的 failure/cancelled/timed_out 才接手（fail-closed＝備援閒置）。
   while [ "$waited" -lt "$SPARE_MAX_WAIT_SECONDS" ]; do
-    artifact_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
-      --jq '[.artifacts[] | select(.name == "plate-sync-result-'"$SHARD"'")][0].id // ""' 2>/dev/null || true)
+    artifact_id=$(spare_find_primary_artifact)
     if [ -n "$artifact_id" ]; then
       break
     fi
-    primary_conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
-      --jq '[.jobs[] | select(.name | endswith("primary-attempt ('"$SHARD"')"))][0].conclusion // ""' 2>/dev/null || true)
-    if [ -n "$primary_conclusion" ]; then
-      # 2026-09-04：SUCCESS/RETRY/HARD_FAILURE 都會留 artifact；「失敗且無 artifact」＝
-      # primary 在開爬前就死於 setup（apt 慢/逾時，SHARD5 10:03/10:23 實例）。此時
-      # 健康的備援機不該收工，而是以自身起跑時間推算 lane 預算、整個 shard 接手。
-      if [ "$primary_conclusion" != "success" ] && [ "$SPARE_START_EPOCH" -gt 0 ]; then
-        DEADLINE_EPOCH=$((SPARE_START_EPOCH + LANE_BUDGET_SECONDS))
-        echo "Primary died before crawling ($primary_conclusion, no artifact); spare taking the whole shard $SHARD."
-        spare_take_over
-        return $?
-      fi
-      echo "Primary finished ($primary_conclusion) without publishing a result artifact; spare standing down."
-      write_outcome SPARE_IDLE
-      return 0
-    fi
+    primary_conclusion=$(spare_primary_conclusion)
+    case "$primary_conclusion" in
+      failure|cancelled|timed_out)
+        # 2026-09-04：SUCCESS/RETRY/HARD_FAILURE 都會留 artifact；「失敗且無 artifact」＝
+        # primary 在開爬前就死於 setup（apt 慢/逾時，SHARD5 10:03/10:23 實例）。此時
+        # 健康的備援機不該收工，而是以自身起跑時間推算 lane 預算、整個 shard 接手。
+        # 接手前再查一次 artifact，排除「上一次查 artifact 之後 primary 才收工」的競態。
+        artifact_id=$(spare_find_primary_artifact)
+        if [ -n "$artifact_id" ]; then
+          break
+        fi
+        if [ "$SPARE_START_EPOCH" -gt 0 ]; then
+          DEADLINE_EPOCH=$((SPARE_START_EPOCH + LANE_BUDGET_SECONDS))
+          echo "Primary died before crawling ($primary_conclusion, no artifact); spare taking the whole shard $SHARD."
+          spare_take_over
+          return $?
+        fi
+        echo "Primary finished ($primary_conclusion) without publishing a result artifact; spare standing down."
+        write_outcome SPARE_IDLE
+        return 0
+        ;;
+      success|skipped|neutral)
+        echo "Primary finished ($primary_conclusion) without publishing a result artifact; spare standing down."
+        write_outcome SPARE_IDLE
+        return 0
+        ;;
+    esac
     sleep "$SPARE_POLL_INTERVAL_SECONDS"
     waited=$((waited + SPARE_POLL_INTERVAL_SECONDS))
   done

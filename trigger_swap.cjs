@@ -2,6 +2,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 const { SHARD_NAMES } = require('./lib/shard-config.cjs');
 const { fetchWatchesByPlate } = require('./lib/watchlist-lookup.cjs');
+const { findDuplicateKeys, fetchAllStagingKeys } = require('./lib/staging-duplicates.cjs');
 require('dotenv').config();
 
 // 最低筆數／最大下降比例保護：擋「幾乎全空但非 0」或「相對正式表暴跌」的殘缺批次。
@@ -270,6 +271,18 @@ async function run() {
 
     if (count < MIN_STAGING_COUNT) {
         console.error(`❌ Staging has only ${count} records (< floor ${MIN_STAGING_COUNT}). Aborting swap to avoid publishing a partial batch.`);
+        process.exit(1);
+    }
+
+    // Safety Check 3：重複鍵。下降閘只擋「變少」，雙 writer 重複寫入只會「變多」。
+    const { rows: stagingKeys, error: stagingKeysError } = await fetchAllStagingKeys(supabase, safeQuery);
+    if (stagingKeysError) {
+        console.error('❌ Failed to read staging keys for duplicate check:', stagingKeysError.message);
+        process.exit(1);
+    }
+    const duplicateKeys = findDuplicateKeys(stagingKeys);
+    if (duplicateKeys.length > 0) {
+        console.error(`❌ Staging has ${duplicateKeys.length} duplicated plate keys (e.g. ${duplicateKeys.slice(0, 3).map(d => `${d.key}×${d.count}`).join(', ')}). Aborting swap.`);
         process.exit(1);
     }
 
