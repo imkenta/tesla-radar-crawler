@@ -6,8 +6,9 @@ const { findDuplicateKeys, fetchAllStagingKeys } = require('./lib/staging-duplic
 require('dotenv').config();
 
 // 最低筆數／最大下降比例保護：擋「幾乎全空但非 0」或「相對正式表暴跌」的殘缺批次。
-// DB 端 swap_plates_data() 也有 20% 熔斷，這裡在呼叫 RPC 前先擋一層，讓
-// trigger_swap.cjs 能明確 exit 非 0，不必等 RPC 側靜默 TRUNCATE 才發現。
+// 這是唯一的一道防線：線上 swap_plates_data() 沒有熔斷（2026-10-14 以
+// pg_get_functiondef 實查；tesla-studio 的 20251229_add_circuit_breaker*.sql 被同日
+// 較晚套用的 20251229_fix_swap_logic.sql 覆寫），staging 非空就直接 TRUNCATE 正式表換上。
 const MIN_STAGING_COUNT = 50;
 const MAX_DROP_RATIO = 0.2;
 // Shard 新鮮度窗口：finalize job 緊接在 5 個 shard 之後跑（各 shard 逾時 45 分鐘），
@@ -312,9 +313,10 @@ async function run() {
         process.exit(1);
     }
 
-    // swap_plates_data() 是 void RPC：熔斷觸發時只把 sync_metadata.status 寫成
-    // SKIPPED_CIRCUIT_BREAKER 並清空 staging，不會回傳 error。必須回讀確認，
-    // 否則下面會把它覆寫成 COMPLETED（false green）。
+    // 防禦性回讀：線上 swap_plates_data() 目前沒有熔斷（見檔頭）。若日後重新套用
+    // 熔斷版，它是 void RPC，觸發時只把 sync_metadata.status 寫成
+    // SKIPPED_CIRCUIT_BREAKER、不回傳 error；不回讀的話下面會把它覆寫成
+    // COMPLETED（false green）。
     const { data: metaAfterSwap, error: metaAfterSwapError } = await safeQuery(() => supabase
         .from('sync_metadata')
         .select('status, status_message')
