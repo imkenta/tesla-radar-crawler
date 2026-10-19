@@ -19,6 +19,8 @@ const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs'
 const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS, NO_ESCAPE_STORM_CALL_TIMEOUT_MS, NO_ESCAPE_STORM_BACKOFF_MIN_MS, NO_ESCAPE_STORM_BACKOFF_MAX_MS } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
+// 瀏覽器／頁面存活判斷＋lane 牆鐘到期關機協調（純函式，與回歸測試共用：test/browser-liveness.test.cjs）
+const { isPageUsable, assertPageUsable, createDeadPageError, createDeadlineShutdown } = require('./lib/browser-liveness.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -106,9 +108,10 @@ const MODEL_NAME = MODEL_LADDER[0].model; // 僅供啟動 log 顯示用，實際
 const MVDIS_PREFLIGHT_EXIT_CODE = 75; // EX_TEMPFAIL：workflow 只補跑此類網路失敗
 
 // 2026-08-30：Gemini 503 過載期，SDK 呼叫會被 Google 端 hold 40-120 秒才回錯，
-// 是 18 分鐘 lane 預算的最大時間小偷，也讓 MVDIS 頁面在乾等期間 session 過期、
-// frame 脫離（05:23/05:43 兩輪的 detached Frame 皆發生在長掛起之後）。健康呼叫
-// 3-15 秒，25 秒硬逾時只切病態長尾；逾時視同 5xx 計入風暴偵測。
+// 是 18 分鐘 lane 預算的最大時間小偷。健康呼叫 3-15 秒，25 秒硬逾時只切病態長尾；
+// 逾時視同 5xx 計入風暴偵測。（2026-10-20 更正：先前把 detached Frame 歸因於「乾等期間
+// MVDIS session 過期」並不成立——實證是 lane 牆鐘到期的 SIGTERM 關掉 Chrome 所致，
+// 見 lib/browser-liveness.cjs 檔頭；5xx 風暴只是讓牆鐘到期恰好落在站中。）
 const AI_CALL_TIMEOUT_MS = 25000;
 
 // 2026-08-31：MVDIS 對個別出口 IP 的「軟封鎖/降級」——preflight GET 正常、提交
@@ -119,6 +122,19 @@ const AI_CALL_TIMEOUT_MS = 25000;
 // lane 預算。任一次提交成功即歸零（跨站累計）。
 const CAPTCHA_REJECT_BAILOUT_THRESHOLD = 4;
 let consecutiveCaptchaRejects = 0;
+
+// 2026-10-20：lane 牆鐘到期的關機狀態（見 lib/browser-liveness.cjs 檔頭）。wrapper 的
+// `timeout --signal=TERM --kill-after=15s` 送 SIGTERM 時，過去 puppeteer 只關 Chrome、node 繼續
+// 在殭屍 page 上跑最多 15 秒，連環噴 "Attempted to use detached Frame"、把站誤標 FAILED。
+// 現在 puppeteer 不再代管 SIGTERM（handleSIGTERM:false），改由 deadlineShutdown 乾淨收尾；
+// 收尾進行中主流程在每個有副作用的點（刪 staging、換站、重試）停手，交給收尾函式結束 process。
+let deadlineShutdown = null;
+function isShuttingDown() {
+    return deadlineShutdown !== null && deadlineShutdown.isShuttingDown();
+}
+async function parkIfShuttingDown() {
+    if (isShuttingDown()) await new Promise(() => {}); // 永不 resolve；process 由 deadlineShutdown.exit 結束
+}
 
 // 2026-08-31：同 run 站點續爬。尖峰期常要抽多張 IP 樂透票才中，但每張新票都
 // 從頭爬整個 shard，預算不夠分。成功完成的站寫進 COMPLETED_STATIONS_FILE
@@ -889,6 +905,7 @@ async function processStation(page, deptId, station) {
     let retries = 0;
     let status = 'SUCCESS';
 
+    await parkIfShuttingDown(); // 到期關機中不得再刪 staging／開新站
     // 清理舊資料
     await supabase.from('available_plates_staging').delete().eq('station_id', station.id).eq('region_id', deptId);
     
@@ -909,6 +926,7 @@ async function processStation(page, deptId, station) {
         const maxQueryAttempts = 10;
 
         while (attempts < maxQueryAttempts && !success) {
+            await parkIfShuttingDown();
             attempts++;
             if (attempts > 1) retries++;
 
@@ -917,6 +935,11 @@ async function processStation(page, deptId, station) {
                 console.log(`    [Attempt ${attempts}] Full Nav...`);
                 let navOk = false;
                 for (let navTry = 0; navTry < 3; navTry++) {
+                    await parkIfShuttingDown();
+                    // 殭屍 page（Chrome 已死／main frame 已被 dispose）不可能靠重試復活：
+                    // 每次 goto 都會同一個 frame id 立刻丟 detached Frame。直接快速失敗交回 wrapper，
+                    // 不再白睡 8s×2（2026-10-19 事故）。
+                    assertPageUsable(page, `${station.name} 站中導航前`, MVDIS_PREFLIGHT_EXIT_CODE);
                     try {
                         // 2026-08-31：90s→45s。尖峰期 MVDIS 若 45 秒內沒回就不會回了
                         // （實測失敗導航都撞 protocolTimeout 60s 上限），早失敗早重試。
@@ -925,6 +948,8 @@ async function processStation(page, deptId, station) {
                         break;
                     } catch (navErr) {
                         console.log(`    [Nav] Attempt ${navTry + 1}/3 failed: ${navErr.message}`);
+                        await parkIfShuttingDown();
+                        assertPageUsable(page, `${station.name} 站中導航`, MVDIS_PREFLIGHT_EXIT_CODE, navErr);
                         if (navTry < 2) await sleep(8000);
                     }
                 }
@@ -979,6 +1004,7 @@ async function processStation(page, deptId, station) {
             let captchaAttempts = 0;
             const solveDeadline = Date.now() + 90000;
             while (!code && captchaAttempts < 5 && Date.now() < solveDeadline) {
+                await parkIfShuttingDown();
                 captchaAttempts++;
                 await page.evaluate(() => {
                     const btn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');
@@ -1193,8 +1219,33 @@ async function processStation(page, deptId, station) {
     const browser = await puppeteer.launch({
         headless: "new",
         protocolTimeout: 60000,
+        // lane 牆鐘到期的 SIGTERM／SIGHUP 改由下方 deadlineShutdown 處理：puppeteer 預設的處理只關 Chrome、
+        // node 不結束，會造成殭屍期（見 lib/browser-liveness.cjs 檔頭）。SIGINT 維持預設。
+        handleSIGTERM: false,
+        handleSIGHUP: false,
         args: launchArgs
     });
+
+    const shutdownSyncKey = TARGET_SHARD ? `plates_sync_shard_${TARGET_SHARD}` : 'plates_full_sync';
+    deadlineShutdown = createDeadlineShutdown({
+        // 必須在 wrapper 的 --kill-after=15s 之前跑完，否則統計寫不出去就被 SIGKILL。
+        graceMs: 10000,
+        exitCode: 143, // 128+15；wrapper 的 124/137/143 一律走既有「lane deadline → exit 75」分支
+        log: (m) => console.error(m),
+        exit: (code) => process.exit(code),
+        flush: async () => {
+            const msg = 'lane 牆鐘預算到期（SIGTERM）：爬取被中止，已完成的站由 Resume 檔保留，其餘交給下一輪。';
+            stats.status = 'FAILED';
+            stats.exitCode = 143;
+            stats.addError('GLOBAL', msg);
+            await reportStatus('FAILED', msg, shutdownSyncKey);
+            await stats.save();
+            // browser.close() 可能卡住；外層 graceMs 會兜底，process.exit 時 puppeteer 的 exit hook 也會殺 Chrome。
+            await Promise.race([browser.close().catch(() => {}), new Promise(r => setTimeout(r, 3000))]);
+        },
+    });
+    process.once('SIGTERM', () => deadlineShutdown.handle('SIGTERM'));
+    process.once('SIGHUP', () => deadlineShutdown.handle('SIGHUP'));
 
     try {
         const page = await browser.newPage();
@@ -1272,15 +1323,24 @@ async function processStation(page, deptId, station) {
                     stats.stationsSuccess++;
                     continue;
                 }
+                await parkIfShuttingDown();
                 const stationAttemptStart = Date.now();
                 try {
                     await processStation(page, deptId, station);
                 } catch (stationErr) {
+                    await parkIfShuttingDown(); // 到期關機造成的錯誤不是站的錯：不記 FAILED、不寫 stats
                     if (stationErr.exitCode === MVDIS_PREFLIGHT_EXIT_CODE) {
                         // 軟封鎖 bail：整個出口 IP 已不可信，跳站沒有意義，
                         // 上拋讓 main catch 帶 exit 75 收場 → wrapper 重抽身分。
                         console.error(`    [Bailout] ${stationErr.message}`);
                         throw stationErr;
+                    }
+                    if (!isPageUsable(page)) {
+                        // 頁面已成殭屍：後面每一站都會用同一個死 frame 失敗，「跳過本站」沒有意義，
+                        // 且會把根本沒爬的站誤標 FAILED。丟 exit 75 讓 wrapper 開新 Chrome 重來（Resume 保留已完成站）。
+                        const deadErr = createDeadPageError(`${station.name} 處理中`, MVDIS_PREFLIGHT_EXIT_CODE, stationErr);
+                        console.error(`    [Bailout] ${deadErr.message}`);
+                        throw deadErr;
                     }
                     if (isUnsupportedLocationError(stationErr) || aiManager.ladder.isCurrentComboDead()) {
                         console.error(`    [AI] 不可在本 runner 內恢復，立即中止 shard：${stationErr.message}`);
