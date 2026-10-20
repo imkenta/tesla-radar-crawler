@@ -38,6 +38,14 @@ readonly PRIMARY_REROLL_MIN_REMAINING_SECONDS="${PRIMARY_REROLL_MIN_REMAINING_SE
 # 當爬行 deadline；配合下方進度傳承，備援機接手時是續爬而非從第一站重來。
 # 330 = 備援機接手門檻 240s ＋ 輪詢偵測與下載延遲（~20-40s）＋ 餘裕。
 readonly PRIMARY_HANDOFF_RESERVE_SECONDS="${PRIMARY_HANDOFF_RESERVE_SECONDS:-330}"
+# 2026-10-20：開新 crawler 的剩餘時間下限。啟動一個 crawler 的固定成本（node 啟動＋5s 穩定等待＋
+# 讀站點設定＋開 Chrome＋施工偵測＋preflight）實測 firstProc 11–25s（p50 15s、n=2717），之後至少
+# 還要爬完一個站（平時單站 p50 36s／p90 77s／p99 125s，n=12416）。剩餘時間連「啟動＋一個 p90 站」
+# （≈100s）都不到時開新 crawler 只會被 SIGTERM 打斷：站中被砍、白刪 staging、白開 Chrome，
+# 而且結局與不開完全相同（lane 一樣判 RETRY→擋 swap）。歷史上 R<258s 的 6 次啟動（53/54/62/88/144/211s）
+# 全數失敗，沒有任何一次成功；取 120s 是落在「成功樣本最小 R（258s）」之下、「失敗樣本」之上的保守值。
+# 預設 120；設 0 可停用（回到只擋 R<=0 的舊行為）。
+readonly MIN_CRAWL_REMAINING_SECONDS="${MIN_CRAWL_REMAINING_SECONDS:-120}"
 # run_crawler 實際使用的 deadline；primary 會設成保留後的較早值，fresh/spare 沿用 lane deadline。
 CRAWL_DEADLINE_EPOCH=""
 
@@ -54,7 +62,7 @@ case "$MODE" in
     ;;
 esac
 
-for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES" "$SPARE_START_EPOCH" "$LANE_BUDGET_SECONDS" "$PRIMARY_HANDOFF_RESERVE_SECONDS"; do
+for numeric_value in "$INITIAL_DELAY_SECONDS" "$RETRY_COOLDOWN_SECONDS" "$MAX_PREFLIGHT_ATTEMPTS" "$DEADLINE_EPOCH" "$PRIMARY_REROLL_MIN_REMAINING_SECONDS" "$SPARE_POLL_INTERVAL_SECONDS" "$SPARE_MAX_WAIT_SECONDS" "$WARM_TICKET_MAX_TRIES" "$SPARE_START_EPOCH" "$LANE_BUDGET_SECONDS" "$PRIMARY_HANDOFF_RESERVE_SECONDS" "$MIN_CRAWL_REMAINING_SECONDS"; do
   if ! [[ "$numeric_value" =~ ^[0-9]+$ ]]; then
     echo "::error::Recovery timing values must be non-negative integers."
     exit 2
@@ -89,6 +97,12 @@ run_crawler() {
     remaining_seconds=$((crawl_deadline - $(date +%s)))
     if [ "$remaining_seconds" -le 0 ]; then
       echo "::error::Shard $SHARD has exhausted its end-to-end lane budget before starting another crawler."
+      return "$MVDIS_PREFLIGHT_EXIT_CODE"
+    fi
+    # 剩餘時間不足以「啟動＋爬完一個站」：不開新 crawler，與預算耗盡同一條 exit 75 路徑
+    # （primary→交棒備援／fresh→RETRY），結局與開了被 SIGTERM 砍掉相同，只是早收工、不白刪 staging。
+    if [ "$remaining_seconds" -lt "$MIN_CRAWL_REMAINING_SECONDS" ]; then
+      echo "::error::Shard $SHARD has only ${remaining_seconds}s left (< ${MIN_CRAWL_REMAINING_SECONDS}s minimum to start a crawler and finish one station); not starting another crawler."
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi
 
@@ -290,6 +304,11 @@ run_fresh() {
         ;;
     esac
 
+    if reroll_would_leave_too_little "$RETRY_COOLDOWN_SECONDS"; then
+      echo "::error::Shard $SHARD would have under ${MIN_CRAWL_REMAINING_SECONDS}s left after cooldown and a WARP re-roll; stopping instead of burning the rest of the lane budget."
+      write_outcome RETRY
+      return "$MVDIS_PREFLIGHT_EXIT_CODE"
+    fi
     if ! wait_before_retry "$RETRY_COOLDOWN_SECONDS" "Shard $SHARD received another transient MVDIS failure"; then
       write_outcome RETRY
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
@@ -300,6 +319,21 @@ run_fresh() {
       return "$MVDIS_PREFLIGHT_EXIT_CODE"
     fi
   done
+}
+
+# 2026-10-20：重抽 WARP 身分最壞約 40s（registration delete→new→connect＋trace 驗證），冷卻後再重抽，
+# 若重抽完剩餘時間已低於「開新 crawler 下限」，下一輪 run_crawler 必被下限擋下——先算好就別重抽了。
+readonly REROLL_ESTIMATE_SECONDS="${REROLL_ESTIMATE_SECONDS:-40}"
+reroll_would_leave_too_little() {
+  local cooldown="$1"
+  local crawl_deadline="${CRAWL_DEADLINE_EPOCH:-$DEADLINE_EPOCH}"
+  local remaining_seconds
+
+  if [ "$crawl_deadline" -le 0 ] || [ "$MIN_CRAWL_REMAINING_SECONDS" -le 0 ]; then
+    return 1
+  fi
+  remaining_seconds=$((crawl_deadline - $(date +%s)))
+  [ $((remaining_seconds - cooldown - REROLL_ESTIMATE_SECONDS)) -lt "$MIN_CRAWL_REMAINING_SECONDS" ]
 }
 
 # primary result artifact 的 id；API 失敗或回傳非數字一律輸出空字串（＝還沒看到）。

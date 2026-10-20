@@ -35,6 +35,7 @@ function runScenario(exitCodes, options = {}) {
         completedJson = '',
         primaryHandoffReserveSeconds = 0,
         omitCompletedEnv = false,
+        extraEnv = {},
     } = options;
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-shard-recovery-'));
     const fakeBin = path.join(tempDir, 'bin');
@@ -116,6 +117,7 @@ esac
             COMPLETED_STATIONS_FILE: completedStationsPath,
             PRIMARY_HANDOFF_RESERVE_SECONDS: String(primaryHandoffReserveSeconds),
             FAKE_NODE_ENV_LOG: nodeEnvLogPath,
+            ...extraEnv,
         }, omitCompletedEnv ? ['COMPLETED_STATIONS_FILE'] : []),
     });
 
@@ -269,6 +271,73 @@ test('fresh runner 遇到非 preflight 錯誤立即失敗且不重試', () => {
     assert.equal(scenario.outcome && scenario.outcome.shard, 'NORTH');
     assert.equal(scenario.outcome && scenario.outcome.status, 'HARD_FAILURE');
     assert.equal(scenario.nodeCalls, 1);
+});
+
+// --- 剩餘時間下限（2026-10-20）：剩餘不足「啟動＋爬完一個站」就不開新 crawler ---
+
+test('剩餘時間低於下限（60s < 120s）→ 不開 crawler，走與預算耗盡相同的 exit 75 路徑', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 60;
+    const scenario = runScenario([0], { deadlineEpoch });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'RETRY');
+    assert.equal(scenario.nodeCalls, 0);
+    assert.match(output, /not starting another crawler/);
+});
+
+test('剩餘時間剛好高於下限（≥120s）→ 照常開 crawler', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 130;
+    const scenario = runScenario([0], { deadlineEpoch });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SUCCESS');
+    assert.equal(scenario.nodeCalls, 1);
+});
+
+test('MIN_CRAWL_REMAINING_SECONDS=0 停用下限，回到只擋 R<=0 的舊行為', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 60;
+    const scenario = runScenario([0], { deadlineEpoch, extraEnv: { MIN_CRAWL_REMAINING_SECONDS: '0' } });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SUCCESS');
+    assert.equal(scenario.nodeCalls, 1);
+});
+
+test('primary 的下限以「保留交棒窗之後的爬行 deadline」計算，不是 lane deadline', () => {
+    // lane 剩 400s、交棒窗 330s → 爬行剩 70s < 120s：不開 crawler，把時間留給備援機
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 400;
+    const scenario = runScenario([0], { deadlineEpoch, primaryHandoffReserveSeconds: 330 });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.nodeCalls, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'RETRY');
+});
+
+test('fresh：剩餘時間連一次冷卻＋重抽（~55s）後都撐不到下限 → 不重抽、不開第二個 crawler', () => {
+    // 剩 ~160s：第一個 crawler 以 75 結束後，160-15(冷卻)-40(重抽)=105 < 120
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 160;
+    const scenario = runScenario([75, 0], { mode: 'fresh', deadlineEpoch, retryCooldownSeconds: 15, maxPreflightAttempts: 3 });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 75, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'RETRY');
+    assert.equal(scenario.nodeCalls, 1);
+    assert.equal(scenario.warpLog, '', '不該白做一次 WARP 重註冊');
+    assert.deepEqual(scenario.sleeps, [], '不該白睡冷卻');
+});
+
+test('fresh：預算充足時冷卻＋重抽＋第二個 crawler 照舊進行（下限不誤傷）', () => {
+    const deadlineEpoch = Math.floor(Date.now() / 1000) + 400;
+    const scenario = runScenario([75, 0], { mode: 'fresh', deadlineEpoch, retryCooldownSeconds: 15, maxPreflightAttempts: 3 });
+    const output = `${scenario.result.stdout}${scenario.result.stderr}`;
+
+    assert.equal(scenario.result.status, 0, output);
+    assert.equal(scenario.outcome && scenario.outcome.status, 'SUCCESS');
+    assert.equal(scenario.nodeCalls, 2);
+    assert.deepEqual(scenario.sleeps, [15]);
 });
 
 // --- 熱備援（spare）模式（2026-09-01）---
