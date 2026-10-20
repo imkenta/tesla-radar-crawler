@@ -742,3 +742,66 @@ test('升級換層時回探計時清空（重新在新層起算）', () => {
     assert.equal(s.tierIndex, 1);
     assert.equal(s.higherTierSinceMs, null);
 });
+
+// --- 對沖支援（2026-10-20）：過載模式／對沖目標／對沖目標日配額標死 ---
+
+const { HEDGE_AFTER_MS, OVERLOAD_WINDOW_MS, OVERLOAD_THRESHOLD } = require('../lib/ai-model-ladder.cjs');
+const M0 = MODEL_LADDER[0].model;
+const M1 = MODEL_LADDER[1].model;
+const M2 = MODEL_LADDER[2].model;
+
+test('對沖常數：門檻 8s 低於本地逾時 25s 與無處可逃逾時 12s，且過載門檻 ≥2（單次 5xx 不啟動對沖）', () => {
+    assert.equal(HEDGE_AFTER_MS, 8000);
+    assert.ok(HEDGE_AFTER_MS < NO_ESCAPE_STORM_CALL_TIMEOUT_MS);
+    assert.ok(OVERLOAD_THRESHOLD >= 2);
+    assert.ok(OVERLOAD_WINDOW_MS <= SERVER_ERROR_STORM_WINDOW_MS);
+});
+
+test('isOverloaded：窗內累積 OVERLOAD_THRESHOLD 次 5xx 才成立；舊事件滑出窗外即解除', () => {
+    const s = new LadderState(['K']);
+    const t0 = 1_000_000;
+    s.recordServerError(t0);
+    s.recordServerError(t0 + 1000); // 第 2 次已達風暴門檻 → 升級（但過載計數不歸零）
+    assert.equal(s.isOverloaded(t0 + 1000), false, '2 次尚未達過載門檻');
+    s.recordServerError(t0 + 2000);
+    assert.equal(s.isOverloaded(t0 + 2000), true);
+    assert.equal(s.isOverloaded(t0 + OVERLOAD_WINDOW_MS + 1500), false, '前兩筆滑出窗外後剩 1 筆');
+});
+
+test('isOverloaded：升級（清風暴窗）與成功都不會清掉過載計數——否則對沖會在最需要時關掉', () => {
+    const s = new LadderState(['K']);
+    const t0 = 2_000_000;
+    for (let i = 0; i < OVERLOAD_THRESHOLD; i++) s.recordServerError(t0 + i);
+    assert.equal(s.serverErrorTimes.length < OVERLOAD_THRESHOLD, true, '風暴窗因升級被清過');
+    s.recordSuccess();
+    assert.equal(s.isOverloaded(t0 + 10), true);
+});
+
+test('pickHedgeCombo：從下一層起繞回找異模型，跳過標死與已對沖過的模型；同模型不同 key 不算', () => {
+    const s = new LadderState(['SHARD', 'DEFAULT']);
+    assert.deepEqual(s.pickHedgeCombo(), { tierIndex: 1, model: M1, keyName: 'SHARD' });
+    s.deadCombos.add(comboId('SHARD', M1));
+    assert.deepEqual(s.pickHedgeCombo(), { tierIndex: 1, model: M1, keyName: 'DEFAULT' }, '同層換 key 繼續用該模型');
+    s.deadCombos.add(comboId('DEFAULT', M1));
+    assert.deepEqual(s.pickHedgeCombo(), { tierIndex: 2, model: M2, keyName: 'SHARD' }, '該模型兩把 key 都死 → 下一層');
+    assert.deepEqual(s.pickHedgeCombo(new Set([M2])), null, '已對沖過 + 其餘全死 → 沒有目標');
+    s.tierIndex = 2; // 末層：繞回第一層
+    assert.deepEqual(s.pickHedgeCombo(), { tierIndex: 0, model: M0, keyName: 'SHARD' });
+});
+
+test('pickHedgeCombo：永不回傳當前模型；只剩當前模型存活 → null', () => {
+    const s = new LadderState(['K']);
+    s.deadCombos.add(comboId('K', M1));
+    s.deadCombos.add(comboId('K', M2));
+    assert.equal(s.pickHedgeCombo(), null);
+});
+
+test('markComboDead：只標死指定 combo，不動當前 combo、失敗計數與風暴窗', () => {
+    const s = new LadderState(['K']);
+    s.recordFailure();
+    s.recordServerError(1_000_000);
+    const snapshot = { tier: s.tierIndex, fail: s.failureCount, storm: s.serverErrorTimes.length };
+    s.markComboDead('K', M1);
+    assert.equal(s.deadCombos.has(comboId('K', M1)), true);
+    assert.deepEqual({ tier: s.tierIndex, fail: s.failureCount, storm: s.serverErrorTimes.length }, snapshot);
+});

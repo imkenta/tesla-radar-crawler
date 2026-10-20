@@ -16,7 +16,7 @@ const util = require('util');
 // 純解析邏輯抽到 lib，與回歸測試共用單一真理（test/plate-parser.test.cjs）
 const { extractPlates, parsePageInfoFromDoc } = require('./lib/plate-parser.cjs');
 // Gemini/Gemma 備援階梯純函式，與回歸測試共用單一真理（test/ai-model-ladder.test.cjs）
-const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS, NO_ESCAPE_STORM_CALL_TIMEOUT_MS, NO_ESCAPE_STORM_BACKOFF_MIN_MS, NO_ESCAPE_STORM_BACKOFF_MAX_MS } = require('./lib/ai-model-ladder.cjs');
+const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedLocationError, isServerError, QUOTA_PER_DAY, resolveShardKeys, SERVER_ERROR_STORM_THRESHOLD, SERVER_ERROR_STORM_WINDOW_MS, FIRST_TIER_PROBE_INTERVAL_MS, NO_ESCAPE_STORM_CALL_TIMEOUT_MS, NO_ESCAPE_STORM_BACKOFF_MIN_MS, NO_ESCAPE_STORM_BACKOFF_MAX_MS, HEDGE_AFTER_MS } = require('./lib/ai-model-ladder.cjs');
 // CAPTCHA 回應嚴格 4 字元截取純函式，與回歸測試共用單一真理（test/captcha-parser.test.cjs）
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 // 瀏覽器／頁面存活判斷＋lane 牆鐘到期關機協調（純函式，與回歸測試共用：test/browser-liveness.test.cjs）
@@ -114,6 +114,11 @@ const MVDIS_PREFLIGHT_EXIT_CODE = 75; // EX_TEMPFAIL：workflow 只補跑此類�
 // 見 lib/browser-liveness.cjs 檔頭；5xx 風暴只是讓牆鐘到期恰好落在站中。）
 const AI_CALL_TIMEOUT_MS = 25000;
 
+// 2026-10-20：對沖（hedged request）總開關。過載模式下單次呼叫超過 HEDGE_AFTER_MS 仍無回應，就把
+// 同一張驗證碼同時送給另一個存活模型、採用最先成功的答案（見 lib/ai-model-ladder.cjs 八次修正）。
+// 緊急停用：workflow／本機設 AI_HEDGE=off。
+const AI_HEDGE_ENABLED = process.env.AI_HEDGE !== 'off';
+
 // 2026-08-31：MVDIS 對個別出口 IP 的「軟封鎖/降級」——preflight GET 正常、提交
 // 卻連環回「驗證碼錯誤」（00:43 CENTRAL 一顆 IP 8 連拒、01:03 NORTH 5 連拒，
 // 同時段其他 shard 全數通過＝按 IP 降級，台北週一早尖峰）。健康拒絕率 <5%，
@@ -210,6 +215,10 @@ const PREFLIGHT_ONLY = args.includes('--preflight-only');
 //   末層也風暴時繞回第一個存活 combo（2026-09-24 六次修正），兩層同時過載時輪替找容量。
 // - 無處可逃的風暴（2026-10-01）：風暴門檻已到卻沒有其他存活 combo 可換 → 逾時縮為 12s、
 //   退避縮為 1-3s（LadderState.isNoEscapeStorm），不再每張驗證碼付 8s 退避＋25s 逾時。
+// - 對沖＋逾時呼叫續戰（2026-10-20，AI_HEDGE=off 可整組停用）：過載模式（近 5 分鐘 ≥3 次 5xx／逾時）下，
+//   單次呼叫 ≥8s 未回、或 5xx 退避期間，同時把同一張圖送給另一個存活模型，採用最先成功者；逾時的呼叫
+//   不再丟棄，留在同一張驗證碼的後續嘗試裡繼續參賽。原層被對沖超車兩次即升級（見 acceptWinner）。
+//   階梯語義（退避、風暴窗、PerDay 標死、回探）全部不變；對沖只多發請求、不改狀態機的轉移條件。
 // - unsupported-location 400 → 出口基礎設施 fatal，不切模型/key、不污染階梯、立即中止 shard。
 // 狀態 per-instance/per-process：五個 shard 各自獨立，不共用不寫檔。
 class AIManager {
@@ -237,21 +246,31 @@ class AIManager {
     get modelName() { return this.ladder.model; }
     get currentKeyName() { return this.ladder.keyName; }
 
+    // 依 key／模型建出 SDK model 物件（init 與對沖共用，設定只此一份）。
+    buildModel(keyName, modelName) {
+        const instance = new GoogleGenerativeAI(this.keysByName.get(keyName));
+        return {
+            instance,
+            model: instance.getGenerativeModel({
+                model: modelName,
+                // 2026-07-05：26B 實戰會把整段思考碎念吐進回應（例："M8L_ (Wait, let me
+                // look closer)... Let's try: MN8L.MN8L"）。補一句更直白的硬約束；
+                // 解析端另有 lib/captcha-parser.cjs 做嚴格截取兜底，兩層防禦。
+                systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters. 只輸出驗證碼的4個字元，禁止任何其他文字或解釋。",
+                // temperature:0 壓制隨機性、減少模型「碎碎念」的空間；maxOutputTokens 壓到
+                // 剛好夠放 4 字元的量（留一點餘裕給模型可能加的前綴），物理上斬斷長篇思考過程。
+                generationConfig: {
+                    temperature: 0,
+                    maxOutputTokens: 16,
+                },
+            }),
+        };
+    }
+
     init() {
-        this.instance = new GoogleGenerativeAI(this.keysByName.get(this.currentKeyName));
-        this.model = this.instance.getGenerativeModel({
-            model: this.modelName,
-            // 2026-07-05：26B 實戰會把整段思考碎念吐進回應（例："M8L_ (Wait, let me
-            // look closer)... Let's try: MN8L.MN8L"）。補一句更直白的硬約束；
-            // 解析端另有 lib/captcha-parser.cjs 做嚴格截取兜底，兩層防禦。
-            systemInstruction: "You are a specialized CAPTCHA solver. Your ONLY task is to output the 4 characters found in the image. DO NOT explain. DO NOT use thinking process. DO NOT output anything except the 4 characters. 只輸出驗證碼的4個字元，禁止任何其他文字或解釋。",
-            // temperature:0 壓制隨機性、減少模型「碎碎念」的空間；maxOutputTokens 壓到
-            // 剛好夠放 4 字元的量（留一點餘裕給模型可能加的前綴），物理上斬斷長篇思考過程。
-            generationConfig: {
-                temperature: 0,
-                maxOutputTokens: 16,
-            },
-        });
+        const built = this.buildModel(this.currentKeyName, this.modelName);
+        this.instance = built.instance;
+        this.model = built.model;
         console.log(`[AI] Initialized using: ${this.currentKeyName} / model: ${this.modelName}`);
     }
 
@@ -266,36 +285,141 @@ class AIManager {
         this.init();
     }
 
-    // 25 秒硬逾時包裝：輸掉 race 的原始 promise 掛 no-op catch，避免它稍後
-    // reject 時炸出 unhandledRejection。逾時錯誤帶 status=503，讓既有的
-    // isServerError / 風暴偵測路徑自然接手。
-    // 2026-09-15 觀測（只記錄、不影響邏輯）：被本地逾時切掉的呼叫後來到底有沒有回應、
-    // 花多久、成功或失敗——用來判斷 25s 門檻是否切掉「慢但會成功」的呼叫（多日統計時
-    // 無法判斷，因為輸掉 race 的結果從未被記錄）。
-    async generateContentWithTimeout(payload) {
+    // 啟動一次 SDK 呼叫並包成可觀測的 entry（state: pending → ok／err）。entry.promise 一律掛 no-op catch，
+    // 稍後才 reject 時不會炸出 unhandledRejection。
+    startCall(model, keyName, modelName, payload, { hedge = false } = {}) {
+        const entry = {
+            label: `${keyName}/${modelName}`, keyName, model: modelName, hedge,
+            startedAt: Date.now(), settledAt: null, state: 'pending', value: null, error: null, promise: null,
+        };
+        let raw;
+        try {
+            raw = Promise.resolve(model.generateContent(payload));
+        } catch (syncErr) {
+            raw = Promise.reject(syncErr);
+        }
+        entry.promise = raw.then(
+            (value) => { entry.state = 'ok'; entry.value = value; entry.settledAt = Date.now(); return value; },
+            (err) => { entry.state = 'err'; entry.error = err; entry.settledAt = Date.now(); throw err; },
+        );
+        entry.promise.catch(() => {});
+        return entry;
+    }
+
+    // 對沖（2026-10-20）：同一張驗證碼同時問另一個存活模型（見 lib/ai-model-ladder.cjs 八次修正）。
+    // 只在過載模式、有存活的異模型、且這張圖尚未對沖過該模型時才發；不動階梯狀態（找不到就回 null）。
+    // 對沖呼叫收到 PerDay 429 只標死該 combo（markComboDead），其他錯誤只記錄。
+    launchHedge(payload, ctx) {
+        if (!AI_HEDGE_ENABLED || this.ladder.isProbing) return null;
+        if (!this.ladder.isOverloaded(Date.now())) return null;
+        const combo = this.ladder.pickHedgeCombo(ctx.hedgedModels);
+        if (!combo) return null;
+        ctx.hedgedModels.add(combo.model);
+        const built = this.buildModel(combo.keyName, combo.model);
+        const entry = this.startCall(built.model, combo.keyName, combo.model, payload, { hedge: true });
+        ctx.pending.push(entry);
+        console.log(`🏇 [AI] 對沖（過載模式）：${this.currentKeyName}/${this.modelName} 尚未回應，同時送出 → ${entry.label}`);
+        entry.promise.catch((err) => {
+            const quota = classifyQuotaError(err);
+            if (quota.isQuotaError && quota.quotaWindow === QUOTA_PER_DAY) {
+                this.ladder.markComboDead(combo.keyName, combo.model);
+                console.log(`💀 [AI] 對沖目標日配額耗盡，標死 ${entry.label}（本輪不再嘗試）`);
+            } else {
+                console.log(`🏇 [AI] 對沖呼叫失敗 @ ${entry.label}（${(err && err.status) || 'unknown'}），忽略`);
+            }
+        });
+        return entry;
+    }
+
+    // 收割先前逾時／對沖呼叫在等待期間已經回來的成功答案（同一張驗證碼，圖相同，答案有效）。
+    harvestPending(ctx) {
+        return ctx.pending.find((e) => e.state === 'ok') || null;
+    }
+
+    // 退避等待：期間若先前逾時／對沖的呼叫成功回來就提早結束（回到迴圈頂端收割）。
+    sleepUnlessAdopted(ms, ctx) {
+        return new Promise((resolve) => {
+            const t = setTimeout(resolve, ms);
+            for (const e of ctx.pending) {
+                e.promise.then(() => { clearTimeout(t); resolve(); }, () => {});
+            }
+        });
+    }
+
+    // 採用勝出者並回傳結果。非原層呼叫勝出（對沖或先前逾時的晚到結果）要留 log；
+    // 對沖勝出代表原層「超過 HEDGE_AFTER_MS 還沒回、別人先回」＝過載訊號，計入風暴窗
+    // （2 次即升級到下一層，通常正是對沖目標），避免原層又慢又每張都付一次對沖請求。
+    acceptWinner(entry, primary, ctx) {
+        if (this.ladder.recordSuccess()) {
+            console.log(`✅ [AI] 回探成功，留在第一層 → ${this.currentKeyName}/${this.modelName}`);
+        }
+        if (entry !== primary) {
+            ctx.pending = ctx.pending.filter((e) => e !== entry);
+            const secs = ((entry.settledAt - entry.startedAt) / 1000).toFixed(1);
+            console.log(`🏁 [AI] 採用${entry.hedge ? '對沖' : '先前逾時呼叫的晚到'}結果 @ ${entry.label}（送出後 ${secs}s 回應成功）`);
+            if (entry.hedge && !this.ladder.isProbing) {
+                const before = `${this.currentKeyName}/${this.modelName}`;
+                const storm = this.ladder.recordServerError(Date.now());
+                if (storm.escalated) {
+                    console.log(`⚠️  [AI] ${before} 慢到被對沖超車（${SERVER_ERROR_STORM_WINDOW_MS / 60000} 分鐘內達 ${SERVER_ERROR_STORM_THRESHOLD} 次），${storm.wrapped ? '末層也過載，輪替回' : '升級'} → ${this.currentKeyName}/${this.modelName}`);
+                    this.init();
+                }
+            }
+        }
+        return entry.value;
+    }
+
+    // 25 秒硬逾時包裝：逾時錯誤帶 status=503，讓既有的 isServerError / 風暴偵測路徑自然接手。
+    // 2026-09-15 觀測：被本地逾時切掉的呼叫後來到底有沒有回應、花多久、成功或失敗——用來判斷
+    // 25s 門檻是否切掉「慢但會成功」的呼叫。2026-10-20 統計（490 輪）證實：峰值期被切掉的
+    // 3.5-flash-lite 呼叫 90% 其實會成功（中位 49.5s）。因此逾時的呼叫現在不再丟棄：留在 ctx.pending，
+    // 同一張驗證碼的後續嘗試（退避後重試、升級後的新層、對沖）都與它同場競速，誰先成功用誰。
+    // 同時：過載模式下超過 HEDGE_AFTER_MS 仍無回應就對沖（launchHedge）。
+    // 回傳 { value, entry, primary }；primary 失敗仍立即以原錯誤 reject（階梯語義不變），
+    // 其餘呼叫留在 ctx.pending 繼續參賽。AI_HEDGE=off 時行為與 2026-10-01 版完全相同。
+    async generateContentWithTimeout(payload, ctx) {
         let timer;
+        let hedgeTimer;
         const label = `${this.currentKeyName}/${this.modelName}`;
         const startedAt = Date.now();
         const timeoutMs = this.ladder.isNoEscapeStorm(startedAt) ? NO_ESCAPE_STORM_CALL_TIMEOUT_MS : AI_CALL_TIMEOUT_MS;
-        const inflight = this.model.generateContent(payload);
-        inflight.catch(() => {});
+        const primary = this.startCall(this.model, this.currentKeyName, this.modelName, payload);
         try {
-            return await Promise.race([
-                inflight,
-                new Promise((_resolve, reject) => {
-                    timer = setTimeout(() => {
-                        inflight.then(
-                            () => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應成功（已被 ${timeoutMs / 1000}s 逾時捨棄）`),
-                            (lateErr) => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應失敗（${(lateErr && lateErr.status) || 'unknown'}）`),
-                        );
-                        const err = new Error(`[AI] generateContent 本地硬逾時 ${timeoutMs / 1000}s（視同暫時性 5xx）`);
-                        err.status = 503;
-                        reject(err);
-                    }, timeoutMs);
-                }),
-            ]);
+            return await new Promise((resolve, reject) => {
+                let done = false;
+                const finish = (fn, v) => { if (!done) { done = true; fn(v); } };
+                const watch = (entry) => {
+                    entry.promise.then(
+                        (value) => finish(resolve, { value, entry, primary }),
+                        (err) => { if (entry === primary) finish(reject, err); },
+                    );
+                };
+                watch(primary);
+                if (AI_HEDGE_ENABLED) {
+                    for (const e of ctx.pending) watch(e);
+                    if (!this.ladder.isProbing && HEDGE_AFTER_MS < timeoutMs) {
+                        hedgeTimer = setTimeout(() => {
+                            if (done) return;
+                            const h = this.launchHedge(payload, ctx);
+                            if (h) watch(h);
+                        }, HEDGE_AFTER_MS);
+                    }
+                }
+                timer = setTimeout(() => {
+                    if (done) return;
+                    primary.promise.then(
+                        () => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應成功（已被 ${timeoutMs / 1000}s 逾時捨棄）`),
+                        (lateErr) => console.log(`🔎 [AI] 逾時後觀測 @ ${label}：在 ${((Date.now() - startedAt) / 1000).toFixed(1)}s 才回應失敗（${(lateErr && lateErr.status) || 'unknown'}）`),
+                    );
+                    if (AI_HEDGE_ENABLED) ctx.pending.push(primary);
+                    const err = new Error(`[AI] generateContent 本地硬逾時 ${timeoutMs / 1000}s（視同暫時性 5xx）`);
+                    err.status = 503;
+                    finish(reject, err);
+                }, timeoutMs);
+            });
         } finally {
             clearTimeout(timer);
+            clearTimeout(hedgeTimer);
         }
     }
 
@@ -306,18 +430,20 @@ class AIManager {
         // 觸發，且回探中任何錯誤都先中止回探再 continue，因此每次呼叫最多多一輪。
         let minuteRetried = false;
         let serverRetried = false;
+        // 同一張驗證碼的「仍在飛／已回來」呼叫（先前逾時的、對沖的）；每次 generateContent 一份，不跨張共用。
+        const ctx = { pending: [], hedgedModels: new Set() };
         for (;;) {
+            // 先收割等待期間已回來的答案（先前逾時或對沖的呼叫），有就不必再打新的一發。
+            const adopted = AI_HEDGE_ENABLED ? this.harvestPending(ctx) : null;
+            if (adopted) return this.acceptWinner(adopted, null, ctx);
             // EXHAUSTED 之後 ladder 仍指向最後一個（已死）combo：快速失敗，絕不再打已標死組合。
             if (this.ladder.isCurrentComboDead()) {
                 throw new Error(`[AI] 本輪所有 key/model 組合均已收到明確 PerDay 429（最後停在 ${this.currentKeyName}/${this.modelName}）`);
             }
             try {
-                const result = await this.generateContentWithTimeout(payload);
+                const won = await this.generateContentWithTimeout(payload, ctx);
                 // 連續失敗語義：任何成功都重置當前層失敗計數；回探中的成功＝留在第一層
-                if (this.ladder.recordSuccess()) {
-                    console.log(`✅ [AI] 回探成功，留在第一層 → ${this.currentKeyName}/${this.modelName}`);
-                }
-                return result;
+                return this.acceptWinner(won.entry, won.primary, ctx);
             } catch (e) {
                 // 出口地區不支援是基礎設施錯誤：切模型、切 key 都仍走同一出口，
                 // 不得累計一般失敗或污染死亡矩陣。
@@ -387,7 +513,9 @@ class AIManager {
                             ? NO_ESCAPE_STORM_BACKOFF_MIN_MS + Math.floor(Math.random() * (NO_ESCAPE_STORM_BACKOFF_MAX_MS - NO_ESCAPE_STORM_BACKOFF_MIN_MS))
                             : 5000 + Math.floor(Math.random() * 5000); // 5-10 秒
                         console.log(`⏳ [AI] ${this.currentKeyName}/${this.modelName} 5xx 暫時性錯誤，${noEscape ? '無處可逃的風暴（短逾時 ' + NO_ESCAPE_STORM_CALL_TIMEOUT_MS / 1000 + 's）' : ''}退避 ${Math.round(waitMs / 1000)}s 後同層重試 1 次（不計入升級門檻）...`);
-                        await new Promise((resolve) => setTimeout(resolve, waitMs));
+                        // 2026-10-20：退避的 5–10 秒不白等——過載模式下同時問另一個模型，其答案先回來就提早結束退避。
+                        if (!noEscape) this.launchHedge(payload, ctx);
+                        await this.sleepUnlessAdopted(waitMs, ctx);
                         continue;
                     }
                 }
