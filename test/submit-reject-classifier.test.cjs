@@ -97,3 +97,31 @@ test('log 格式：單行、含 type= 與 msg=，可 grep 統計三類', () => {
   assert.equal(multi.includes('\n'), false);
   assert.match(multi, /type=unknown-dialog msg=第一行 第二行/);
 });
+
+// ---------------------------------------------------------------------------
+// H3：同站「表單問題」連續計數（送出前驗證不過＋form-incomplete 合併）
+// ---------------------------------------------------------------------------
+const { FormProblemCounter } = require('../lib/submit-reject-classifier.cjs');
+
+test('FormProblemCounter：連續 3 次表單問題才達上限（預設門檻＝FORM_INCOMPLETE_BAILOUT_THRESHOLD）', () => {
+  const c = new FormProblemCounter();
+  assert.equal(c.add('送出前驗證不過，缺 selWindowNo'), false);
+  assert.equal(c.add('送出前驗證不過，缺 selCarType'), false);
+  assert.equal(c.add('送出被表單驗證擋下 form-incomplete'), true); // 兩種來源合併計數
+  assert.equal(c.count, 3);
+  assert.match(c.bailMessage('臺北區'), /同站（臺北區）連續 3 次表單問題（送出被表單驗證擋下 form-incomplete）/);
+});
+
+test('FormProblemCounter：成功或 captcha 類拒絕後 reset，重新計數', () => {
+  const c = new FormProblemCounter();
+  c.add('a'); c.add('b');
+  c.reset();
+  assert.equal(c.count, 0);
+  assert.equal(c.add('c'), false);
+});
+
+test('FormProblemCounter：門檻可調（H3 建議 2～3）', () => {
+  const c = new FormProblemCounter(2);
+  assert.equal(c.add('x'), false);
+  assert.equal(c.add('y'), true);
+});

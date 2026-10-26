@@ -21,7 +21,7 @@ const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedL
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 // 瀏覽器／頁面存活判斷＋lane 牆鐘到期關機協調（純函式，與回歸測試共用：test/browser-liveness.test.cjs）
 const { isPageUsable, assertPageUsable, createDeadPageError, createDeadlineShutdown } = require('./lib/browser-liveness.cjs');
-const { classifySubmitReject, countsTowardSoftBlock, formatRejectLog, REJECT_TYPES, FORM_INCOMPLETE_BAILOUT_THRESHOLD } = require('./lib/submit-reject-classifier.cjs');
+const { classifySubmitReject, countsTowardSoftBlock, formatRejectLog, REJECT_TYPES, FormProblemCounter } = require('./lib/submit-reject-classifier.cjs');
 const { fillAndVerifyForm } = require('./lib/mvdis-form.cjs');
 
 // --- Global Error Handlers ---
@@ -1050,7 +1050,15 @@ async function processStation(page, deptId, station) {
 
     let isFirstQueryInStation = true;
     let stationAborted = false;
-    let consecutiveFormIncomplete = 0; // 同站連續 form-incomplete（見 lib/submit-reject-classifier.cjs）
+    // 同站連續「表單問題」：送出前驗證不過（fillAndVerifyForm ok=false）或送出被 chkForm 擋下（form-incomplete）。
+    // 兩者同根因（DWR 下拉狀態異常），合併計數；達上限就 exit 75，避免 DWR 持續異常時燒滿 10 個 attempt
+    // 才整站 FAILED（exit 1 擋 swap、失去舊碼的快速重抽）。
+    const formProblems = new FormProblemCounter();
+    const bailOnFormProblems = () => {
+        const formErr = new Error(formProblems.bailMessage(station.name));
+        formErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+        throw formErr;
+    };
 
     for (const pType of plateTypes) {
         if (stationAborted) break;
@@ -1133,7 +1141,9 @@ async function processStation(page, deptId, station) {
             if (formResult.tries > 1) formFillStats.refills += formResult.tries - 1;
             if (!formResult.ok) {
                 formFillStats.verifyFailedToFullNav++;
-                console.log(`    [Form] 原頁重填 ${formResult.tries} 次仍不全（缺 ${formResult.missing.join(',')}），放棄本 attempt，改走 Full Nav...`);
+                console.log(`    [Form] 原頁重填 ${formResult.tries} 次仍不全${formResult.budgetExceeded ? '（總時間超限）' : ''}（缺 ${formResult.missing.join(',')}），放棄本 attempt。`);
+                if (formProblems.add(`送出前驗證不過，缺 ${formResult.missing.join(',')}`)) bailOnFormProblems();
+                console.log('    [Form] 改走 Full Nav...');
                 continue;
             }
 
@@ -1238,11 +1248,11 @@ async function processStation(page, deptId, station) {
             // form-incomplete 是表單沒填齊（與 IP 無關），不動軟封鎖計數，另以同站連續次數把關。
             if (success) {
                 consecutiveCaptchaRejects = 0;
-                consecutiveFormIncomplete = 0;
+                formProblems.reset();
             } else if (rejectType !== REJECT_TYPES.NONE) {
                 submitRejectTotals[rejectType]++;
                 if (countsTowardSoftBlock(rejectType)) {
-                    consecutiveFormIncomplete = 0;
+                    formProblems.reset();
                     consecutiveCaptchaRejects++;
                     if (consecutiveCaptchaRejects >= CAPTCHA_REJECT_BAILOUT_THRESHOLD) {
                         const bailErr = new Error(`連續 ${consecutiveCaptchaRejects} 次驗證碼提交被拒（跨站累計）：疑似本出口 IP 遭 MVDIS 軟封鎖/降級，交回 workflow 重抽 WARP 身分。`);
@@ -1250,15 +1260,11 @@ async function processStation(page, deptId, station) {
                         throw bailErr;
                     }
                 } else {
-                    consecutiveFormIncomplete++;
-                    if (consecutiveFormIncomplete >= FORM_INCOMPLETE_BAILOUT_THRESHOLD) {
-                        // 送出前驗證都通過了還連續被 chkForm 擋＝MVDIS 頁面狀態異常（多半是 DWR 極慢／重複 callback
-                        // 在驗證後才清掉欄位）。與 IP 軟封鎖無關，但仍屬「換個乾淨 Chrome／出口身分重來」可解的暫時性失敗，
-                        // 故沿用 exit 75（Resume 保留已完成站、workflow 補跑），而不是記單站 FAILED（會擋 swap 並判 HARD_FAILURE）。
-                        const formErr = new Error(`同站（${station.name}）連續 ${consecutiveFormIncomplete} 次送出被表單驗證擋下（form-incomplete，alert=${JSON.stringify(alertMsg)}）：MVDIS 頁面下拉狀態異常，交回 workflow 以新 Chrome／身分重來。`);
-                        formErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
-                        throw formErr;
-                    }
+                    const bail = formProblems.add(`送出被表單驗證擋下 form-incomplete，alert=${JSON.stringify(alertMsg)}`);
+                    // 送出前驗證都通過了還被 chkForm 擋＝頁面狀態在驗證後才被洗掉。與 IP 軟封鎖無關，但仍屬
+                    // 「換乾淨 Chrome／出口身分重來」可解的暫時性失敗，故沿用 exit 75（Resume 保留已完成站、
+                    // workflow 補跑），而不是記單站 FAILED（會擋 swap 並判 HARD_FAILURE）。
+                    if (bail) bailOnFormProblems();
                 }
             }
 
