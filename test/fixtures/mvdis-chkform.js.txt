@@ -1,0 +1,54 @@
+// 節錄自 MVDIS webpickno 頁面（2026-10-26 抓取）：chkForm() 原始碼，供測試解析 alert 字串與驗證欄位規則。
+function chkForm() {
+	if(document.getElementById('selDeptCode').value == '0' || document.getElementById('selStationCode').value == '0'){
+		alert('請選擇管轄監理單位');
+		return false;
+	}
+	if(document.getElementById('selWindowNo').value == '0'){
+		alert('請選擇領牌地點');
+		return false;
+	}
+	if(!document.getElementById('selCarType').value){
+		alert('請選擇車種別');
+		return false;
+	}
+	if(document.getElementById('selEnergyType').value == '0'){
+		alert('請選擇能源別');
+		return false;
+	}
+	if(document.getElementById('selPlateType').value == '0'){
+		alert('請選擇車牌別');
+		return false;
+	}
+	if (dwr.util.getValue('plateVer') == '') {
+		alert('請選擇車牌樣式');
+		return false;
+	}
+	document.WebPickNoForm.action ="/m3-emv-plate/webpickno/queryPickNo#anchor";
+	document.WebPickNoForm.method.vlaue='qryPickNo';
+	var radioObj = document.getElementsByName('queryType');
+	for(var i=0; i<radioObj.length; i++) {
+		if(radioObj[i].checked){
+			if(radioObj[i].value == '2' && document.getElementById('queryNo').value.length == 0) {
+				alert('請輸入查詢號碼');
+				return false;
+			}
+			if(radioObj[i].value == '1'){
+			    document.WebPickNoForm.action ="/m3-emv-plate/webpickno/queryPickNo#anchor";
+			    document.WebPickNoForm.method.value='qryLastNo';
+			}
+			else {
+				if(radioObj[i].value == '0') {
+					dwr.util.setValue('queryNo', '*');
+				}
+			}
+		}
+	}	
+	
+	if(dwr.util.getValue('validateStr') == '') {
+		alert('請輸入驗證數字');
+		return false;
+	}
+	
+	return true;
+}

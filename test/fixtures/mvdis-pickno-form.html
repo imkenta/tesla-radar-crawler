@@ -1,0 +1,93 @@
+<!doctype html><html><head><meta charset="utf-8"><title>MVDIS 選號表單（節錄自 webpickno 頁面，供 mvdis-form 測試）</title></head><body><form id="command" name="WebPickNoForm">
+				<tr>
+					<th align="right" width="31%">管轄監理單位：</th>
+					<td align="left">
+						<select name="selDeptCode" id="selDeptCode" onchange="getStation();" class="sel_std">
+							<option value="0" selected="selected">請選擇</option>
+							<option value="2">臺北市</option>
+							<option value="3">高雄市</option>
+							<option value="4">臺北區</option>
+							<option value="5">新竹區</option>
+							<option value="6">臺中區</option>
+							<option value="7">嘉義區</option>
+							<option value="8">高雄區</option>
+						</select>
+						<select name="selStationCode" id="selStationCode" onchange="getWindow();" class="sel_std">
+							<option value="0">請選擇</option>
+							
+						</select> <br>
+						<font color="red">可跨監理所、站選號<!--(有貸款設定及租賃車輛除外)-->，領牌時須至該號牌之管轄單位領取。</font>
+					</td>
+				</tr>
+				<tr>
+					<th align="right">領牌地點(窗口地點)：</th>
+					<td align="left"><select name="selWindowNo"
+						id="selWindowNo" onchange="getWindowStatus();getPlateType();" class="sel_std">
+						<option value="0">請選擇</option>
+						
+					</select> <input type="hidden" name="location" id="location"></td>
+				</tr>
+				<tr>
+          		<tr>
+		          	<th align="right">服務電話：</th>
+		          	<td align="left">
+		          		<span id="phoneSpan"> 
+							 
+						</span>
+					</td>
+       		 	</tr>	
+				<tr>
+					<th align="right">受理業務項目：</th>
+					<td align="left">
+						<span id="carOpItemSpan">
+							 
+						</span> 
+						<span id="trailOpItemSpan"></span> <span id="motorOpItemSpan"></span><span id="bikeOpItemSpan"></span>&nbsp;
+					</td>
+				</tr>
+				<tr>
+					<th align="right">車種別：</th>
+					<td align="left">
+						<select name="selCarType" id="selCarType" class="sel_std" onchange="refreshFilterPlateType()">
+							<option value="">請選擇</option>
+							<option value="C">汽車</option>
+							<option value="M">機車</option>
+							<option value="T">拖車</option>
+							<option value="n">微型電動二輪車</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th align="right">能源別：</th>
+					<td align="left">
+						<select name="selEnergyType" id="selEnergyType" class="sel_std" onchange="refreshFilterPlateType()">
+							<option value="">請選擇</option>
+							<option value="C">非電能</option>
+							<option value="E">純電能</option>
+						</select><br>
+						<font color="red">註：非電能包括汽油、柴油、瓦斯、汽油/LPG、汽油/電、柴油/電。</font>
+					</td>
+				</tr>
+				<tr>
+					<th align="right">車牌別：</th>
+					<td align="left">
+						<select name="selPlateType"	id="selPlateType" class="sel_std">
+							<option value="0">請選擇</option>
+							
+						</select><a href="/m3-emv-plate/plateDesc" class="various">機車車牌規則</a>
+					</td>
+				</tr>
+				<tr>
+			    
+				
+					
+						<tr>
+							<th align="right">車牌樣式：</th>
+							<td align="left">
+								<input type="radio"	name="plateVer" value="2" checked>新式車牌
+							</td>
+						</tr>
+					
+					
+				
+</table></form></body></html>

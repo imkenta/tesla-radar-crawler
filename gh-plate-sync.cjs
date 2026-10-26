@@ -21,6 +21,8 @@ const { MODEL_LADDER, EXHAUSTED, LadderState, classifyQuotaError, isUnsupportedL
 const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 // 瀏覽器／頁面存活判斷＋lane 牆鐘到期關機協調（純函式，與回歸測試共用：test/browser-liveness.test.cjs）
 const { isPageUsable, assertPageUsable, createDeadPageError, createDeadlineShutdown } = require('./lib/browser-liveness.cjs');
+const { classifySubmitReject, countsTowardSoftBlock, formatRejectLog, REJECT_TYPES, FORM_INCOMPLETE_BAILOUT_THRESHOLD } = require('./lib/submit-reject-classifier.cjs');
+const { fillAndVerifyForm } = require('./lib/mvdis-form.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -127,6 +129,24 @@ const AI_HEDGE_ENABLED = process.env.AI_HEDGE !== 'off';
 // lane 預算。任一次提交成功即歸零（跨站累計）。
 const CAPTCHA_REJECT_BAILOUT_THRESHOLD = 4;
 let consecutiveCaptchaRejects = 0;
+
+// 2026-10-26：送出被拒原因分三類（lib/submit-reject-classifier.cjs）。只有 captcha／unknown-dialog 計入上面的
+// 軟封鎖偵測；form-incomplete（頁面 chkForm 的「請選擇…」alert＝下拉沒填齊，DWR 晚回造成）與 IP 無關，
+// 另以「同站連續」計數（FORM_INCOMPLETE_BAILOUT_THRESHOLD）。這裡的累計只用於結尾統計 log。
+const submitRejectTotals = { [REJECT_TYPES.CAPTCHA]: 0, [REJECT_TYPES.FORM_INCOMPLETE]: 0, [REJECT_TYPES.UNKNOWN_DIALOG]: 0 };
+const formFillStats = { refills: 0, verifyFailedToFullNav: 0, imageNotReady: 0 };
+
+// 全程掛在 page 上的 dialog 記錄器：記下並 dismiss 所有 alert（含填表階段的，例如 station 62 的「進口車」提醒——
+// 沒有 listener 時 dialog 會一直開著、卡住後續 evaluate）。送出階段用 alertEvents 的游標取「這次送出之後」的訊息。
+const alertEvents = [];
+function attachDialogRecorder(page) {
+    page.on('dialog', async (d) => {
+        const msg = d.message();
+        alertEvents.push(msg);
+        console.log(`    [Dialog] ${d.type()}: ${String(msg).replace(/\s+/g, ' ').trim()}`);
+        try { await d.dismiss(); } catch (e) { /* dialog 已被關閉或頁面已死：忽略 */ }
+    });
+}
 
 // 2026-10-20：lane 牆鐘到期的關機狀態（見 lib/browser-liveness.cjs 檔頭）。wrapper 的
 // `timeout --signal=TERM --kill-after=15s` 送 SIGTERM 時，過去 puppeteer 只關 Chrome、node 繼續
@@ -668,6 +688,8 @@ class SyncStats {
         console.log(`   - Stations: ${this.stationsSuccess} Success / ${this.stationsFailed} Failed`);
         const captchaRate = this.captchaAttempts > 0 ? Math.round(this.captchaSuccess/this.captchaAttempts*100) : 0;
         console.log(`   - CAPTCHA: ${this.captchaSuccess}/${this.captchaAttempts} (${captchaRate}%)`);
+        console.log(`   - Submit rejects: captcha=${submitRejectTotals[REJECT_TYPES.CAPTCHA]} form-incomplete=${submitRejectTotals[REJECT_TYPES.FORM_INCOMPLETE]} unknown-dialog=${submitRejectTotals[REJECT_TYPES.UNKNOWN_DIALOG]}`);
+        console.log(`   - Form fill: refills=${formFillStats.refills} verifyFailedToFullNav=${formFillStats.verifyFailedToFullNav} captchaImageNotReady=${formFillStats.imageNotReady}`);
         console.log(`   - Runtime: ${runtime.toFixed(2)}s`);
 
         if (PREFLIGHT_ONLY) return; // 暖身探測不寫 sync_logs，避免灌噪音列
@@ -942,20 +964,6 @@ async function performSwap() {
     return true;
 }
 
-// Helper to select and dispatch events
-const selectWithEvent = async (page, selector, value) => {
-    await page.waitForSelector(selector);
-    await page.select(selector, value);
-    await page.evaluate((sel) => {
-        const el = document.querySelector(sel);
-        if (el) {
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            if (el.onchange) el.onchange();
-        }
-    }, selector);
-};
-
 const waitForImage = async (page, selector, timeout = 10000) => {
     try {
         await page.waitForFunction(
@@ -1042,6 +1050,7 @@ async function processStation(page, deptId, station) {
 
     let isFirstQueryInStation = true;
     let stationAborted = false;
+    let consecutiveFormIncomplete = 0; // 同站連續 form-incomplete（見 lib/submit-reject-classifier.cjs）
 
     for (const pType of plateTypes) {
         if (stationAborted) break;
@@ -1059,7 +1068,9 @@ async function processStation(page, deptId, station) {
             if (attempts > 1) retries++;
 
             // 1. 導覽與填表
+            let formMode;
             if (isFirstQueryInStation || attempts > 1) {
+                formMode = 'full';
                 console.log(`    [Attempt ${attempts}] Full Nav...`);
                 let navOk = false;
                 for (let navTry = 0; navTry < 3; navTry++) {
@@ -1097,17 +1108,8 @@ async function processStation(page, deptId, station) {
                     if (btn) btn.click();
                 });
                 await sleep(1000);
-                await selectWithEvent(page, '#selDeptCode', deptId); await sleep(1200);
-                await selectWithEvent(page, '#selStationCode', station.id); await sleep(1200);
-                await selectWithEvent(page, '#selWindowNo', '01'); await sleep(800);
-                await selectWithEvent(page, '#selCarType', 'C');
-                await selectWithEvent(page, '#selEnergyType', 'E'); await sleep(1200);
-                await selectWithEvent(page, '#selPlateType', pType); await sleep(800);
-                await page.evaluate(() => {
-                    const radios = document.getElementsByName('plateVer');
-                    if (radios.length > 0) (Array.from(radios).find(r => r.value === '2') || radios[0]).click();
-                });
             } else {
+                formMode = 'quick';
                 console.log('    [Action] Quick Re-query...');
                 await page.evaluate(() => {
                     const btn = document.querySelector('a[onclick*="doReturnWithData"]');
@@ -1119,8 +1121,20 @@ async function processStation(page, deptId, station) {
                     console.log(`    [Action] Quick Re-query 逾時（${waitErr.message}），退回 Full Nav 重試...`);
                     continue;
                 }
-                await selectWithEvent(page, '#selPlateType', pType);
-                await sleep(1000);
+            }
+
+            // 1b. 填表（每步等選項出現再選）＋送出前驗證整張表單。不全就在原頁重填（不走 Full Nav），
+            // 仍不全才放棄本 attempt 走 Full Nav——避免為一定被 chkForm 擋下的提交付 AI 呼叫
+            // （2026-10-26：晚間 MVDIS 變慢時 DWR 晚回，固定 sleep 串 select 會靜默取消選取）。
+            const formResult = await fillAndVerifyForm(page, { deptId, stationId: station.id, pType }, {
+                mode: formMode,
+                log: (m) => console.log(m),
+            });
+            if (formResult.tries > 1) formFillStats.refills += formResult.tries - 1;
+            if (!formResult.ok) {
+                formFillStats.verifyFailedToFullNav++;
+                console.log(`    [Form] 原頁重填 ${formResult.tries} 次仍不全（缺 ${formResult.missing.join(',')}），放棄本 attempt，改走 Full Nav...`);
+                continue;
             }
 
             // 2. 驗證碼辨識（90s 牆鐘上限：5xx 風暴下單次 solve 最壞 ~57s；遇到回探第一層那張
@@ -1138,7 +1152,14 @@ async function processStation(page, deptId, station) {
                     const btn = document.querySelector('#pickimg + a') || document.querySelector('a[onclick*="pickimg"]');
                     if (btn) btn.click();
                 });
-                await waitForImage(page, '#pickimg');
+                const imgReady = await waitForImage(page, '#pickimg');
+                if (!imgReady) {
+                    // 驗證碼圖沒載好（逾時／broken image）：別拿它燒 AI 呼叫，回圈頂端會再按「換一張」重抽
+                    formFillStats.imageNotReady++;
+                    console.log(`    [Captcha] 驗證碼圖未載入完成（${captchaAttempts}/5），重新整理驗證碼...`);
+                    await sleep(1500);
+                    continue;
+                }
                 await sleep(1000);
                 const rawCode = await solveCaptcha(page);
                 if (rawCode && rawCode.length === 4) code = rawCode;
@@ -1159,10 +1180,11 @@ async function processStation(page, deptId, station) {
             }, code);
             await sleep(1000);
 
+            // 被拒原因分類（lib/submit-reject-classifier.cjs）：alert 原文由全程 dialog 記錄器收集，
+            // 這裡只取「送出之後」新出現的第一則。
             let alertMsg = null;
-            let captchaRejected = false;
-            const dialogHandler = async d => { alertMsg = d.message(); await d.dismiss(); };
-            page.on('dialog', dialogHandler);
+            let rejectType = REJECT_TYPES.NONE;
+            const alertCursor = alertEvents.length;
             
             const trigger = await doSubmit(page);
             console.log(`    [Form] Submit triggered (${trigger}), waiting for results...`);
@@ -1178,7 +1200,8 @@ async function processStation(page, deptId, station) {
                         return {
                             isResult: h1.includes('--') || document.querySelector('.number_cell') !== null,
                             isNoData: body.includes('截至目前為止') || body.includes('查無資料'),
-                            isError: body.includes('驗證數字輸入錯誤') || body.includes('請輸入驗證數字')
+                            captchaWrong: body.includes('驗證數字輸入錯誤'),
+                            captchaEmpty: body.includes('請輸入驗證數字')
                         };
                     });
                 } catch (evalErr) {
@@ -1193,9 +1216,12 @@ async function processStation(page, deptId, station) {
                     throw evalErr;
                 }
 
-                if (alertMsg || pageInfo.isError) {
-                    console.log(`    [Fail] Captcha Error detected.`);
-                    captchaRejected = true;
+                alertMsg = alertEvents.length > alertCursor ? alertEvents[alertCursor] : null;
+                const bodyFlags = { captchaWrong: pageInfo.captchaWrong, captchaEmpty: pageInfo.captchaEmpty };
+                const rejectCandidate = classifySubmitReject({ alertMsg, bodyFlags });
+                if (rejectCandidate !== REJECT_TYPES.NONE) {
+                    rejectType = rejectCandidate;
+                    console.log(`\n    ${formatRejectLog(rejectType, alertMsg, bodyFlags)}`);
                     break;
                 }
                 if (pageInfo.isResult || pageInfo.isNoData) {
@@ -1206,18 +1232,33 @@ async function processStation(page, deptId, station) {
                 process.stdout.write('.'); // 打印進度點
             }
 
-            page.off('dialog', dialogHandler);
-
             // 軟封鎖偵測：成功提交歸零；連續被拒達門檻＝IP 層問題，丟回 workflow
             // 重抽 WARP 身分，別把 lane 預算磨在被降級的出口 IP 上。
+            // 只有 captcha／unknown-dialog 計入（unknown 保守視同 captcha，保留真軟封鎖偵測）；
+            // form-incomplete 是表單沒填齊（與 IP 無關），不動軟封鎖計數，另以同站連續次數把關。
             if (success) {
                 consecutiveCaptchaRejects = 0;
-            } else if (captchaRejected) {
-                consecutiveCaptchaRejects++;
-                if (consecutiveCaptchaRejects >= CAPTCHA_REJECT_BAILOUT_THRESHOLD) {
-                    const bailErr = new Error(`連續 ${consecutiveCaptchaRejects} 次驗證碼提交被拒（跨站累計）：疑似本出口 IP 遭 MVDIS 軟封鎖/降級，交回 workflow 重抽 WARP 身分。`);
-                    bailErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
-                    throw bailErr;
+                consecutiveFormIncomplete = 0;
+            } else if (rejectType !== REJECT_TYPES.NONE) {
+                submitRejectTotals[rejectType]++;
+                if (countsTowardSoftBlock(rejectType)) {
+                    consecutiveFormIncomplete = 0;
+                    consecutiveCaptchaRejects++;
+                    if (consecutiveCaptchaRejects >= CAPTCHA_REJECT_BAILOUT_THRESHOLD) {
+                        const bailErr = new Error(`連續 ${consecutiveCaptchaRejects} 次驗證碼提交被拒（跨站累計）：疑似本出口 IP 遭 MVDIS 軟封鎖/降級，交回 workflow 重抽 WARP 身分。`);
+                        bailErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+                        throw bailErr;
+                    }
+                } else {
+                    consecutiveFormIncomplete++;
+                    if (consecutiveFormIncomplete >= FORM_INCOMPLETE_BAILOUT_THRESHOLD) {
+                        // 送出前驗證都通過了還連續被 chkForm 擋＝MVDIS 頁面狀態異常（多半是 DWR 極慢／重複 callback
+                        // 在驗證後才清掉欄位）。與 IP 軟封鎖無關，但仍屬「換個乾淨 Chrome／出口身分重來」可解的暫時性失敗，
+                        // 故沿用 exit 75（Resume 保留已完成站、workflow 補跑），而不是記單站 FAILED（會擋 swap 並判 HARD_FAILURE）。
+                        const formErr = new Error(`同站（${station.name}）連續 ${consecutiveFormIncomplete} 次送出被表單驗證擋下（form-incomplete，alert=${JSON.stringify(alertMsg)}）：MVDIS 頁面下拉狀態異常，交回 workflow 以新 Chrome／身分重來。`);
+                        formErr.exitCode = MVDIS_PREFLIGHT_EXIT_CODE;
+                        throw formErr;
+                    }
                 }
             }
 
@@ -1377,6 +1418,7 @@ async function processStation(page, deptId, station) {
 
     try {
         const page = await browser.newPage();
+        attachDialogRecorder(page);
         
         // Handle Proxy Auth if provided
         if (PROXY_URL && PROXY_URL.includes('@')) {
