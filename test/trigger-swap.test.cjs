@@ -84,6 +84,10 @@ function makeScenario(overrides = {}) {
         stagingCount: 1000,
         prodCount: 1000,
         stagingKeys: Array.from({ length: 1000 }, (_, i) => ({ station_id: '40', region_id: '4', plate_type: 'g', plate_no: `P${i}` })),
+        prodRows: [], // 單組歸零守門讀的正式表（預設空＝沒有可保留的組）
+        prodReadError: null,
+        insertError: null,
+        duplicateOnInsert: false, // 模擬 insert 重試造成同一批列進了兩次
         swapError: null,
         metaAfterSwap: { status: 'COMPLETED', status_message: null },
         metaUpsertError: null,
@@ -99,18 +103,31 @@ function makeScenario(overrides = {}) {
             return { data: o.shardMeta };
         }
         if (call.table === 'available_plates_staging') {
+            if (call.has('insert')) {
+                if (o.insertError) return { data: null, error: o.insertError };
+                // 模擬真實 DB：抄回的列進了 staging，後續讀鍵會看到它們
+                o.stagingKeys = o.stagingKeys.concat(call.arg('insert'), o.duplicateOnInsert ? call.arg('insert') : []);
+                return { data: null };
+            }
             if (call.has('range')) {
                 const [from, to] = call.ops.find((op) => op.name === 'range').args;
                 return { data: o.stagingKeys.slice(from, to + 1) };
             }
             return { count: o.stagingCount };
         }
-        if (call.table === 'available_plates') return { count: o.prodCount };
+        if (call.table === 'available_plates') {
+            if (call.has('range')) {
+                if (o.prodReadError) return { data: null, error: o.prodReadError };
+                const [from, to] = call.ops.find((op) => op.name === 'range').args;
+                return { data: o.prodRows.slice(from, to + 1) };
+            }
+            return { count: o.prodCount };
+        }
         if (call.table === 'plate_changes') { notified.sold++; return { data: null, error: { message: 'none' } }; }
         return { data: [] };
     });
     const ctx = { supabase: sb, safeQuery: (op) => op(), sendEmail: async () => true, now: () => NOW };
-    return { sb, ctx, notified };
+    return { sb, ctx, notified, o };
 }
 
 const swapCalled = (sb) => sb.calls.some((c) => c.rpc === 'swap_plates_data');
@@ -228,4 +245,186 @@ test('sendEmail dry-run：只印遮罩收件人與主旨，不印整封信，且
         if (saved.u !== undefined) process.env.SMTP_USER = saved.u;
         if (saved.p !== undefined) process.env.SMTP_PASS = saved.p;
     }
+});
+
+// ---------- 單組歸零保留（C12）整合 ----------
+
+const heldGroupRows = (offsetMin, n = 5) => Array.from({ length: n }, (_, i) => ({
+    id: `x${i}`, station_id: '20', station_name: '臺北市區監理所', region_id: '2', plate_type: 'g',
+    window_id: '01', plate_no: `H${i}`, price: 2000, status: 'AVAILABLE',
+    updated_at: new Date(NOW + offsetMin * 60 * 1000).toISOString(),
+}));
+// 正式表：被保留的 20/2/g 組 + 一組仍有新資料的 40/4/g（updated_at 由呼叫端決定「上一次 swap 的時間」）
+const prodWith = (heldRows, freshOffsetMin) => [
+    ...heldRows,
+    ...Array.from({ length: 10 }, (_, i) => ({ id: `y${i}`, station_id: '40', station_name: '臺北區', region_id: '4', plate_type: 'g', window_id: '01', plate_no: `P${i}`, price: 2000, status: 'AVAILABLE', updated_at: new Date(NOW + freshOffsetMin * 60 * 1000).toISOString() })),
+];
+
+test('run：某站車種整組回空、正式表有 5 筆 → 抄回 staging 後照常 swap（不會 REMOVED），exit 0，成功訊息註明保留', async () => {
+    const { sb, ctx, o } = makeScenario({ prodRows: prodWith(heldGroupRows(-20), -20) });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 0);
+    assert.ok(swapCalled(sb));
+    const ins = sb.calls.filter((c) => c.table === 'available_plates_staging' && c.has('insert'));
+    assert.equal(ins.length, 1);
+    const restored = ins[0].arg('insert');
+    assert.equal(restored.length, 5);
+    assert.ok(restored.every((r) => !('id' in r) && r.station_id === '20'));
+    assert.equal(o.stagingKeys.length, 1005, '抄回的列進了 staging');
+    assert.ok(lines.some((l) => /::warning::\[Hold\] 20 \/ 2 \/ g/.test(l)));
+    // 抄回發生在 swap 之前
+    const order = sb.calls.map((c) => (c.rpc === 'swap_plates_data' ? 'swap' : c.has('insert') ? 'insert' : null)).filter(Boolean);
+    assert.deepEqual(order, ['insert', 'swap']);
+    const upsert = sb.calls.find((c) => c.table === 'sync_metadata' && c.has('upsert'));
+    assert.match(upsert.arg('upsert').status_message, /不含沿用上一輪的 5 筆；1 組本輪回空/);
+});
+
+test('run：連續空夠久（age ≥ 30 分）→ 放行：不抄回、照常 swap（真正售完的組不會永遠卡住）', async () => {
+    const { sb, ctx } = makeScenario({ prodRows: prodWith(heldGroupRows(-40), 0) });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 0);
+    assert.ok(swapCalled(sb));
+    assert.equal(sb.calls.some((c) => c.has('insert')), false);
+    assert.ok(lines.some((l) => /\[Hold-Release\] 20 \/ 2 \/ g/.test(l)));
+});
+
+test('run：讀正式表失敗 → fail-closed（exit 1、不 swap）', async () => {
+    const { sb, ctx } = makeScenario({ prodReadError: { message: 'prod read boom' } });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.ok(lines.some((l) => /empty-group hold.*prod read boom/.test(l)));
+});
+
+test('run：抄回 insert 失敗 → fail-closed（exit 1、不 swap）', async () => {
+    const { sb, ctx } = makeScenario({ prodRows: prodWith(heldGroupRows(-20), -20), insertError: { message: 'insert boom' } });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.ok(lines.some((l) => /insert boom/.test(l)));
+});
+
+test('run：筆數下限看「本輪實際抓到的」——不會被抄回的舊列墊高而放過殘缺批次', async () => {
+    // 本輪只抓到 10 筆，正式表有 600 筆：若先抄回再檢查下限就會通過。必須先擋下，且完全不讀正式表。
+    const bigProd = Array.from({ length: 600 }, (_, i) => ({ id: `z${i}`, station_id: String(20 + (i % 6)), region_id: '2', plate_type: 'g', plate_no: `Z${i}`, updated_at: iso0() }));
+    function iso0() { return new Date(NOW).toISOString(); }
+    const { sb, ctx } = makeScenario({ stagingCount: 10, stagingKeys: [], prodRows: bigProd });
+    const { result } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.equal(sb.calls.some((c) => c.table === 'available_plates' && c.has('range')), false);
+});
+
+test('run：下降閘分子分母都扣掉保留列——殘缺批次不會因抄回而過關（20% 閘照擋、且不寫入）', async () => {
+    const { sb, ctx } = makeScenario({ stagingCount: 1000, prodCount: 2000, prodRows: prodWith(heldGroupRows(-20), -20) });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.ok(lines.some((l) => /dropped 49\.9% vs production \(1995 → 1000, excluding 5 held rows\)/.test(l)));
+    assert.equal(sb.calls.some((c) => c.has('insert')), false);
+});
+
+test('run：抄回後複檢到重複鍵（例如 insert 重試重複寫入）→ exit 1、不 swap', async () => {
+    const { sb, ctx } = makeScenario({ prodRows: prodWith(heldGroupRows(-20), -20), duplicateOnInsert: true });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.ok(lines.some((l) => /duplicated plate keys/.test(l)));
+});
+
+// ---------- 保留期間 × 下降閘（P1-1／P1-2） ----------
+
+const mkRows = (station, type, n, offsetMin, region = '2', prefix = '') => Array.from({ length: n }, (_, i) => ({
+    id: `${prefix}${station}${type}${i}`, station_id: station, station_name: `站${station}`, region_id: region, plate_type: type,
+    window_id: '01', plate_no: `${prefix}${station}${type}${i}`, price: 2000, status: 'AVAILABLE',
+    updated_at: new Date(NOW + offsetMin * 60 * 1000).toISOString(),
+}));
+const keysOf = (rows) => rows.map((r) => ({ station_id: r.station_id, region_id: r.region_id, plate_type: r.plate_type, plate_no: r.plate_no }));
+
+// 正式表 1000 列：兩個大組同時回空（100 + 86 = 18.6%）+ 814 列正常組（updated_at = 上一次 swap 的時間 0）
+function multiHeldScenario({ heldOffsetMin, freshNow, ...extra }) {
+    const heldA = mkRows('20', 'g', 100, heldOffsetMin);
+    const heldB = mkRows('84', 'h', 86, heldOffsetMin, '8');
+    const fresh = mkRows('40', 'g', 814, 0, '4');
+    const prodRows = [...heldA, ...heldB, ...fresh];
+    return makeScenario({
+        prodRows, prodCount: prodRows.length,
+        stagingKeys: keysOf(fresh).slice(0, freshNow), stagingCount: freshNow,
+        ...extra,
+    });
+}
+
+test('P1-1：保留第 2 輪、多站合計 18.6%，本輪再淨降 20 筆——舊公式會擋死（20.6%），新公式照常 swap', async () => {
+    // 舊公式 (1000-794)/1000 = 20.6% > 20% → 擋下 → 不 swap → 時鐘不前進 → 永遠保留且每輪 exit 1
+    const { sb, ctx } = multiHeldScenario({ heldOffsetMin: -20, freshNow: 794 });
+    assert.ok(swap.checkDropRatio(1000, 794), '前提：不扣保留列時舊公式會擋');
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 0, lines.join('\n'));
+    assert.ok(swapCalled(sb));
+    assert.equal(sb.calls.filter((c) => c.has('insert')).length, 1);
+    assert.equal(sb.calls.find((c) => c.has('insert')).arg('insert').length, 186);
+});
+
+test('P1-1：保留第 3 輪（age 40 分）→ 放行；放行輪不扣除，嚴格度與舊版相同', async () => {
+    // 放行輪：186 列真的要被移除。fresh 815 → (1000-815)/1000 = 18.5% 通過；794 → 20.6% 擋下（與舊版一致）
+    const pass = multiHeldScenario({ heldOffsetMin: -40, freshNow: 815 });
+    const r1 = await quiet(() => swap.run(pass.ctx));
+    assert.equal(r1.result, 0);
+    assert.ok(swapCalled(pass.sb));
+    assert.equal(pass.sb.calls.some((c) => c.has('insert')), false, '放行：不抄回');
+    assert.ok(r1.lines.some((l) => /\[Hold-Release\] 20 \/ 2 \/ g/.test(l)));
+
+    const blocked = multiHeldScenario({ heldOffsetMin: -40, freshNow: 794 });
+    const r2 = await quiet(() => swap.run(blocked.ctx));
+    assert.equal(r2.result, 1);
+    assert.equal(swapCalled(blocked.sb), false);
+});
+
+test('P1-1：保留列超過正式表 20% → exit 1、不寫入、不 swap（大量整組歸零不得被保留洗白）', async () => {
+    const heldA = mkRows('20', 'g', 150, -20);
+    const heldB = mkRows('84', 'h', 101, -20, '8'); // 251 / 1000 = 25.1%
+    const fresh = mkRows('40', 'g', 749, 0, '4');
+    const prodRows = [...heldA, ...heldB, ...fresh];
+    const { sb, ctx } = makeScenario({ prodRows, prodCount: prodRows.length, stagingKeys: keysOf(fresh), stagingCount: fresh.length });
+    const { result, lines } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.equal(sb.calls.some((c) => c.has('insert')), false);
+    assert.ok(lines.some((l) => /251 rows are held.*> 20% of production 1000/.test(l)));
+});
+
+test('checkHeldCap／checkDropRatio(heldRows)：上限剛好 20% 通過、超過即中止；扣除後的分母為 0 不誤擋', () => {
+    assert.equal(swap.checkHeldCap(1000, 200), null);
+    assert.match(swap.checkHeldCap(1000, 201).message, /201 rows are held/);
+    assert.equal(swap.checkHeldCap(0, 0), null);
+    assert.equal(swap.checkDropRatio(1000, 794, 186), null); // (814-794)/814 = 2.5%
+    assert.match(swap.checkDropRatio(1000, 600, 186).message, /\(814 → 600, excluding 186 held rows\)/);
+    assert.equal(swap.checkDropRatio(100, 0, 100), null);
+});
+
+test('P1-1 反例檢查：被保留的組不會讓「殘缺的非保留部分」過關——非保留部分仍受同一個 20% 閘', async () => {
+    // 保留 186（18.6%），其餘 814 只抓到 600（-26%）：舊閘與新閘都必須擋
+    const { sb, ctx } = multiHeldScenario({ heldOffsetMin: -20, freshNow: 600 });
+    const { result } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 1);
+    assert.equal(swapCalled(sb), false);
+    assert.equal(sb.calls.some((c) => c.has('insert')), false);
+});
+
+test('P2-3：抄回的 insert 不重試（safeQuery maxRetries=1），其餘查詢維持預設重試', async () => {
+    const seen = [];
+    const { sb, ctx } = makeScenario({ prodRows: prodWith(heldGroupRows(-20), -20) });
+    ctx.safeQuery = (op, maxRetries) => { seen.push(maxRetries); return op(); };
+    const original = sb.from.bind(sb);
+    const insertRetries = [];
+    sb.from = (table) => {
+        const chain = original(table);
+        return table === 'available_plates_staging'
+            ? new Proxy(chain, { get: (t, prop) => (prop === 'insert' ? (...a) => { insertRetries.push(seen[seen.length - 1]); return t.insert(...a); } : t[prop]) })
+            : chain;
+    };
+    const { result } = await quiet(() => swap.run(ctx));
+    assert.equal(result, 0);
+    assert.deepEqual(insertRetries, [1]);
+    assert.ok(seen.includes(1) && seen.some((v) => v === undefined));
 });

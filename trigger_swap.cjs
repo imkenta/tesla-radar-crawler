@@ -3,12 +3,14 @@ const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 const { SHARD_NAMES } = require('./lib/shard-config.cjs');
 const { fetchWatchesByPlate } = require('./lib/watchlist-lookup.cjs');
 const { findDuplicateKeys, fetchAllStagingKeys } = require('./lib/staging-duplicates.cjs');
+const { planHoldFromDb, commitHold } = require('./lib/station-empty-hold.cjs');
 const { maskEmail, redactEmails, safeErrorMessage } = require('./lib/mask-email.cjs');
 
 // 最低筆數／最大下降比例保護：擋「幾乎全空但非 0」或「相對正式表暴跌」的殘缺批次。
-// 這是唯一的一道防線：線上 swap_plates_data() 沒有熔斷（2026-10-14 以
-// pg_get_functiondef 實查；tesla-studio 的 20251229_add_circuit_breaker*.sql 被同日
-// 較晚套用的 20251229_fix_swap_logic.sql 覆寫），staging 非空就直接 TRUNCATE 正式表換上。
+// 2026-11-10 更正：線上 swap_plates_data() 目前「有」熔斷（以 pg_get_functiondef 唯讀實查：
+// 重複鍵＋相對正式表驟降 >20% 時寫 SKIPPED_CIRCUIT_BREAKER 並清空 staging），與本檔的下降／重複鍵
+// 守門重疊；2026-10-14 當時的「線上沒有熔斷」註解已過時。這兩道仍都是「全域」守門，
+// 擋不住「單一站某車種整組歸零」（只佔全量 ≤10%）——那由 lib/station-empty-hold.cjs 處理。
 const MIN_STAGING_COUNT = 50;
 const MAX_DROP_RATIO = 0.2;
 // Shard 新鮮度窗口：finalize job 緊接在 5 個 shard 之後跑（各 shard 逾時 45 分鐘），
@@ -273,13 +275,31 @@ function checkDuplicateKeys(stagingKeys) {
     return null;
 }
 
-/** Safety Check 2b：相對正式表的下降比例。 */
-function checkDropRatio(prodCount, count) {
-    if (prodCount > 0) {
-        const dropRatio = (prodCount - count) / prodCount;
+/**
+ * Safety Check 2b：相對正式表的下降比例。
+ * heldRows：本輪被「單組歸零保留」的列數。這些組本輪不會被移除（會抄回 staging），所以分子分母都扣掉；
+ * 不扣的話，保留期間 prodCount 含它們而 count 不含，多組合計接近 20% 時會把 swap 擋死（參考時鐘只在 swap 成功時前進）。
+ * 放行輪不扣（那些組真的要被移除），嚴格度與舊版相同。
+ */
+function checkDropRatio(prodCount, count, heldRows = 0) {
+    const effectiveProd = prodCount - heldRows;
+    if (effectiveProd > 0) {
+        const dropRatio = (effectiveProd - count) / effectiveProd;
         if (dropRatio > MAX_DROP_RATIO) {
-            return { message: `❌ Staging count dropped ${(dropRatio * 100).toFixed(1)}% vs production (${prodCount} → ${count}), exceeds ${(MAX_DROP_RATIO * 100).toFixed(0)}% floor. Aborting swap.` };
+            const heldNote = heldRows > 0 ? `, excluding ${heldRows} held rows` : '';
+            return { message: `❌ Staging count dropped ${(dropRatio * 100).toFixed(1)}% vs production (${effectiveProd} → ${count}${heldNote}), exceeds ${(MAX_DROP_RATIO * 100).toFixed(0)}% floor. Aborting swap.` };
         }
+    }
+    return null;
+}
+
+/**
+ * Safety Check 4a：被保留的列總數上限。單一站最多約 10%，超過 20% 代表多站／整個 shard 同時回空，
+ * 是系統性問題而不是個別站異常，不能用「保留」洗白——exit 1 讓人來看。
+ */
+function checkHeldCap(prodCount, heldRows) {
+    if (prodCount > 0 && heldRows > MAX_DROP_RATIO * prodCount) {
+        return { message: `❌ ${heldRows} rows are held because their station/type groups came back empty (> ${(MAX_DROP_RATIO * 100).toFixed(0)}% of production ${prodCount}). Too many groups empty at once looks systemic, not a per-station glitch. Aborting swap for manual review.` };
     }
     return null;
 }
@@ -364,6 +384,20 @@ async function run(ctx = {}) {
         return 1;
     }
 
+    // Safety Check 4（單組歸零保留，C12）：本輪某站某車種整組回空、但正式表原本有 ≥3 筆，
+    // 多半是抓取異常而非真的售完。把正式表該組抄回 staging，讓 swap 的 REMOVED diff 看不到它們，
+    // 不會對收藏者寄假「已售出」。要防的不可逆後果：processSoldNotifications 寄出售出信後會刪掉使用者的
+    // watchlist 紀錄（收藏消失、無法復原），假售出不只是一封錯信。連續空夠久（約 3 輪）才放行。
+    // 順序：筆數下限（上面，在讀正式表之前）→ 計畫（只讀）→ 下降閘（扣掉保留列）＋保留上限 → 才寫入抄回。
+    // 抄回的舊列不能讓殘缺批次過關：下降閘的分子分母都扣掉保留列，等於只對「沒被保留的部分」維持原嚴格度，
+    // 且保留列總數有 20% 上限。
+    const planned = await planHoldFromDb({ supabase, safeQuery: query, stagingKeys });
+    if (planned.error) {
+        console.error('❌ Failed to plan empty-group hold (fail-closed, swap aborted):', redactEmails(planned.error.message));
+        return 1;
+    }
+    const plan = planned.plan;
+
     const { count: prodCount, error: prodCountError } = await query(() => supabase
         .from('available_plates')
         .select('*', { count: 'exact', head: true }));
@@ -373,10 +407,37 @@ async function run(ctx = {}) {
         return 1;
     }
 
-    const dropVerdict = checkDropRatio(prodCount, count);
+    const capVerdict = checkHeldCap(prodCount, plan.heldRows);
+    if (capVerdict) {
+        console.error(capVerdict.message);
+        return 1;
+    }
+
+    const dropVerdict = checkDropRatio(prodCount, count, plan.heldRows);
     if (dropVerdict) {
         console.error(dropVerdict.message);
         return 1;
+    }
+
+    // 抄回的 insert 不冪等：不重試（maxRetries=1），失敗即 fail-closed，避免「已寫入但回應遺失」的重試寫出重複列。
+    const holdOutcome = await commitHold({ supabase, safeQuery: (op) => query(op, 1), plan });
+    if (holdOutcome.error) {
+        console.error('❌ Failed to restore held groups into staging (fail-closed, swap aborted):', redactEmails(holdOutcome.error.message));
+        return 1;
+    }
+    if (holdOutcome.restored > 0) {
+        // 抄回的列與本輪列在鍵上互斥（只對 staging 該組 0 筆的組抄回），這裡是防禦性複檢。
+        const { rows: keysAfterHold, error: keysAfterHoldError } = await fetchAllStagingKeys(supabase, query);
+        if (keysAfterHoldError) {
+            console.error('❌ Failed to re-read staging keys after hold:', keysAfterHoldError.message);
+            return 1;
+        }
+        const dupAfterHold = checkDuplicateKeys(keysAfterHold);
+        if (dupAfterHold) {
+            console.error(dupAfterHold.message);
+            return 1;
+        }
+        console.log(`🛡️ Hold applied: ${plan.hold.length} group(s) kept from previous round (${holdOutcome.restored} rows restored into staging).`);
     }
 
     console.log(`✅ Staging has ${count} records. Proceeding with swap...`);
@@ -388,10 +449,8 @@ async function run(ctx = {}) {
         return 1;
     }
 
-    // 防禦性回讀：線上 swap_plates_data() 目前沒有熔斷（見檔頭）。若日後重新套用
-    // 熔斷版，它是 void RPC，觸發時只把 sync_metadata.status 寫成
-    // SKIPPED_CIRCUIT_BREAKER、不回傳 error；不回讀的話下面會把它覆寫成
-    // COMPLETED（false green）。
+    // 回讀：線上 swap_plates_data() 的熔斷是 void RPC，觸發時只把 sync_metadata.status 寫成
+    // SKIPPED_CIRCUIT_BREAKER、不回傳 error；不回讀的話下面會把它覆寫成 COMPLETED（false green）。
     const { data: metaAfterSwap, error: metaAfterSwapError } = await query(() => supabase
         .from('sync_metadata')
         .select('status, status_message')
@@ -409,7 +468,8 @@ async function run(ctx = {}) {
         return 1;
     }
 
-    const successMsg = `同步完成，共抓取 ${count} 筆資料`;
+    // 筆數口徑：count 是本輪實際抓到的；沿用上一輪的保留列不計入（swap 寫入的 total_count 才含它們）。
+    const successMsg = `同步完成，共抓取 ${count} 筆資料` + (plan.hold.length > 0 ? `（不含沿用上一輪的 ${holdOutcome.restored} 筆；${plan.hold.length} 組本輪回空）` : '');
     console.log(`✅ ${successMsg}. Production data updated.`);
 
     // Update main metadata status
@@ -462,6 +522,7 @@ module.exports = {
     checkStagingCount,
     checkDuplicateKeys,
     checkDropRatio,
+    checkHeldCap,
     checkCircuitBreaker,
     run,
 };
