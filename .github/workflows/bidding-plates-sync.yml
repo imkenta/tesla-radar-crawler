@@ -29,47 +29,78 @@ jobs:
           curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
-          # Install WARP。時間預算（步驟上限 7 分鐘；job 上限 10 分鐘不動，後面 npm ci＋爬取正常約 1–2 分鐘）：
-          #   金鑰下載   正常 ~1 秒；最壞 3×30 秒＋重試間隔 ≈ 96 秒
-          #   update     最多 2 輪，每輪上限 90 秒（＋TERM 後 15 秒強殺寬限），輪間睡 5 秒
-          #   install    只跑 1 次，上限 240 秒（＋15 秒寬限）。Ubuntu 26.04 每次要下載 125 MB，
-          #              實測綠燈輪次 install 約 66 秒、88 秒、2 分 54 秒；90 秒上限會砍掉原本會綠的輪次。
-          #   正常慢速輪次  1 ＋ ~20 ＋ ~180 ≈ 3.5 分鐘 → 一定能綠
-          #   update 卡一次再成功  1 ＋ 95 ＋ 5 ＋ ~20 ＋ ~180 ≈ 5.1 分鐘 → 仍能綠
-          #   更糟的組合由 7 分鐘步驟上限把關（明確失敗，不再讓整個 job 被 10 分鐘 timeout 取消）。
-          # install 不做第二輪：第二輪塞不進預算，而且 TERM 若落在 dpkg 解包階段，第二輪固定失敗於
-          # 「dpkg was interrupted」。逾時／kill-after 與 Acquire::* 參數沿用
-          # .github/actions/setup-plate-runner/action.yml 的 refresh_all_indexes／install_warp 寫法，
-          # 但 update 上限是 90 秒、install 上限是 240 秒（與該檔 118／134 行一致）。
+          # Install WARP。2026-11-10 第二版：兩段式（先下載、再解包）＋整體 deadline。
+          # 為什麼：11/10 14:05 為止 Bidding Plates 近 64 輪有 7 輪死在這一步（上線前 11/5–11/9 同一步驟 716 輪有 23 輪被
+          # job 10 分鐘 timeout 取消、其中 19 輪在 11/6 一天）。7 輪的 log 都是 azure.archive.ubuntu.com 慢／間歇卡住
+          # （Ign: 15–30 秒空窗、libwebkit2gtk 25.7 MB 單檔停滯），其中一輪 236 秒才下載完 125 MB，TERM 落在 dpkg 解包而失敗。
+          # 舊版把「下載＋解包」塞進同一個 240 秒的 install：下載慢會吃掉解包的時間、TERM 又可能砍在 dpkg 中途。
+          # 新版：
+          #   1. update           最多 2 輪，每輪 ≤60 秒（實測正常 ~4 秒）
+          #   2. install --download-only  最多 3 輪，每輪 ≤100 秒。apt 的半成品下載會留在 archives/partial 續傳，
+          #                       已下載完的 .deb 保留；被 TERM 砍掉不會動到 dpkg，安全，且每輪重新建立連線以脫離卡住的連線。
+          #   3. install          只剩解包（本機 .deb），最多 2 輪，每輪 ≤120 秒；若 TERM 落在 dpkg 中途，先 dpkg --configure -a 再續一輪。
+          # 整體預算：函式起算 330 秒（WARP_APT_BUDGET 可覆寫，供測試），下載階段永遠替解包保留 60 秒；每個階段的上限
+          # 都會被「剩餘預算」再夾一次，所以不會因為前面慢就讓後面無上限。
+          #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊／連線 ~25 ≈ 6 分鐘（步驟上限 7 分鐘）；
+          #   極端（金鑰下載也卡滿 96 秒）由 7 分鐘步驟上限把關，明確失敗。
+          #   後續步驟（Setup Node＋npm ci＋同步）p50 19 秒、p99 191 秒、max 201 秒（11/5–11/10 共 767 輪）；
+          #   job 上限 10 分鐘：330 ＋ checkout 與金鑰約 5 ＋ WARP 設定約 30 ＋ Verify IP 最多約 25 ＋ 後續最大 201 ≈ 590 秒，
+          #   仍在 600 內但餘裕只剩約 10 秒（舊版單次 240 秒 install 的最壞情況本來就會超過）。
+          # Acquire::Retries=2／Timeout=15／20 維持不變：log 顯示它們有在作用（Ign: 後重試），調大只會讓每次卡住更久。
           install_warp_bounded() {
-            local TRY
+            local DEADLINE=$((SECONDS + ${WARP_APT_BUDGET:-330}))
+            local UNPACK_RESERVE=60
+            local TRY CAP REM DOWNLOADED=false
+            local APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=20 -o Dpkg::Use-Pty=0)
+
             for TRY in 1 2; do
-              echo "apt-get update attempt $TRY/2..."
-              if sudo timeout --signal=TERM --kill-after=15s 90s \
-                   apt-get \
-                     -o Acquire::Retries=2 \
-                     -o Acquire::http::Timeout=15 \
-                     -o Acquire::https::Timeout=20 \
-                     -o Dpkg::Use-Pty=0 \
-                     update; then
+              REM=$((DEADLINE - SECONDS - UNPACK_RESERVE)); CAP=60
+              if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before apt-get update."; return 1; fi
+              echo "apt-get update attempt $TRY/2 (cap ${CAP}s)..."
+              if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
+                   apt-get "${APT_OPTS[@]}" update; then
                 break
               fi
               echo "::warning::apt-get update attempt $TRY failed or timed out."
               if [ "$TRY" -ge 2 ]; then return 1; fi
-              sleep 5
+              sleep 3
             done
-            echo "apt-get install cloudflare-warp (single attempt, 240s cap)..."
-            sudo timeout --signal=TERM --kill-after=15s 240s \
-              env DEBIAN_FRONTEND=noninteractive \
-              apt-get \
-                -o Acquire::Retries=2 \
-                -o Acquire::http::Timeout=15 \
-                -o Acquire::https::Timeout=20 \
-                -o Dpkg::Use-Pty=0 \
-                install -y cloudflare-warp
+
+            for TRY in 1 2 3; do
+              REM=$((DEADLINE - SECONDS - UNPACK_RESERVE)); CAP=100
+              if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted during download."; break; fi
+              echo "apt-get install --download-only attempt $TRY/3 (cap ${CAP}s)..."
+              if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
+                   env DEBIAN_FRONTEND=noninteractive \
+                   apt-get "${APT_OPTS[@]}" install -y --download-only cloudflare-warp; then
+                DOWNLOADED=true
+                break
+              fi
+              echo "::warning::download attempt $TRY failed or timed out (partial files are kept and resumed)."
+              sleep 2
+            done
+            if [ "$DOWNLOADED" != "true" ]; then return 1; fi
+
+            for TRY in 1 2; do
+              REM=$((DEADLINE - SECONDS)); CAP=120
+              if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before unpack."; return 1; fi
+              echo "apt-get install (unpack from local .deb) attempt $TRY/2 (cap ${CAP}s)..."
+              if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
+                   env DEBIAN_FRONTEND=noninteractive \
+                   apt-get "${APT_OPTS[@]}" install -y cloudflare-warp; then
+                return 0
+              fi
+              echo "::warning::unpack attempt $TRY failed or timed out; finishing any half-configured packages."
+              # 最後一輪失敗後不必收尾（函式即將回傳失敗），省下最多 65 秒、不逼近步驟上限
+              if [ "$TRY" -lt 2 ]; then sudo timeout --signal=TERM --kill-after=5s 60s dpkg --configure -a || true; fi
+            done
+            return 1
           }
           if ! install_warp_bounded; then
-            echo "::error::Cloudflare WARP package installation failed or timed out after bounded retries."
+            echo "::error::Cloudflare WARP package installation failed or timed out after bounded retries (download/unpack two-phase)."
             exit 1
           fi
 
