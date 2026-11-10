@@ -13,8 +13,11 @@ const dotenv = require('dotenv');
 puppeteer.use(StealthPlugin());
 
 // --- Config ---
-const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
-dotenv.config({ path: envPath });
+// 2026-11-10：被 require（測試）時不載入 .env，避免測試意外拿到正式環境的金鑰。
+if (require.main === module) {
+  const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
+  dotenv.config({ path: envPath });
+}
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -86,8 +89,16 @@ function findStationCodes(name, stationData) {
   return null;
 }
 
+/**
+ * @returns {Promise<number>} exit code：0＝完整成功；1＝有任一失敗（載入頁面失敗、寫入失敗、爬取例外）。
+ * 2026-11-10（健檢 O5）：原本整支永遠 exit 0，導航 3 次失敗只 continue、upsert 失敗只 log，
+ * bid_announcements 過期時 bidding-plates-sync 會依舊公告決定要爬哪些站，卻沒有任何紅燈。
+ * 這裡的 exit code 只用 0/1：本 workflow 直接 `node` 執行，沒有 plate lane wrapper 的 75（交棒重試）語意。
+ * 已成功的寫入不會因為其他部分失敗而作廢——旗標只在最後決定結束碼。
+ */
 async function run() {
   const startTime = Date.now();
+  let hadError = false;
   console.log('🚀 Starting Bidding Announcements Sync...');
 
   // 1. Clean up expired announcements (older than 30 days)
@@ -117,7 +128,7 @@ async function run() {
     stationData = await loadStationData();
   } catch (err) {
     console.error('[AnnounceSync] Setup failed:', err.message);
-    process.exit(1);
+    return 1;
   }
 
   // 3. Launch Puppeteer
@@ -154,7 +165,8 @@ async function run() {
         }
 
         if (!navSuccess) {
-          console.error(`[Fatal] Could not load announce page after 3 attempts.`);
+          console.error(`[Fatal] Could not load announce page after 3 attempts (${typeLabel} - ${carLabel}).`);
+          hadError = true;
           continue;
         }
 
@@ -287,6 +299,7 @@ async function run() {
       console.log(`📥 Upserting ${scrapedRecords.length} announcements to database...`);
       
       // Perform upsert in chunks to prevent large payload errors
+      let upsertFailed = false;
       const chunkSize = 100;
       for (let i = 0; i < scrapedRecords.length; i += chunkSize) {
         const chunk = scrapedRecords.slice(i, i + chunkSize);
@@ -296,19 +309,35 @@ async function run() {
 
         if (upsertErr) {
           console.error('[AnnounceSync] Upsert error in chunk:', upsertErr.message);
+          hadError = true;
+          upsertFailed = true;
         }
       }
-      console.log('✅ Announcements synced successfully.');
+      if (!upsertFailed) console.log('✅ Announcements synced successfully.');
     } else {
       console.log('ℹ️ No announcements found to sync.');
     }
 
   } catch (err) {
     console.error('[AnnounceSync] Scrape failed:', err);
+    hadError = true;
   } finally {
     await browser.close();
     console.log(`🏁 Finished. Total Runtime: ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
+    if (hadError) {
+      console.error('[AnnounceSync] Completed with errors; marking run as failed.');
+    }
   }
+  return hadError ? 1 : 0;
 }
 
-run();
+if (require.main === module) {
+  run().then((code) => {
+    if (code) process.exitCode = code;
+  }).catch((err) => {
+    console.error('[AnnounceSync] Fatal:', err);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { run };

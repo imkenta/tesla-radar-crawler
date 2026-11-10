@@ -22,7 +22,7 @@ const { extractCaptchaCode } = require('./lib/captcha-parser.cjs');
 // 瀏覽器／頁面存活判斷＋lane 牆鐘到期關機協調（純函式，與回歸測試共用：test/browser-liveness.test.cjs）
 const { isPageUsable, assertPageUsable, createDeadPageError, createDeadlineShutdown } = require('./lib/browser-liveness.cjs');
 const { classifySubmitReject, countsTowardSoftBlock, formatRejectLog, REJECT_TYPES, FormProblemCounter } = require('./lib/submit-reject-classifier.cjs');
-const { fillAndVerifyForm } = require('./lib/mvdis-form.cjs');
+const { fillAndVerifyForm, submitMvdisForm } = require('./lib/mvdis-form.cjs');
 
 // --- Global Error Handlers ---
 process.on('unhandledRejection', (reason, p) => {
@@ -830,41 +830,9 @@ async function solveCaptcha(page) {
     }
 }
 
+// 實作在 lib/mvdis-form.cjs（可單元測試；後備分支的 window 判斷必須在 page.evaluate 內執行）
 async function doSubmit(page) {
-    const buttonData = await page.evaluate(() => {
-        const selectors = [
-            'a[onclick*="doSubmit"]',
-            'input[onclick*="doSubmit"]',
-            'button[onclick*="doSubmit"]',
-            'input[type="button"][value*="確"]',
-            '.std_btn'
-        ];
-        
-        for (const sel of selectors) {
-            const el = Array.from(document.querySelectorAll(sel)).find(e => {
-                const r = e.getBoundingClientRect();
-                return r.width > 0 && r.height > 0 && window.getComputedStyle(e).display !== 'none';
-            });
-            
-            if (el) {
-                el.scrollIntoView();
-                const rect = el.getBoundingClientRect();
-                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, tag: el.tagName, sel: sel };
-            }
-        }
-        return null;
-    });
-
-    if (buttonData) {
-        await page.mouse.move(buttonData.x, buttonData.y, { steps: 5 });
-        await sleep(200);
-        await page.mouse.click(buttonData.x, buttonData.y);
-        return `PHYSICAL_CLICK_${buttonData.tag}`;
-    } else if (typeof window.doSubmit === 'function') {
-        await page.evaluate(() => window.doSubmit());
-        return "CALLED_SCRIPT_FALLBACK";
-    }
-    return "NOT_FOUND";
+    return submitMvdisForm(page, sleep);
 }
 
 async function parsePageInfo(page) {

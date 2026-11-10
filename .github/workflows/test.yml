@@ -1,0 +1,47 @@
+name: Tests
+
+# 2026-11-10（健檢 O6）：repo 原本沒有任何 CI 執行 `npm test`，swap 守門（trigger_swap.cjs）等關鍵邏輯
+# 只靠人記得在本機跑。本 workflow 只跑單元測試：
+#   - 不需要任何 secret（測試全部使用假 Supabase／假 puppeteer，不連網路、不碰資料庫）；
+#   - 只用 pull_request（不用 pull_request_target），fork 的 PR 拿不到任何 secret；
+#   - 權限最小化（contents: read），action 釘 commit SHA（tag 於 2026-11-10 以 gh api 實查）。
+# 這個 repo push 到 main 即上線（排程與 launchd 都會跑到），測試失敗時請不要等排程撞上。
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  npm-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # package.json 的 test script 用引號包住 glob（"test/**/*.test.cjs"），由 `node --test` 自己展開；
+      # Node 21 起才支援，所以 CI 用 22（LTS）。與排程 workflow 固定的 Node 20 無關，那些不在此變更範圍。
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+        env:
+          # 測試不啟動瀏覽器；略過 Puppeteer 的 Chrome 下載（約 150MB，且曾因 ECONNRESET 失敗）
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+
+      # 註：test/speed-camera-local-runner.test.cjs 是 macOS 專用（launchd runner），非 darwin 平台自動 skip。
+      - name: Run Tests
+        run: npm test

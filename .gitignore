@@ -16,3 +16,6 @@ bidding_page_text.txt
 # 台南 geocode 本機負快取，不進公開 repo
 .cache/
 evidence/
+
+# Supabase CLI 暫存目錄（含 project-ref／pooler-url 等，不進公開 repo）
+supabase/.temp/

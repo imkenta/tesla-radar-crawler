@@ -20,13 +20,57 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install and Configure Cloudflare WARP
+        # 2026-11-10（健檢 O7）：步驟層上限（時間預算見下方安裝函式註解），卡住時在 job 的
+        # 10 分鐘 timeout 之前明確失敗，而不是讓整個 job 被取消、爬完卻沒寫入（11/9 兩輪各卡 7.5 分鐘）。
+        timeout-minutes: 7
         run: |
           # Import GPG key and add repository
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
-          # Install WARP
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
+          # Install WARP。時間預算（步驟上限 7 分鐘；job 上限 10 分鐘不動，後面 npm ci＋爬取正常約 1–2 分鐘）：
+          #   金鑰下載   正常 ~1 秒；最壞 3×30 秒＋重試間隔 ≈ 96 秒
+          #   update     最多 2 輪，每輪上限 90 秒（＋TERM 後 15 秒強殺寬限），輪間睡 5 秒
+          #   install    只跑 1 次，上限 240 秒（＋15 秒寬限）。Ubuntu 26.04 每次要下載 125 MB，
+          #              實測綠燈輪次 install 約 66 秒、88 秒、2 分 54 秒；90 秒上限會砍掉原本會綠的輪次。
+          #   正常慢速輪次  1 ＋ ~20 ＋ ~180 ≈ 3.5 分鐘 → 一定能綠
+          #   update 卡一次再成功  1 ＋ 95 ＋ 5 ＋ ~20 ＋ ~180 ≈ 5.1 分鐘 → 仍能綠
+          #   更糟的組合由 7 分鐘步驟上限把關（明確失敗，不再讓整個 job 被 10 分鐘 timeout 取消）。
+          # install 不做第二輪：第二輪塞不進預算，而且 TERM 若落在 dpkg 解包階段，第二輪固定失敗於
+          # 「dpkg was interrupted」。逾時／kill-after 與 Acquire::* 參數沿用
+          # .github/actions/setup-plate-runner/action.yml 的 refresh_all_indexes／install_warp 寫法，
+          # 但 update 上限是 90 秒、install 上限是 240 秒（與該檔 118／134 行一致）。
+          install_warp_bounded() {
+            local TRY
+            for TRY in 1 2; do
+              echo "apt-get update attempt $TRY/2..."
+              if sudo timeout --signal=TERM --kill-after=15s 90s \
+                   apt-get \
+                     -o Acquire::Retries=2 \
+                     -o Acquire::http::Timeout=15 \
+                     -o Acquire::https::Timeout=20 \
+                     -o Dpkg::Use-Pty=0 \
+                     update; then
+                break
+              fi
+              echo "::warning::apt-get update attempt $TRY failed or timed out."
+              if [ "$TRY" -ge 2 ]; then return 1; fi
+              sleep 5
+            done
+            echo "apt-get install cloudflare-warp (single attempt, 240s cap)..."
+            sudo timeout --signal=TERM --kill-after=15s 240s \
+              env DEBIAN_FRONTEND=noninteractive \
+              apt-get \
+                -o Acquire::Retries=2 \
+                -o Acquire::http::Timeout=15 \
+                -o Acquire::https::Timeout=20 \
+                -o Dpkg::Use-Pty=0 \
+                install -y cloudflare-warp
+          }
+          if ! install_warp_bounded; then
+            echo "::error::Cloudflare WARP package installation failed or timed out after bounded retries."
+            exit 1
+          fi
 
           # Register
           sudo warp-cli registration new --accept-tos 2>/dev/null || \

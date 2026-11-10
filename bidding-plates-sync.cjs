@@ -11,6 +11,7 @@ const fs = require('fs');
 const dotenv = require('dotenv');
 const { processPlateSubscriptions } = require('./lib/subscription-notify.cjs');
 const { fetchWatchesByPlate } = require('./lib/watchlist-lookup.cjs');
+const { maskEmail, redactEmails, safeErrorMessage } = require('./lib/mask-email.cjs');
 const {
   groupActiveEvAnnouncements,
   partitionEligibleBiddingPlates
@@ -19,8 +20,11 @@ const {
 puppeteer.use(StealthPlugin());
 
 // --- Config ---
-const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
-dotenv.config({ path: envPath });
+// 2026-11-10：被 require（測試）時不載入 .env，避免測試意外拿到正式環境的金鑰／SMTP 帳號。
+if (require.main === module) {
+  const envPath = fs.existsSync('.env.development') ? '.env.development' : '.env';
+  dotenv.config({ path: envPath });
+}
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -38,7 +42,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   global: {
     fetch: (url, options) => {
       return fetch(url, options).catch(err => {
-        console.error(`[FetchError] ${err.name}: ${err.message} (Target: ${url})`);
+        console.error(`[FetchError] ${err.name}: ${redactEmails(err.message)} (Target: ${redactEmails(String(url))})`);
         throw err;
       });
     }
@@ -68,7 +72,7 @@ async function isEmailBounced(email) {
       .maybeSingle();
     return !!data;
   } catch (e) {
-    console.warn(`[Bounce Check] Failed to check bounce list for ${email}:`, e.message);
+    console.warn(`[Bounce Check] Failed to check bounce list for ${maskEmail(email)}:`, safeErrorMessage(e));
     return false; // 查不到就不擋，讓寄信繼續
   }
 }
@@ -78,9 +82,9 @@ async function markEmailBounced(email, reason) {
     await supabase
       .from('email_bounce_list')
       .upsert({ email, reason, bounced_at: new Date().toISOString(), bounce_count: 1 }, { onConflict: 'email' });
-    console.log(`[Email Bounce] ${email} 已標記為 hard bounce，日後不再寄信。原因：${reason}`);
+    console.log(`[Email Bounce] ${maskEmail(email)} 已標記為 hard bounce，日後不再寄信。原因：${redactEmails(reason)}`);
   } catch (e) {
-    console.error(`[Bounce Mark] 無法標記 ${email}:`, e.message);
+    console.error(`[Bounce Mark] 無法標記 ${maskEmail(email)}:`, safeErrorMessage(e));
   }
 }
 
@@ -89,7 +93,7 @@ async function markEmailBounced(email, reason) {
 async function sendEmail(to, subject, html) {
   // Hard bounce 守衛：已在退信名單則直接跳過
   if (await isEmailBounced(to)) {
-    console.log(`[Email Skip] ${to} 在 hard bounce 名單中，跳過寄信。`);
+    console.log(`[Email Skip] ${maskEmail(to)} 在 hard bounce 名單中，跳過寄信。`);
     return false;
   }
 
@@ -97,7 +101,8 @@ async function sendEmail(to, subject, html) {
   const smtpPass = process.env.SMTP_PASS;
 
   if (!smtpUser || !smtpPass) {
-    console.log(`[Email Log] (Dry Run - No SMTP Config) to: ${to}, subject: ${subject}\nContent:\n${html}\n`);
+    // 公開 log：只印遮罩後的收件人與主旨，不印整封信內容
+    console.log(`[Email Log] (Dry Run - No SMTP Config) to: ${maskEmail(to)}, subject: ${redactEmails(subject)}`);
     return true;
   }
 
@@ -120,10 +125,11 @@ async function sendEmail(to, subject, html) {
       subject: subject,
       html: html
     });
-    console.log(`[SMTP Email] Sent email successfully to ${to} via ${smtpUser}`);
+    console.log(`[SMTP Email] Sent email successfully to ${maskEmail(to)}`);
     return true;
   } catch (err) {
-    console.error(`[SMTP Email Error] Failed to send email to ${to}:`, err.message);
+    // err.message 可能夾帶收件人（如 "Recipient address rejected: <addr>"）→ 遮罩後再印
+    console.error(`[SMTP Email Error] Failed to send email to ${maskEmail(to)}:`, safeErrorMessage(err));
     // 550 = mailbox not found（hard bounce），寫入退信名單
     const isHardBounce =
       err.responseCode === 550 ||
@@ -158,7 +164,7 @@ async function processWatchlistAlerts(plates) {
   try {
     watchesByPlate = await fetchWatchesByPlate(supabase, 'bidding', plates.map((p) => p.plate_no));
   } catch (err) {
-    console.error('[Watchlist] Fetch watch error:', err.message);
+    console.error('[Watchlist] Fetch watch error:', safeErrorMessage(err));
     return;
   }
   for (const plate of plates) {
@@ -171,7 +177,7 @@ async function processWatchlistAlerts(plates) {
         const currentBid = parseFloat(plate.current_bid);
 
         if (!watch.last_known_bid || currentBid > lastBid) {
-          console.log(`🚨 Alert! Bid price changed for ${plate.plate_no} (User: ${watch.email}, Price: ${lastBid} -> ${currentBid})`);
+          console.log(`🚨 Alert! Bid price changed for ${plate.plate_no} (User: ${maskEmail(watch.email)}, Price: ${lastBid} -> ${currentBid})`);
           
           const formattedEnd = new Date(plate.end_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
           const mailHtml = `
@@ -209,7 +215,7 @@ async function processWatchlistAlerts(plates) {
         }
       }
     } catch (err) {
-      console.error(`[Watchlist Error] Processing ${plate.plate_no}:`, err.message);
+      console.error(`[Watchlist Error] Processing ${plate.plate_no}:`, safeErrorMessage(err));
     }
   }
 }
@@ -244,7 +250,7 @@ async function processEndedAuctions() {
       const formattedEnd = new Date(plate.end_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
 
       for (const watch of watches) {
-        console.log(`🏁 Auction ended for ${plate.plate_no}. Notifying ${watch.email} (final bid: ${finalBid})`);
+        console.log(`🏁 Auction ended for ${plate.plate_no}. Notifying ${maskEmail(watch.email)} (final bid: ${finalBid})`);
         const mailHtml = `
           <div style="font-family: sans-serif; padding: 20px; max-width: 600px; border: 1px solid #eee; border-radius: 8px;">
             <h2 style="color: #16a34a; margin-bottom: 20px;">Tesla Studio - 收藏車牌結標通知</h2>
@@ -274,7 +280,7 @@ async function processEndedAuctions() {
       }
     }
   } catch (e) {
-    console.error('[EndedAuctions] Process exception:', e.message);
+    console.error('[EndedAuctions] Process exception:', safeErrorMessage(e));
   }
 }
 
@@ -320,7 +326,7 @@ async function processAnnouncementOpenAlerts() {
       const formattedEnd = new Date(ann.end_time).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
 
       for (const sub of annSubs) {
-        console.log(`📣 Announcement opened (${ann.start_plate}~${ann.end_plate}). Notifying ${sub.email}`);
+        console.log(`📣 Announcement opened (${ann.start_plate}~${ann.end_plate}). Notifying ${maskEmail(sub.email)}`);
         const mailHtml = `
           <div style="font-family: sans-serif; padding: 20px; max-width: 600px; border: 1px solid #eee; border-radius: 8px;">
             <h2 style="color: #7c3aed; margin-bottom: 20px;">Tesla Studio - 競標開標通知</h2>
@@ -350,13 +356,21 @@ async function processAnnouncementOpenAlerts() {
       }
     }
   } catch (e) {
-    console.error('[OpenAlerts] Process exception:', e.message);
+    console.error('[OpenAlerts] Process exception:', safeErrorMessage(e));
   }
 }
 
+/**
+ * @returns {Promise<number>} exit code：0＝完整成功；1＝有寫入失敗、爬取整體失敗，或有任一站爬取失敗。
+ * 2026-11-10（健檢 O5）：單站爬取失敗原本只 log（「❌ Error crawling station」），不影響結束碼 → 假綠。
+ * 現在記錄 failedStations 並在結尾印摘要＋以 exit 1 結束；但**不**中途中止——其他站已爬到的資料
+ * 仍照常 upsert 與通知（部分成功的寫入不作廢）。結束碼只用 0/1：本 workflow 直接 `node` 執行，
+ * 沒有 plate lane wrapper 的 75（交棒重試）語意。
+ */
 async function run() {
   const startTime = Date.now();
   let hadUpsertError = false;
+  const failedStations = [];
   console.log('🚀 Starting Bidding Plates Sync...');
 
   // 0. Watchlist 通知（不論是否有 active 競標站台都先執行；結標需在清除過期牌之前撈取）
@@ -381,12 +395,12 @@ async function run() {
     stations = await loadActiveStations();
   } catch (err) {
     console.error('[BiddingPlatesSync] Failed to load active stations:', err.message);
-    process.exit(1);
+    return 1;
   }
 
   if (stations.length === 0) {
     console.log('ℹ️ No active bidding sessions at the moment. Exiting.');
-    process.exit(0);
+    return 0;
   }
 
   console.log(`📊 Found ${stations.length} active stations to crawl.`);
@@ -524,6 +538,7 @@ async function run() {
 
       } catch (stErr) {
         console.error(`❌ Error crawling station ${station.stationCode}:`, stErr.message);
+        failedStations.push(station.stationCode);
         // Recover navigation by re-visiting the URL if crashed
         try {
           await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -578,11 +593,23 @@ async function run() {
   } finally {
     await browser.close();
     console.log(`🏁 Finished. Total Runtime: ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
+    if (failedStations.length > 0) {
+      console.error(`[BiddingPlatesSync] ${failedStations.length}/${stations.length} station(s) failed to crawl: ${failedStations.join(', ')}; marking run as failed.`);
+    }
     if (hadUpsertError) {
       console.error('[BiddingPlatesSync] Completed with data write errors; marking run as failed.');
-      process.exitCode = 1;
     }
   }
+  return (hadUpsertError || failedStations.length > 0) ? 1 : 0;
 }
 
-run();
+if (require.main === module) {
+  run().then((code) => {
+    if (code) process.exitCode = code;
+  }).catch((err) => {
+    console.error('[BiddingPlatesSync] Fatal:', safeErrorMessage(err));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { run };

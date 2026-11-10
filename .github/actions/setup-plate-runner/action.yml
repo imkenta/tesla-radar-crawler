@@ -198,7 +198,41 @@ runs:
         sudo warp-cli registration new --accept-tos 2>/dev/null || \
         sudo warp-cli --accept-tos registration new 2>/dev/null || true
 
-        DIRECT_IP_BEFORE=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+        # 2026-11-10（健檢 O2）：直連出口 IP 金絲雀原本是單次 `curl api.ipify.org`（--max-time 15）。
+        # 11/8 15:23 ipify 一次逾時，7 個 job（primary 與 recovery 同時）在 80 秒內死在 setup。
+        # 改成有上限的重試＋備援端點；回傳值必須像 IPv4，否則視為失敗（避免空字串 == 空字串 讓金絲雀假通過）。
+        # 兩個端點都必須在 WARP 的 `tunnel host add` 排除清單內（見下方 HOST 迴圈），
+        # 這樣 WARP 開啟後不論哪個端點回答，看到的都是 GitHub 直連 IP，split-tunnel 判定語意不變。
+        # 用法：fetch_direct_ipv4 [偏好端點]，成功時輸出「<端點> <IPv4>」。AFTER 傳入 BEFORE 回答的端點，
+        # 優先問同一個服務（不同服務看到的 IP 理論上相同，但同端點比對最不容易誤判）。
+        # 注意：迴圈變數刻意不叫 ATTEMPT（Gemini 預檢步驟用它，測試的假 curl 也靠它分辨呼叫）。
+        fetch_direct_ipv4() {
+          local TRY ENDPOINT RESULT
+          local ENDPOINTS=(https://api.ipify.org https://checkip.amazonaws.com)
+          if [ "${1:-}" = "https://checkip.amazonaws.com" ]; then
+            ENDPOINTS=(https://checkip.amazonaws.com https://api.ipify.org)
+          fi
+          for TRY in 1 2 3; do
+            for ENDPOINT in "${ENDPOINTS[@]}"; do
+              RESULT=$(curl -4 -fsS --max-time 15 "$ENDPOINT" 2>/dev/null || true)
+              RESULT=${RESULT//[[:space:]]/}
+              if [[ "$RESULT" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                echo "$ENDPOINT $RESULT"
+                return 0
+              fi
+              echo "::warning::Direct IPv4 lookup via $ENDPOINT failed (round $TRY/3)." >&2
+            done
+            if [ "$TRY" -lt 3 ]; then sleep $((TRY * 3)); fi
+          done
+          return 1
+        }
+
+        if ! BEFORE_RESULT=$(fetch_direct_ipv4); then
+          echo "::error::Unable to determine the GitHub direct IPv4 before WARP after bounded retries."
+          exit 1
+        fi
+        BEFORE_ENDPOINT=${BEFORE_RESULT% *}
+        DIRECT_IP_BEFORE=${BEFORE_RESULT#* }
         echo "GitHub direct IPv4 before WARP: $DIRECT_IP_BEFORE"
 
         for HOST in generativelanguage.googleapis.com api.ipify.org; do
@@ -210,6 +244,16 @@ runs:
             exit 1
           fi
         done
+
+        # 備援金絲雀端點（fetch_direct_ipv4 的第二順位）也要排除在 WARP 之外，WARP 開啟後它回的才是直連 IP。
+        # 這一個排除失敗只警告、不中止：若它沒排除成功，WARP 後經它查到的會是 WARP IP → 與 BEFORE 不符 →
+        # 下方金絲雀照樣 fail-closed，不會放行；不該因為「備援」本身讓原本能過的 lane 死在 setup。
+        if sudo warp-cli tunnel host add checkip.amazonaws.com 2>/dev/null || \
+           sudo warp-cli --accept-tos tunnel host add checkip.amazonaws.com 2>/dev/null; then
+          echo "Excluded from WARP: checkip.amazonaws.com (backup canary endpoint)"
+        else
+          echo "::warning::Failed to exclude backup canary endpoint checkip.amazonaws.com from WARP; canary stays fail-closed."
+        fi
 
         SUB_DOMAIN=$(sed -E 's#https?://([^/]+).*#\1#' <<< "$SUPABASE_URL")
         SUB_IP=$(getent ahostsv4 "$SUB_DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }')
@@ -241,7 +285,15 @@ runs:
           exit 1
         fi
 
-        DIRECT_IP_AFTER=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+        if ! AFTER_RESULT=$(fetch_direct_ipv4 "$BEFORE_ENDPOINT"); then
+          echo "::error::Unable to determine the GitHub direct IPv4 after WARP exclusion; split-tunnel canary unproven."
+          exit 1
+        fi
+        AFTER_ENDPOINT=${AFTER_RESULT% *}
+        DIRECT_IP_AFTER=${AFTER_RESULT#* }
+        if [ "$AFTER_ENDPOINT" != "$BEFORE_ENDPOINT" ]; then
+          echo "::warning::Canary compares across endpoints (before: $BEFORE_ENDPOINT, after: $AFTER_ENDPOINT); the preferred endpoint was unreachable."
+        fi
         echo "GitHub direct IPv4 after WARP exclusion: $DIRECT_IP_AFTER"
         if [ "$DIRECT_IP_AFTER" != "$DIRECT_IP_BEFORE" ]; then
           echo "::error::Split-tunnel canary changed IP; Gemini bypass is not proven."
@@ -302,6 +354,35 @@ runs:
         GEMINI_API_KEY_SHARD4: ${{ inputs.gemini-api-key-shard4 }}
         GEMINI_API_KEY_SHARD5: ${{ inputs.gemini-api-key-shard5 }}
       run: |
+        # 2026-11-10（健檢 O2）：直連出口 IP 金絲雀原本是單次 `curl api.ipify.org`（--max-time 15）。
+        # 11/8 15:23 ipify 一次逾時，7 個 job（primary 與 recovery 同時）在 80 秒內死在 setup。
+        # 改成有上限的重試＋備援端點；回傳值必須像 IPv4，否則視為失敗（避免空字串 == 空字串 讓金絲雀假通過）。
+        # 兩個端點都必須在 WARP 的 `tunnel host add` 排除清單內（見下方 HOST 迴圈），
+        # 這樣 WARP 開啟後不論哪個端點回答，看到的都是 GitHub 直連 IP，split-tunnel 判定語意不變。
+        # 用法：fetch_direct_ipv4 [偏好端點]，成功時輸出「<端點> <IPv4>」。AFTER 傳入 BEFORE 回答的端點，
+        # 優先問同一個服務（不同服務看到的 IP 理論上相同，但同端點比對最不容易誤判）。
+        # 注意：迴圈變數刻意不叫 ATTEMPT（Gemini 預檢步驟用它，測試的假 curl 也靠它分辨呼叫）。
+        fetch_direct_ipv4() {
+          local TRY ENDPOINT RESULT
+          local ENDPOINTS=(https://api.ipify.org https://checkip.amazonaws.com)
+          if [ "${1:-}" = "https://checkip.amazonaws.com" ]; then
+            ENDPOINTS=(https://checkip.amazonaws.com https://api.ipify.org)
+          fi
+          for TRY in 1 2 3; do
+            for ENDPOINT in "${ENDPOINTS[@]}"; do
+              RESULT=$(curl -4 -fsS --max-time 15 "$ENDPOINT" 2>/dev/null || true)
+              RESULT=${RESULT//[[:space:]]/}
+              if [[ "$RESULT" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                echo "$ENDPOINT $RESULT"
+                return 0
+              fi
+              echo "::warning::Direct IPv4 lookup via $ENDPOINT failed (round $TRY/3)." >&2
+            done
+            if [ "$TRY" -lt 3 ]; then sleep $((TRY * 3)); fi
+          done
+          return 1
+        }
+
         IFS=',' read -r -a SHARD_LIST <<< "${{ inputs.shards }}"
         for SHARD in "${SHARD_LIST[@]}"; do
           case "$SHARD" in
@@ -318,7 +399,8 @@ runs:
             exit 1
           fi
 
-          DIRECT_IP=$(curl -4 -fsS --max-time 15 https://api.ipify.org)
+          # 僅供診斷顯示（真正的預檢是下面的 generateContent 呼叫，失敗會正確 fail），查不到 IP 不應讓整條 lane 陣亡。
+          if DIRECT_RESULT=$(fetch_direct_ipv4); then DIRECT_IP=${DIRECT_RESULT#* }; else DIRECT_IP="UNKNOWN"; fi
           echo "Gemini direct egress IPv4 for $SHARD: $DIRECT_IP"
           MAX_ATTEMPTS=3
           PREFLIGHT_OUTCOME=""

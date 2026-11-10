@@ -11,7 +11,11 @@ const runnerSource = fs.readFileSync(path.join(__dirname, '../scripts/run-speed-
 const shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
 
 for (const exitCode of [0, 17]) {
-  test(`local runner：離線替身退出 ${exitCode}，記錄完成時間並保留退出碼`, (t) => {
+  // launchd 專用 runner（macOS）：腳本用 BSD `stat -f%z`、`/usr/bin/osascript`，測試以 /bin/zsh 執行。
+  // Linux CI（ubuntu runner 不保證預裝 zsh、stat 語意不同）不跑，避免間歇紅燈；本機 macOS 照跑。
+  test(`local runner：離線替身退出 ${exitCode}，記錄完成時間並保留退出碼`, {
+    skip: process.platform === 'darwin' ? false : 'macOS 專用（launchd runner：zsh／BSD stat／osascript）',
+  }, (t) => {
     // 絕不執行正式 runner：複製到 temp，替換 repo、Node 與通知程式；僅讀假 .env。
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'speed-camera-runner-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
