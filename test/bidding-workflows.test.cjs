@@ -37,7 +37,7 @@ const functionOf = (step) => {
 // 在假 sudo／timeout／apt-get／dpkg 下執行安裝函式。
 //   updateFailures／downloadFailures／unpackFailures：各階段前 N 次呼叫失敗（模擬卡住被 timeout 砍掉＝124）
 //   budget：WARP_APT_BUDGET（秒）；假 timeout 不會真的等，所以只用來驗證「各階段上限被剩餘預算夾住」
-function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFailures = 0, budget } = {}) {
+function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFailures = 0, budget, cache } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'warp-'));
     try {
         const bin = path.join(dir, 'bin');
@@ -66,6 +66,7 @@ esac
 exit 0`);
         const env = { PATH: `${bin}:${process.env.PATH}` };
         if (budget !== undefined) env.WARP_APT_BUDGET = String(budget);
+        if (cache) env.WARP_DEB_CACHE = '1';
         const result = spawnSync('/bin/bash', ['-e'], {
             input: `${fnText}\ninstall_warp_bounded && echo OK || echo FAILED`,
             encoding: 'utf8',
@@ -92,6 +93,17 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(step.run, /WARP_APT_BUDGET:-330/);
         assert.match(step.run, /UNPACK_RESERVE=60/);
         assert.match(step.run, /dpkg --configure -a/);
+        // 唯讀沿用車牌同步的 .deb 快取：restore 步驟在安裝步驟之前、失敗不擋；安裝前把 .deb 放進 apt archives
+        const steps = job.steps.map((x) => x.name || x.uses);
+        const restoreIdx = steps.indexOf('Restore cached WARP apt packages (shared with plate-sync)');
+        assert.ok(restoreIdx >= 0 && restoreIdx < steps.indexOf('Install and Configure Cloudflare WARP'));
+        const restore = job.steps[restoreIdx];
+        assert.equal(restore.uses, 'actions/cache/restore@v4');
+        assert.equal(restore['continue-on-error'], true);
+        assert.equal(restore.with.path, '~/.warp-apt-cache');
+        assert.match(restore.with['restore-keys'], /^warp-apt-\$\{\{ runner\.os \}\}-\s*$/);
+        assert.match(step.run, /cp "\$HOME\/\.warp-apt-cache\/"\*\.deb \/var\/cache\/apt\/archives\//);
+        assert.match(step.run, /WARP_DEB_CACHE=1/);
         // 鏡像卡住時改用 archive.ubuntu.com（只改 mirror 清單檔內容），update 與下載失敗後都會呼叫
         assert.match(step.run, /use_fallback_ubuntu_mirror\(\) \{[\s\S]*?\/etc\/apt\/apt-mirrors\.txt[\s\S]*?https:\/\/archive\.ubuntu\.com\/ubuntu\//);
         assert.ok((step.run.match(/^\s*use_fallback_ubuntu_mirror$/gm) || []).length >= 2);
@@ -149,6 +161,14 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(updateFallback.stdout, /falling back to Cloudflare-only apt index/);
         assert.equal(count(updateFallback.calls, /--download-only/g), 1);
         assert.doesNotMatch(clean.stdout, /falling back|mirror switched/);
+        // 有快取的 .deb：不碰 Ubuntu 鏡像，update 只有一輪且只更新 Cloudflare 來源
+        const cached = runInstall(fn, { cache: true });
+        assert.match(cached.stdout, /OK/, cached.stderr);
+        updateCalls = cached.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 1);
+        assert.match(updateCalls[0], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list/);
+        assert.deepEqual(cached.calls.match(/^timeout .*$/gm), ['timeout 20s', 'timeout 100s', 'timeout 120s']);
+        assert.doesNotMatch(cached.calls, /ForceIPv4/);
         const updateExhausted = runInstall(fn, { updateFailures: 99 });
         assert.match(updateExhausted.stdout, /FAILED/);
         assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 3, 'update 最多 3 輪');

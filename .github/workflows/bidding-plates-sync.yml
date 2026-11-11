@@ -20,6 +20,18 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 2026-11-11：21:55 起 runner 連不到 Ubuntu 套件鏡像（azure 與 archive 兩個、IPv4／IPv6 皆逾時），
+      # 相依套件（約 50 MB）下載不下來。車牌同步（setup-plate-runner）不受影響是因為它快取了 .deb。
+      # 這裡唯讀沿用同一份快取（同 repo、同 path；用不會命中的 key 讓 restore-keys 取最新一份），不另存。
+      - name: Restore cached WARP apt packages (shared with plate-sync)
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: ~/.warp-apt-cache
+          key: warp-apt-${{ runner.os }}-bidding-readonly-${{ github.run_id }}
+          restore-keys: |
+            warp-apt-${{ runner.os }}-
+
       - name: Install and Configure Cloudflare WARP
         # 2026-11-10（健檢 O7）：步驟層上限（時間預算見下方安裝函式註解），卡住時在 job 的
         # 10 分鐘 timeout 之前明確失敗，而不是讓整個 job 被取消、爬完卻沒寫入（11/9 兩輪各卡 7.5 分鐘）。
@@ -74,6 +86,8 @@ jobs:
             # update：第 1 輪用原鏡像（正常 3–17 秒）；卡住就換鏡像再完整更新一次；仍失敗則只更新 Cloudflare 來源、
             # Ubuntu 套件清單沿用 runner 映像內既有的（11/11 實測這樣仍能解出相依；清單過期時下載階段會明確失敗）。
             for TRY in 1 2 3; do
+              # 已有快取的 .deb：跳過會碰 Ubuntu 鏡像的前兩輪，直接只更新 Cloudflare 來源
+              if [ "${WARP_DEB_CACHE:-0}" = "1" ] && [ "$TRY" -lt 3 ]; then continue; fi
               REM=$((DEADLINE - SECONDS - UNPACK_RESERVE)); CAP=30
               local SCOPE=()
               if [ "$TRY" -eq 2 ]; then CAP=45; fi
@@ -127,6 +141,17 @@ jobs:
             done
             return 1
           }
+          # 有快取的 .deb 就先放進 apt 的 archives：之後 --download-only 只會補抓缺的檔案，
+          # 而且 update 直接只更新 Cloudflare 來源，不去碰 Ubuntu 鏡像。
+          WARP_DEB_CACHE=0
+          if ls "$HOME/.warp-apt-cache/"*.deb >/dev/null 2>&1; then
+            if sudo cp "$HOME/.warp-apt-cache/"*.deb /var/cache/apt/archives/; then
+              WARP_DEB_CACHE=1
+              echo "Restored $(ls "$HOME/.warp-apt-cache/"*.deb | wc -l) cached .deb packages into apt archives."
+            fi
+          else
+            echo "No cached .deb packages; everything will be downloaded."
+          fi
           if ! install_warp_bounded; then
             echo "::error::Cloudflare WARP package installation failed or timed out after bounded retries (download/unpack two-phase)."
             exit 1
