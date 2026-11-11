@@ -125,6 +125,13 @@ for (const [file, jobName] of WORKFLOWS) {
         const updateRetried = runInstall(fn, { updateFailures: 1 });
         assert.match(updateRetried.stdout, /OK/);
         assert.equal(count(updateRetried.calls, /^apt-get .* update$/gm), 2);
+        // 第 2 輪是「只更新 Cloudflare 來源」的後備（Ubuntu 鏡像索引卡住時不再重試整份），上限 30 秒
+        const updateCalls = updateRetried.calls.match(/^apt-get .* update$/gm);
+        assert.doesNotMatch(updateCalls[0], /Dir::Etc::sourcelist/);
+        assert.match(updateCalls[1], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update$/);
+        assert.deepEqual(updateRetried.calls.match(/^timeout .*$/gm).slice(0, 2), ['timeout 60s', 'timeout 30s']);
+        assert.match(updateRetried.stdout, /falling back to Cloudflare-only apt index/);
+        assert.doesNotMatch(clean.stdout, /falling back/);
         const updateExhausted = runInstall(fn, { updateFailures: 99 });
         assert.match(updateExhausted.stdout, /FAILED/);
         assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 2, 'update 最多 2 輪');
