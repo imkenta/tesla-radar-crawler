@@ -133,6 +133,11 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls.forEach((c) => assert.doesNotMatch(c, /Dir::Etc::sourcelist/));
         assert.deepEqual(updateRetried.calls.match(/^timeout .*$/gm).slice(0, 2), ['timeout 30s', 'timeout 45s']);
         assert.doesNotMatch(updateRetried.stdout, /falling back to Cloudflare-only/);
+        // 第 1 輪失敗後，之後所有 apt 呼叫都強制 IPv4；正常路徑不加
+        assert.doesNotMatch(updateCalls[0], /ForceIPv4/);
+        assert.match(updateCalls[1], /Acquire::ForceIPv4=true/);
+        updateRetried.calls.match(/^apt-get .* install .*$/gm).forEach((c) => assert.match(c, /Acquire::ForceIPv4=true/));
+        assert.doesNotMatch(clean.calls, /ForceIPv4/);
         // 前兩輪都失敗：第 3 輪只更新 Cloudflare 來源（上限 20 秒），Ubuntu 清單沿用既有的，然後照常下載
         const updateFallback = runInstall(fn, { updateFailures: 2 });
         assert.match(updateFallback.stdout, /OK/, updateFallback.stderr);

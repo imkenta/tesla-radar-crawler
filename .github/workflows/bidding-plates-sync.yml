@@ -56,10 +56,18 @@ jobs:
 
             # Ubuntu 鏡像（azure.archive.ubuntu.com）卡住時改用 archive.ubuntu.com（與 setup-plate-runner 相同的替換）。
             # runner 的來源是 mirror+file:/etc/apt/apt-mirrors.txt，只改清單檔內容，不動來源 URI，既有套件清單仍可用。可重複呼叫。
+            # 11/11 晚間換鏡像後 archive.ubuntu.com 同樣每個檔案卡滿逾時（本機測兩個鏡像 IPv4／IPv6 皆正常），
+            # 所以退路再加：之後的 apt 一律走 IPv4，並各用 5 秒量一次兩個位址族的連線，下次失敗時 log 就看得出卡在哪。
+            local NET_OPTS=()
             use_fallback_ubuntu_mirror() {
+              NET_OPTS=(-o Acquire::ForceIPv4=true)
               if [ -f /etc/apt/apt-mirrors.txt ] && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+                local FAM
+                for FAM in 4 6; do
+                  echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
+                done
                 sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' /etc/apt/apt-mirrors.txt || true
-                echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com for this run."
+                echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
               fi
             }
 
@@ -77,7 +85,7 @@ jobs:
               if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before apt-get update."; return 1; fi
               echo "apt-get update attempt $TRY/3 (cap ${CAP}s)..."
               if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
-                   apt-get "${APT_OPTS[@]}" "${SCOPE[@]}" update; then
+                   apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" "${SCOPE[@]}" update; then
                 break
               fi
               echo "::warning::apt-get update attempt $TRY failed or timed out."
@@ -93,7 +101,7 @@ jobs:
               echo "apt-get install --download-only attempt $TRY/3 (cap ${CAP}s)..."
               if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                    env DEBIAN_FRONTEND=noninteractive \
-                   apt-get "${APT_OPTS[@]}" install -y --download-only cloudflare-warp; then
+                   apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y --download-only cloudflare-warp; then
                 DOWNLOADED=true
                 break
               fi
@@ -110,7 +118,7 @@ jobs:
               echo "apt-get install (unpack from local .deb) attempt $TRY/2 (cap ${CAP}s)..."
               if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                    env DEBIAN_FRONTEND=noninteractive \
-                   apt-get "${APT_OPTS[@]}" install -y cloudflare-warp; then
+                   apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y cloudflare-warp; then
                 return 0
               fi
               echo "::warning::unpack attempt $TRY failed or timed out; finishing any half-configured packages."
