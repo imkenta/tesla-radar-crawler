@@ -92,6 +92,9 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(step.run, /WARP_APT_BUDGET:-330/);
         assert.match(step.run, /UNPACK_RESERVE=60/);
         assert.match(step.run, /dpkg --configure -a/);
+        // 鏡像卡住時改用 archive.ubuntu.com（只改 mirror 清單檔內容），update 與下載失敗後都會呼叫
+        assert.match(step.run, /use_fallback_ubuntu_mirror\(\) \{[\s\S]*?\/etc\/apt\/apt-mirrors\.txt[\s\S]*?https:\/\/archive\.ubuntu\.com\/ubuntu\//);
+        assert.ok((step.run.match(/^\s*use_fallback_ubuntu_mirror$/gm) || []).length >= 2);
         assert.match(step.run, /Acquire::Retries=2/);
         assert.match(step.run, /Acquire::http::Timeout=15/);
         assert.match(step.run, /curl -fsSL --connect-timeout 10 --max-time 30 --retry 2/);
@@ -114,7 +117,7 @@ for (const [file, jobName] of WORKFLOWS) {
 
         const clean = runInstall(fn);
         assert.match(clean.stdout, /OK/, clean.stderr);
-        assert.deepEqual(clean.calls.match(/^timeout .*$/gm), ['timeout 60s', 'timeout 100s', 'timeout 120s']);
+        assert.deepEqual(clean.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 100s', 'timeout 120s']);
         assert.equal(count(clean.calls, /--download-only/g), 1);
         assert.equal(count(clean.calls, /^apt-get .* install -y cloudflare-warp$/gm), 1);
         assert.equal(count(clean.calls, /^dpkg /gm), 0);
@@ -122,19 +125,28 @@ for (const [file, jobName] of WORKFLOWS) {
         const order = clean.calls.match(/^apt-get .*$/gm).map((l) => (/update$/.test(l) ? 'update' : /--download-only/.test(l) ? 'download' : 'unpack'));
         assert.deepEqual(order, ['update', 'download', 'unpack']);
 
+        // update 第 1 輪卡住（Ubuntu 鏡像）：換鏡像後再完整更新一次（上限 45 秒）
         const updateRetried = runInstall(fn, { updateFailures: 1 });
         assert.match(updateRetried.stdout, /OK/);
-        assert.equal(count(updateRetried.calls, /^apt-get .* update$/gm), 2);
-        // 第 2 輪是「只更新 Cloudflare 來源」的後備（Ubuntu 鏡像索引卡住時不再重試整份），上限 30 秒
-        const updateCalls = updateRetried.calls.match(/^apt-get .* update$/gm);
-        assert.doesNotMatch(updateCalls[0], /Dir::Etc::sourcelist/);
-        assert.match(updateCalls[1], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update$/);
-        assert.deepEqual(updateRetried.calls.match(/^timeout .*$/gm).slice(0, 2), ['timeout 60s', 'timeout 30s']);
-        assert.match(updateRetried.stdout, /falling back to Cloudflare-only apt index/);
-        assert.doesNotMatch(clean.stdout, /falling back/);
+        let updateCalls = updateRetried.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 2);
+        updateCalls.forEach((c) => assert.doesNotMatch(c, /Dir::Etc::sourcelist/));
+        assert.deepEqual(updateRetried.calls.match(/^timeout .*$/gm).slice(0, 2), ['timeout 30s', 'timeout 45s']);
+        assert.doesNotMatch(updateRetried.stdout, /falling back to Cloudflare-only/);
+        // 前兩輪都失敗：第 3 輪只更新 Cloudflare 來源（上限 20 秒），Ubuntu 清單沿用既有的，然後照常下載
+        const updateFallback = runInstall(fn, { updateFailures: 2 });
+        assert.match(updateFallback.stdout, /OK/, updateFallback.stderr);
+        updateCalls = updateFallback.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 3);
+        assert.doesNotMatch(updateCalls[1], /Dir::Etc::sourcelist/);
+        assert.match(updateCalls[2], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update$/);
+        assert.deepEqual(updateFallback.calls.match(/^timeout .*$/gm).slice(0, 3), ['timeout 30s', 'timeout 45s', 'timeout 20s']);
+        assert.match(updateFallback.stdout, /falling back to Cloudflare-only apt index/);
+        assert.equal(count(updateFallback.calls, /--download-only/g), 1);
+        assert.doesNotMatch(clean.stdout, /falling back|mirror switched/);
         const updateExhausted = runInstall(fn, { updateFailures: 99 });
         assert.match(updateExhausted.stdout, /FAILED/);
-        assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 2, 'update 最多 2 輪');
+        assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 3, 'update 最多 3 輪');
         assert.equal(count(updateExhausted.calls, /--download-only/g), 0);
 
         // 慢鏡像：下載前兩輪被砍，第三輪成功（半成品續傳由 apt 負責，這裡驗證「會再試」且只解包一次）
@@ -165,7 +177,7 @@ for (const [file, jobName] of WORKFLOWS) {
         const { step } = load(file, jobName);
         const fn = functionOf(step);
 
-        // 預算 75 秒：update 上限 = min(60, 75-60) = 15；下載 = min(100, 15) = 15；解包 = min(120, 75) = 75（皆為約數）
+        // 預算 75 秒：update 上限 = min(30, 75-60) = 15；下載 = min(100, 15) = 15；解包 = min(120, 75) = 75（皆為約數）
         const tight = runInstall(fn, { budget: 75 });
         assert.match(tight.stdout, /OK/, tight.stderr);
         // bash 的 SECONDS 走真實時鐘（假指令啟動也要時間），所以允許最多 3 秒的向下誤差
