@@ -150,14 +150,14 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(updateCalls[1], /Acquire::ForceIPv4=true/);
         updateRetried.calls.match(/^apt-get .* install .*$/gm).forEach((c) => assert.match(c, /Acquire::ForceIPv4=true/));
         assert.doesNotMatch(clean.calls, /ForceIPv4/);
-        // 前兩輪都失敗：第 3 輪只更新 Cloudflare 來源（上限 20 秒），Ubuntu 清單沿用既有的，然後照常下載
+        // 前兩輪都失敗：第 3 輪只更新 Cloudflare 來源（上限 30 秒，大於 https Timeout 20 秒），Ubuntu 清單沿用既有的，然後照常下載
         const updateFallback = runInstall(fn, { updateFailures: 2 });
         assert.match(updateFallback.stdout, /OK/, updateFallback.stderr);
         updateCalls = updateFallback.calls.match(/^apt-get .* update$/gm);
         assert.equal(updateCalls.length, 3);
         assert.doesNotMatch(updateCalls[1], /Dir::Etc::sourcelist/);
         assert.match(updateCalls[2], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update$/);
-        assert.deepEqual(updateFallback.calls.match(/^timeout .*$/gm).slice(0, 3), ['timeout 30s', 'timeout 45s', 'timeout 20s']);
+        assert.deepEqual(updateFallback.calls.match(/^timeout .*$/gm).slice(0, 3), ['timeout 30s', 'timeout 45s', 'timeout 30s']);
         assert.match(updateFallback.stdout, /falling back to Cloudflare-only apt index/);
         assert.equal(count(updateFallback.calls, /--download-only/g), 1);
         assert.doesNotMatch(clean.stdout, /falling back|mirror switched/);
@@ -167,11 +167,32 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls = cached.calls.match(/^apt-get .* update$/gm);
         assert.equal(updateCalls.length, 1);
         assert.match(updateCalls[0], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list/);
-        assert.deepEqual(cached.calls.match(/^timeout .*$/gm), ['timeout 20s', 'timeout 100s', 'timeout 120s']);
+        assert.deepEqual(cached.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 100s', 'timeout 120s']);
         assert.doesNotMatch(cached.calls, /ForceIPv4/);
+        assert.doesNotMatch(cached.calls, /Debug::Acquire/);
+        // WARP 審查 H1：快取模式下 Cloudflare 索引更新失敗要再試（11/13 那型失敗），重試輪上限 40 秒並開 apt https 除錯輸出
+        const cachedRetried = runInstall(fn, { cache: true, updateFailures: 1 });
+        assert.match(cachedRetried.stdout, /OK/, cachedRetried.stderr);
+        updateCalls = cachedRetried.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 2);
+        updateCalls.forEach((c) => assert.match(c, /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list/));
+        assert.doesNotMatch(updateCalls[0], /Debug::Acquire/);
+        assert.match(updateCalls[1], /Debug::Acquire::https=true/);
+        assert.deepEqual(cachedRetried.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 40s', 'timeout 100s', 'timeout 120s']);
+        assert.doesNotMatch(cachedRetried.calls, /ForceIPv4/, '快取模式的重試不換 Ubuntu 鏡像');
+        assert.doesNotMatch(cachedRetried.stdout, /mirror switched/);
+        const cachedExhausted = runInstall(fn, { cache: true, updateFailures: 99 });
+        assert.match(cachedExhausted.stdout, /FAILED/);
+        updateCalls = cachedExhausted.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 3, '快取模式 Cloudflare 索引更新最多 3 輪');
+        updateCalls.forEach((c) => assert.match(c, /Dir::Etc::sourcelist/));
+        assert.deepEqual(cachedExhausted.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 40s', 'timeout 40s']);
+        assert.equal(count(cachedExhausted.calls, /--download-only/g), 0);
+        // 每輪上限都大於 Acquire::https::Timeout（20 秒），apt 內建重試才有機會生效
+        assert.match(step.run, /Acquire::https::Timeout=20/);
         const updateExhausted = runInstall(fn, { updateFailures: 99 });
         assert.match(updateExhausted.stdout, /FAILED/);
-        assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 3, 'update 最多 3 輪');
+        assert.equal(count(updateExhausted.calls, /^apt-get .* update$/gm), 3, '無快取時 update 最多 3 輪（Cloudflare-only 不重試）');
         assert.equal(count(updateExhausted.calls, /--download-only/g), 0);
 
         // 慢鏡像：下載前兩輪被砍，第三輪成功（半成品續傳由 apt 負責，這裡驗證「會再試」且只解包一次）
