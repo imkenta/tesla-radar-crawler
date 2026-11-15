@@ -31,7 +31,7 @@ runs:
   using: composite
   steps:
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: '20'
 
@@ -39,7 +39,7 @@ runs:
     # ECONNRESET 就整個 npm ci 失敗、primary 在 11 秒內死於 setup（9/9 19:03 SHARD5）。
     # 快取瀏覽器讓命中時完全不必下載。
     - name: Cache Puppeteer browsers
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.cache/puppeteer
         key: puppeteer-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
@@ -68,7 +68,7 @@ runs:
 
     - name: Cache Cloudflare WARP apt packages
       id: cache-warp-apt
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.warp-apt-cache
         key: warp-apt-${{ runner.os }}-${{ steps.runner-image.outputs.version }}-${{ hashFiles('.github/workflows/plate-sync.yml', '.github/workflows/plate-shard-lane.yml') }}-${{ hashFiles('.github/actions/setup-plate-runner/action.yml') }}

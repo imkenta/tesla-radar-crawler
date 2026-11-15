@@ -14,6 +14,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const yaml = require('js-yaml');
 
 const WORKFLOWS = [
@@ -37,7 +38,8 @@ const functionOf = (step) => {
 // 在假 sudo／timeout／apt-get／dpkg 下執行安裝函式。
 //   updateFailures／downloadFailures／unpackFailures：各階段前 N 次呼叫失敗（模擬卡住被 timeout 砍掉＝124）
 //   budget：WARP_APT_BUDGET（秒）；假 timeout 不會真的等，所以只用來驗證「各階段上限被剩餘預算夾住」
-function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFailures = 0, budget, cache } = {}) {
+//   cacheFiles：放進假 HOME/.warp-apt-cache 的檔案（檔名→內容）；uris：假 apt-get --print-uris 的輸出；aptCache：假 apt-cache show 的輸出
+function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFailures = 0, budget, cache, cacheFiles, uris = '', aptCache = '', downloadExit = 124 } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'warp-'));
     try {
         const bin = path.join(dir, 'bin');
@@ -50,29 +52,45 @@ function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFa
         write('timeout', `echo "timeout $3" >> "${log}"; shift 3; exec "$@"`);
         write('sleep', 'exit 0');
         write('dpkg', `echo "dpkg $*" >> "${log}"; exit 0`);
+        const aptCacheFile = path.join(dir, 'apt-cache.txt');
+        fs.writeFileSync(aptCacheFile, aptCache);
+        write('apt-cache', `echo "apt-cache $*" >> "${log}"; cat "${aptCacheFile}"`);
+        // macOS 沒有 sha256sum，用 node 算（輸出格式同 coreutils）
+        for (const bits of ['256']) {
+            fs.writeFileSync(path.join(bin, `sha${bits}sum`), `#!/usr/bin/env node\nconst c=require('crypto'),fs=require('fs');console.log(c.createHash('sha${bits}').update(fs.readFileSync(process.argv[2])).digest('hex')+'  '+process.argv[2]);\n`, { mode: 0o755 });
+        }
+        const home = path.join(dir, 'home');
+        const archives = path.join(dir, 'archives');
+        fs.mkdirSync(path.join(home, '.warp-apt-cache'), { recursive: true });
+        fs.mkdirSync(archives);
+        for (const [name, content] of Object.entries(cacheFiles || {})) fs.writeFileSync(path.join(home, '.warp-apt-cache', name), content);
+        const urisFile = path.join(dir, 'uris.txt');
+        fs.writeFileSync(urisFile, uris);
         write('apt-get', `
 echo "apt-get $*" >> "${log}"
 case " $* " in
+  *" --print-uris "*)
+    cat "${urisFile}"; exit 0 ;;
   *" update "*)
     n=$(grep -c '^apt-get .* update$' "${log}" || true)
     if [ "$n" -le ${updateFailures} ]; then exit 124; fi ;;
   *" --download-only "*)
     n=$(grep -c -- '--download-only' "${log}" || true)
-    if [ "$n" -le ${downloadFailures} ]; then exit 124; fi ;;
+    if [ "$n" -le ${downloadFailures} ]; then exit ${downloadExit}; fi ;;
   *" install "*)
     n=$(grep -c '^apt-get .* install -y cloudflare-warp$' "${log}" || true)
     if [ "$n" -le ${unpackFailures} ]; then exit 124; fi ;;
 esac
 exit 0`);
-        const env = { PATH: `${bin}:${process.env.PATH}` };
+        const env = { PATH: `${bin}:${process.env.PATH}`, HOME: home, WARP_APT_ARCHIVES: archives };
         if (budget !== undefined) env.WARP_APT_BUDGET = String(budget);
         if (cache) env.WARP_DEB_CACHE = '1';
-        const result = spawnSync('/bin/bash', ['-e'], {
+        const result = spawnSync('/bin/bash', ['-eo', 'pipefail'], {
             input: `${fnText}\ninstall_warp_bounded && echo OK || echo FAILED`,
             encoding: 'utf8',
             env,
         });
-        return { ...result, calls: fs.readFileSync(log, 'utf8') };
+        return { ...result, calls: fs.readFileSync(log, 'utf8'), adopted: fs.readdirSync(archives).sort() };
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -98,11 +116,21 @@ for (const [file, jobName] of WORKFLOWS) {
         const restoreIdx = steps.indexOf('Restore cached WARP apt packages (shared with plate-sync)');
         assert.ok(restoreIdx >= 0 && restoreIdx < steps.indexOf('Install and Configure Cloudflare WARP'));
         const restore = job.steps[restoreIdx];
-        assert.equal(restore.uses, 'actions/cache/restore@v4');
+        assert.match(restore.uses, /^actions\/cache\/restore@[0-9a-f]{40}$/, 'action 要釘 commit SHA');
         assert.equal(restore['continue-on-error'], true);
         assert.equal(restore.with.path, '~/.warp-apt-cache');
-        assert.match(restore.with['restore-keys'], /^warp-apt-\$\{\{ runner\.os \}\}-\s*$/);
-        assert.match(step.run, /cp "\$HOME\/\.warp-apt-cache\/"\*\.deb \/var\/cache\/apt\/archives\//);
+        // M2：優先同一個 runner 映像版本的快取，沒有才退到任何版本
+        assert.deepEqual(restore.with['restore-keys'].trim().split(/\s+/), [
+            'warp-apt-${{', 'runner.os', '}}-${{', 'steps.runner-image.outputs.version', '}}-',
+            'warp-apt-${{', 'runner.os', '}}-',
+        ]);
+        const imageIdx = job.steps.findIndex((x) => x.id === 'runner-image');
+        assert.ok(imageIdx >= 0 && imageIdx < restoreIdx);
+        assert.match(job.steps[imageIdx].run, /ImageVersion/);
+        job.steps.filter((x) => x.uses).forEach((x) => assert.match(x.uses, /@[0-9a-f]{40}$/, `${x.uses} 要釘 commit SHA`));
+        // M1：不得再整批複製快取檔；只能經 adopt_verified_cached_debs 逐檔比對雜湊後放入
+        assert.doesNotMatch(step.run, /cp "\$HOME\/\.warp-apt-cache\/"\*\.deb/);
+        assert.match(step.run, /--print-uris cloudflare-warp/);
         assert.match(step.run, /WARP_DEB_CACHE=1/);
         // 鏡像卡住時改用 archive.ubuntu.com（只改 mirror 清單檔內容），update 與下載失敗後都會呼叫
         assert.match(step.run, /use_fallback_ubuntu_mirror\(\) \{[\s\S]*?\/etc\/apt\/apt-mirrors\.txt[\s\S]*?https:\/\/archive\.ubuntu\.com\/ubuntu\//);
@@ -167,7 +195,9 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls = cached.calls.match(/^apt-get .* update$/gm);
         assert.equal(updateCalls.length, 1);
         assert.match(updateCalls[0], /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list/);
-        assert.deepEqual(cached.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 100s', 'timeout 120s']);
+        assert.deepEqual(cached.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 20s', 'timeout 100s', 'timeout 120s']);
+        assert.match(cached.stdout, /could not list the packages apt expects/);
+        assert.deepEqual(cached.adopted, []);
         assert.doesNotMatch(cached.calls, /ForceIPv4/);
         assert.doesNotMatch(cached.calls, /Debug::Acquire/);
         // WARP 審查 H1：快取模式下 Cloudflare 索引更新失敗要再試（11/13 那型失敗），重試輪上限 40 秒並開 apt https 除錯輸出
@@ -178,7 +208,7 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls.forEach((c) => assert.match(c, /Dir::Etc::sourcelist=sources\.list\.d\/cloudflare-client\.list/));
         assert.doesNotMatch(updateCalls[0], /Debug::Acquire/);
         assert.match(updateCalls[1], /Debug::Acquire::https=true/);
-        assert.deepEqual(cachedRetried.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 40s', 'timeout 100s', 'timeout 120s']);
+        assert.deepEqual(cachedRetried.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 40s', 'timeout 20s', 'timeout 100s', 'timeout 120s']);
         assert.doesNotMatch(cachedRetried.calls, /ForceIPv4/, '快取模式的重試不換 Ubuntu 鏡像');
         assert.doesNotMatch(cachedRetried.stdout, /mirror switched/);
         const cachedExhausted = runInstall(fn, { cache: true, updateFailures: 99 });
@@ -188,6 +218,62 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls.forEach((c) => assert.match(c, /Dir::Etc::sourcelist/));
         assert.deepEqual(cachedExhausted.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 40s', 'timeout 40s']);
         assert.equal(count(cachedExhausted.calls, /--download-only/g), 0);
+        // WARP 審查 M1：快取檔逐檔比對索引裡的 SHA256，相符才放進 archives。
+        // apt --print-uris 實際只印 MD5Sum（11/15 在 runner 實測），所以 SHA256 由 apt-cache show「套件=版本」取得、以 MD5 對應紀錄。
+        const sha = (alg, text) => crypto.createHash(alg).update(text).digest('hex');
+        const record = (pkg, md5Of, shaOf) => `Package: ${pkg}\nSize: 1\nMD5sum: ${sha('md5', md5Of)}\nSHA1: x\nSHA256: ${sha('sha256', shaOf)}\nSHA512: y\nDescription: z\n`;
+        const verified = runInstall(fn, {
+            cache: true,
+            cacheFiles: {
+                'good_1%3a2.0-1_amd64v3.deb': 'A', 'direct_1_amd64.deb': 'B', 'tampered_1_amd64.deb': 'EVIL',
+                'md5collide_1_amd64.deb': 'FORGED', 'norecord_1_amd64.deb': 'C', 'stale_0.9_amd64.deb': 'D', 'escape_1_amd64.deb': 'E',
+            },
+            uris: [
+                `'http://x/good.deb' good_1%3a2.0-1_amd64v3.deb 1 MD5Sum:${sha('md5', 'A')}`,
+                `'http://x/direct.deb' direct_1_amd64.deb 1 SHA256:${sha('sha256', 'B')}`,
+                `'http://x/tampered.deb' tampered_1_amd64.deb 4 MD5Sum:${sha('md5', 'ORIGINAL')}`,
+                // 假設攻擊者做得出 MD5 相同的檔案：MD5 對得上、SHA256 對不上，必須被拒絕
+                `'http://x/md5collide.deb' md5collide_1_amd64.deb 1 MD5Sum:${sha('md5', 'GENUINE')}`,
+                `'http://x/norecord.deb' norecord_1_amd64.deb 1 MD5Sum:${sha('md5', 'C')}`,
+                `'http://x/missing.deb' missing_1_amd64.deb 1 MD5Sum:${sha('md5', 'Z')}`,
+                `'http://x/escape.deb' ../home/.warp-apt-cache/escape_1_amd64.deb 1 MD5Sum:${sha('md5', 'E')}`,
+                `'http://x/nohash.deb' nohash_1_amd64.deb 1 `,
+                '',
+            ].join('\n'),
+            aptCache: [record('good', 'A', 'A'), record('tampered', 'ORIGINAL', 'ORIGINAL'), record('md5collide', 'GENUINE', 'GENUINE'), record('escape', 'E', 'E')].join('\n'),
+        });
+        assert.match(verified.stdout, /OK/, verified.stderr);
+        assert.deepEqual(verified.adopted, ['direct_1_amd64.deb', 'good_1%3a2.0-1_amd64v3.deb'], '只有 SHA256 相符的快取檔會被採用；不在清單內的舊版也不會');
+        assert.match(verified.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 3 rejected, 2 not in cache/);
+        assert.match(verified.stdout, /3 cached \.deb file\(s\) failed SHA256 verification/);
+        // apt-cache 以「套件=版本」查詢，檔名裡的 %3a 還原成 epoch 的冒號；只查快取裡有的檔
+        const specLine = verified.calls.match(/^apt-cache show (.*)$/m)[1].split(' ');
+        assert.deepEqual(specLine, ['good=1:2.0-1', 'direct=1', 'tampered=1', 'md5collide=1', 'norecord=1']);
+        // 無快取模式完全不碰快取目錄
+        const noCacheMode = runInstall(fn, { cacheFiles: { 'direct_1_amd64.deb': 'A' }, uris: `'http://x/direct.deb' direct_1_amd64.deb 1 SHA256:${sha('sha256', 'A')}\n` });
+        assert.deepEqual(noCacheMode.adopted, []);
+        assert.doesNotMatch(noCacheMode.calls, /--print-uris/);
+        // WARP 審查 M2：快取模式下第一次下載被 apt 回報錯誤（例：清單過期 404＝exit 100）→ 補一次完整 update（不限 Cloudflare 來源）並重新比對快取；只做一次
+        const cachedDownloadRetry = runInstall(fn, { cache: true, downloadFailures: 2, downloadExit: 100 });
+        assert.match(cachedDownloadRetry.stdout, /OK/, cachedDownloadRetry.stderr);
+        updateCalls = cachedDownloadRetry.calls.match(/^apt-get .* update$/gm);
+        assert.equal(updateCalls.length, 2, 'Cloudflare-only 一次＋完整 update 一次');
+        assert.match(updateCalls[0], /Dir::Etc::sourcelist/);
+        assert.doesNotMatch(updateCalls[1], /Dir::Etc::sourcelist/);
+        assert.equal(count(cachedDownloadRetry.calls, /--print-uris/g), 2);
+        assert.deepEqual(cachedDownloadRetry.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 20s', 'timeout 100s', 'timeout 45s', 'timeout 20s', 'timeout 100s', 'timeout 100s', 'timeout 120s']);
+        const order2 = cachedDownloadRetry.calls.match(/^apt-get .*$/gm).map((l) => (/update$/.test(l) ? 'update' : /--print-uris/.test(l) ? 'uris' : /--download-only/.test(l) ? 'download' : 'unpack'));
+        assert.deepEqual(order2, ['update', 'uris', 'download', 'update', 'uris', 'download', 'download', 'unpack']);
+        // 下載是被 timeout 砍掉（124＝連線卡住）時不補完整 update，時間留給下載重試
+        const cachedDownloadStalled = runInstall(fn, { cache: true, downloadFailures: 2 });
+        assert.match(cachedDownloadStalled.stdout, /OK/, cachedDownloadStalled.stderr);
+        assert.equal(count(cachedDownloadStalled.calls, /^apt-get .* update$/gm), 1);
+        assert.equal(count(cachedDownloadStalled.calls, /--print-uris/g), 1);
+        assert.equal(count(cachedDownloadStalled.calls, /--download-only/g), 3);
+        // 無快取模式即使 apt 回報錯誤也不補（前面已做過完整 update）
+        const plainDownloadError = runInstall(fn, { downloadFailures: 1, downloadExit: 100 });
+        assert.match(plainDownloadError.stdout, /OK/, plainDownloadError.stderr);
+        assert.equal(count(plainDownloadError.calls, /^apt-get .* update$/gm), 1);
         // 每輪上限都大於 Acquire::https::Timeout（20 秒），apt 內建重試才有機會生效
         assert.match(step.run, /Acquire::https::Timeout=20/);
         const updateExhausted = runInstall(fn, { updateFailures: 99 });
@@ -201,6 +287,7 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.equal(count(slowDownload.calls, /--download-only/g), 3);
         assert.equal(count(slowDownload.calls, /^apt-get .* install -y cloudflare-warp$/gm), 1);
         assert.equal(count(slowDownload.calls, /^dpkg /gm), 0, '下載階段被砍不碰 dpkg');
+        assert.equal(count(slowDownload.calls, /^apt-get .* update$/gm), 1, '無快取模式下載失敗不補完整 update（前面已做過）');
 
         const downloadExhausted = runInstall(fn, { downloadFailures: 99 });
         assert.match(downloadExhausted.stdout, /FAILED/);

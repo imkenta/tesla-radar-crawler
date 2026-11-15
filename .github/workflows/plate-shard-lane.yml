@@ -48,7 +48,7 @@ jobs:
       deadline_epoch: ${{ steps.budget.outputs.deadline_epoch }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 2026-08-31：1080→1140。lane 結束後只剩 verify(~15s)+finalize(~60s)，1140s
       # 預算下 workflow 最晚 ~T+20.4 收工；下一班 dispatch 最多排隊 ~30s（僅在
@@ -96,7 +96,7 @@ jobs:
       # status 與 deadline_epoch）是它取得 primary 結局與 lane 預算的唯一管道。
       - name: Publish primary outcome for the hot spare
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: plate-sync-result-${{ inputs.shard }}
           # 一併帶上已完成站清單，讓接手的備援機續爬而非從第一站重來。
@@ -158,7 +158,7 @@ jobs:
       status: ${{ steps.crawl.outputs.status }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 2026-09-04：primary 若在開爬前死於 setup（apt 慢/逾時）不會留 artifact，備援機
       # 以自己的起跑時間推算同一份 lane 預算整個接手（兩者同輪同秒發車）。
