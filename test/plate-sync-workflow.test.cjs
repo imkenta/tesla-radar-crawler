@@ -234,7 +234,7 @@ test('shard lane gate 只有在 primary 成功或 bounded recovery 完成時放�
 
 test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries', () => {
     const setupStep = getLaneStep('primary', 'Setup primary crawler runner');
-    const cacheStep = getStep('Cache Cloudflare WARP apt packages');
+    const cacheStep = getStep('Restore cached Cloudflare WARP apt packages');
     const installStep = getStep('Install and Configure Cloudflare WARP');
 
     assert.equal(setupStep['timeout-minutes'], 10);
@@ -243,17 +243,19 @@ test('WARP 安裝有獨立上限、HTTPS Ubuntu mirror 與 bounded apt retries',
     assert.match(installStep.run, /timeout --signal=TERM --kill-after=15s 240s/);
     assert.match(installStep.run, /Acquire::Retries=2/);
     assert.doesNotMatch(installStep.run, /sudo apt-get update &&/);
-    // 2026-09-04：快取命中直裝本地 .deb（零 apt-get update）；未命中只更新 Cloudflare 單一來源
-    assert.match(installStep.run, /install_warp "\$WARP_DEB"/);
+    // 2026-11-16（WARP 審查 M1b）：快取檔逐檔驗 SHA256 才採用；⛔ 不得再用本地路徑安裝或整批複製快取檔
+    // （行為測試在 setup-action-warp-cache.test.cjs）。平常只更新 Cloudflare 單一來源，不碰 Ubuntu 鏡像。
+    assert.doesNotMatch(installStep.run, /install_warp "\$WARP_DEB"/);
+    assert.doesNotMatch(installStep.run, /cp "\$HOME\/\.warp-apt-cache\/"\*\.deb/);
     assert.match(installStep.run, /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
     assert.match(installStep.run, /APT::Get::List-Cleanup=0/);
-    assert.match(cacheStep.with.key, /plate-shard-lane\.yml/);
-    // 2026-09-23：映像換版後內建索引指向已下架的相依版本（404）→ 兩條安裝路徑失敗時
-    // 都要退回有上限的完整 apt-get update 再重裝；快取鍵帶映像版本，新映像只付一次代價。
+    // 2026-09-23：映像換版後內建索引指向已下架的相依版本（404）→ 安裝失敗時
+    // 退回有上限的完整 apt-get update 再重裝。
     assert.match(installStep.run, /refresh_all_indexes\(\)/);
-    assert.match(installStep.run, /if \[ "\$WARP_INSTALLED" != "true" \]; then\s+if ! refresh_all_indexes; then/);
-    assert.match(installStep.run, /install_warp cloudflare-warp/);
-    assert.match(cacheStep.with.key, /steps\.runner-image\.outputs\.version/);
+    assert.match(installStep.run, /if \[ "\$INSTALLED" != "true" \]; then\s+if ! refresh_all_indexes; then/);
+    assert.match(installStep.run, /install -y cloudflare-warp/);
+    assert.match(cacheStep.uses, /^actions\/cache\/restore@[0-9a-f]{40}$/);
+    assert.match(cacheStep.with['restore-keys'], /steps\.runner-image\.outputs\.version/);
     assert.match(getStep('Detect runner image version').run, /ImageVersion/);
     // 2026-09-10：npm ci 需重試（Puppeteer 下載 ECONNRESET 曾秒殺 primary），並快取瀏覽器
     const installDeps = getStep('Install Dependencies');

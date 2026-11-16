@@ -58,24 +58,31 @@ runs:
         echo "::error::npm ci failed after 3 attempts."
         exit 1
 
-    # 2026-09-23：快取鍵帶 runner 映像版本。相依套件版本跟著映像的 apt 索引走，新映像
-    # 第一次跑會 restore 舊映像的 .deb（restore-keys）、走完整刷新 fallback 後以新鍵
-    # 存下；之後同映像的輪次直接命中，不必每輪都刷 Ubuntu 索引。
+    # 2026-11-16（WARP 審查 M1b）：這份快取的 .deb 會以 root 安裝，而 main 上任何 job 都寫得進 warp-apt-* 快取；
+    # 握有 Gemini／Supabase 金鑰的車牌同步不能直接信任它。所以：
+    #   1. 只還原（actions/cache/restore），不再用整合版 actions/cache 在 job 結束時原樣存回。
+    #   2. 安裝步驟逐檔比對 apt 索引的 SHA256 才採用快取檔（見下方 install_warp_verified）。
+    #   3. 安裝後快取目錄只留這一輪 apt archives 內的檔（全部經 apt 或上面的比對驗過），
+    #      以「映像版本＋檔名清單雜湊」為鍵另存；內容沒變就不存。Cloudflare 出新版 WARP 時檔名改變 → 自動存新鍵，
+    #      下一輪起又是零下載。競標兩支 workflow 用 restore-keys 取同映像最新的一份。
     - name: Detect runner image version
       id: runner-image
       shell: bash
       run: echo "version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
-    - name: Cache Cloudflare WARP apt packages
+    - name: Restore cached Cloudflare WARP apt packages
       id: cache-warp-apt
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.warp-apt-cache
-        key: warp-apt-${{ runner.os }}-${{ steps.runner-image.outputs.version }}-${{ hashFiles('.github/workflows/plate-sync.yml', '.github/workflows/plate-shard-lane.yml') }}-${{ hashFiles('.github/actions/setup-plate-runner/action.yml') }}
+        # 主鍵刻意不會命中（每輪唯一、也不會被存下），一律由 restore-keys 取最新一份：先同映像版本，再任何版本。
+        key: warp-apt-${{ runner.os }}-${{ steps.runner-image.outputs.version }}-lookup-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: |
+          warp-apt-${{ runner.os }}-${{ steps.runner-image.outputs.version }}-
           warp-apt-${{ runner.os }}-
 
     - name: Install and Configure Cloudflare WARP
+      id: install-warp
       shell: bash
       env:
         SUPABASE_URL: ${{ inputs.supabase-url }}
@@ -96,104 +103,146 @@ runs:
           fi
         done
 
-        sudo cp "$HOME/.warp-apt-cache/"*.deb /var/cache/apt/archives/ 2>/dev/null \
-          && echo "Cache hit: restored .deb packages to apt archives." \
-          || echo "Cache miss: packages will be downloaded fresh this run."
         echo 'APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs > /dev/null
 
-        # 2026-09-04：快取命中→直接裝本地 .deb，完全跳過 apt-get update。9/3-9/4 runner
-        # 對 Ubuntu 鏡像的 apt-get update 慢到 90s×2 逾時，setup 被拖到 7-10 分鐘、連
-        # primary 都死在 setup（SHARD5 10:03/10:23）。本地 .deb 不需要任何索引刷新，
-        # 相依套件由 runner 映像既有的 apt 清單解析。
-        # 從 /var/cache/apt/archives 取（上方已從快取複製過去；root 擁有，apt 的 _apt 沙箱
-        # 使用者必能讀取，避免 $HOME 權限造成 unsandboxed 警告或失敗）。
-        # 2026-09-23：runner 映像換版（ubuntu24/20260920）後，映像內建的 Ubuntu 索引指向
-        # 已被 archive 下架的相依版本（gstreamer1.0-plugins-good 1.24.2-1ubuntu1.6，
-        # archive 已到 1.7），快取裡只有舊映像用的 1.5 → 本地裝與只刷 Cloudflare 索引
-        # 兩條路都 404。任一條失敗時，才以有上限的完整 apt-get update（含 Ubuntu 鏡像）
-        # 刷新索引後重裝一次；舊映像/快取齊全的輪次仍完全不碰 Ubuntu 鏡像。
-        refresh_all_indexes() {
-          for ATTEMPT in 1 2; do
-            echo "apt-get update (all sources, fallback) attempt $ATTEMPT/2..."
-            if sudo timeout --signal=TERM --kill-after=15s 90s \
-              apt-get \
-                -o Acquire::Retries=2 \
-                -o Acquire::http::Timeout=15 \
-                -o Acquire::https::Timeout=20 \
-                -o Dpkg::Use-Pty=0 \
-                update; then
+        # 安裝流程（2026-11-16 起）：
+        #   1. 只更新 Cloudflare 單一來源的索引（最多 3 輪 30／40／40 秒；不碰 Ubuntu 鏡像，
+        #      Ubuntu 套件清單沿用 runner 映像內建的——9/3–9/4 Ubuntu 鏡像的 update 慢到 90 秒×2 逾時，所以平常不刷）。
+        #   2. 有快取時逐檔比對 SHA256，相符才放進 apt archives（adopt_verified_cached_debs，與競標 workflow 逐字相同）。
+        #   3. 按名稱安裝 cloudflare-warp。快取齊全時「Need to get 0 B」，不連 Ubuntu 鏡像。
+        #      ⛔ 不得再用本地路徑安裝快取裡的 .deb（apt 對本地檔完全不驗雜湊），也不得整批複製快取檔。
+        #   4. 上面任一步失敗（Cloudflare 索引抓不到；或映像內建清單指向已下架的相依版本而 404，9/23 實例）
+        #      → 有上限的完整 apt-get update（含 Ubuntu 鏡像）後，重新比對快取、重裝一次。
+        # 版本：一律裝 Cloudflare 索引的現行版（索引只保留最新一版，舊版 .deb 無從驗證）。
+        install_warp_verified() {
+          local APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=20 -o Dpkg::Use-Pty=0)
+          local ARCHIVES="${WARP_APT_ARCHIVES:-/var/cache/apt/archives}"
+          local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false TRY CAP
+
+          adopt_verified_cached_debs() {
+            local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
+            local SPECS=() MD5_TO_SHA=""
+            URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
+                     env DEBIAN_FRONTEND=noninteractive \
+                     apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
+            if [ -z "$URIS" ]; then
+              echo "::warning::could not list the packages apt expects; cached .deb files are not used."
               return 0
             fi
-            echo "::warning::Full apt-get update attempt $ATTEMPT failed or timed out."
-            if [ "$ATTEMPT" -lt 2 ]; then sleep 5; fi
-          done
-          return 1
-        }
-
-        install_warp() {
-          sudo timeout --signal=TERM --kill-after=15s 240s \
-            env DEBIAN_FRONTEND=noninteractive \
-            apt-get \
-              -o Acquire::Retries=2 \
-              -o Acquire::http::Timeout=15 \
-              -o Acquire::https::Timeout=20 \
-              -o Dpkg::Use-Pty=0 \
-              install -y "$1"
-        }
-
-        WARP_INSTALLED=false
-        WARP_DEB=$(ls /var/cache/apt/archives/cloudflare-warp*.deb 2>/dev/null | head -n 1 || true)
-        if [ -n "$WARP_DEB" ]; then
-          echo "Cache hit: installing $WARP_DEB directly (no apt-get update)."
-          if install_warp "$WARP_DEB"; then
-            WARP_INSTALLED=true
-          else
-            echo "::warning::Cloudflare WARP local .deb installation failed; refreshing all apt indexes and retrying."
-          fi
-        else
-          # 快取未命中：只刷新 Cloudflare 單一來源的索引，不碰 Ubuntu 鏡像
-          # （sourcelist 指到 cloudflare-client.list、sourceparts 清空、List-Cleanup=0
-          # 保留 runner 映像既有清單供相依解析）。
-          APT_UPDATED=false
-          for ATTEMPT in 1 2; do
-            echo "apt-get update (Cloudflare repo only) attempt $ATTEMPT/2..."
-            if sudo timeout --signal=TERM --kill-after=15s 90s \
-              apt-get \
-                -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list \
-                -o Dir::Etc::sourceparts=- \
-                -o APT::Get::List-Cleanup=0 \
-                -o Acquire::Retries=2 \
-                -o Acquire::http::Timeout=15 \
-                -o Acquire::https::Timeout=20 \
-                -o Dpkg::Use-Pty=0 \
-                update; then
-              APT_UPDATED=true
-              break
+            # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
+            # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
+            while read -r _ NAME SIZE HASH; do
+              case "$NAME" in ''|*/*|.*) continue ;; esac
+              [ -f "$CACHE_DIR/$NAME" ] || continue
+              VER="${NAME#*_}"; VER="${VER%%_*}"; VER="${VER//%3a/:}"; VER="${VER//%3A/:}"
+              SPECS+=("${NAME%%_*}=${VER}")
+            done <<< "$URIS"
+            if [ "${#SPECS[@]}" -gt 0 ]; then
+              # 每行「md5 sha256」；不用關聯陣列（測試也在 bash 3.2 上跑）
+              MD5_TO_SHA=$(timeout --signal=TERM --kill-after=10s 20s apt-cache show "${SPECS[@]}" 2>/dev/null | awk '
+                /^MD5sum: /  { md = $2 }
+                /^SHA256: /  { sha = $2 }
+                /^$/         { if (md != "" && sha != "") print md, sha; md = ""; sha = "" }
+                END          { if (md != "" && sha != "") print md, sha }' || true)
             fi
-            echo "::warning::apt-get update attempt $ATTEMPT failed or timed out."
-            if [ "$ATTEMPT" -lt 2 ]; then sleep 5; fi
-          done
-          if [ "$APT_UPDATED" = "true" ] && install_warp cloudflare-warp; then
-            WARP_INSTALLED=true
+            while read -r _ NAME SIZE HASH; do
+              case "$NAME" in ''|*/*|.*) continue ;; esac
+              if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+              ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
+              case "$ALG" in
+                SHA256) WANT="$HEX" ;;
+                MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
+              esac
+              ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
+              if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
+                OK=$((OK + 1))
+              else
+                BAD=$((BAD + 1))
+              fi
+            done <<< "$URIS"
+            echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
+            if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
+            return 0
+          }
+
+          cloudflare_only_update() {
+            for TRY in 1 2 3; do
+              CAP=30
+              local DEBUG_OPTS=()
+              if [ "$TRY" -gt 1 ]; then CAP=40; DEBUG_OPTS=(-o Debug::Acquire::https=true); fi
+              echo "apt-get update (Cloudflare repo only) attempt $TRY/3 (cap ${CAP}s)..."
+              if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
+                apt-get "${APT_OPTS[@]}" "${DEBUG_OPTS[@]}" \
+                  -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list \
+                  -o Dir::Etc::sourceparts=- \
+                  -o APT::Get::List-Cleanup=0 \
+                  update; then
+                return 0
+              fi
+              echo "::warning::apt-get update (Cloudflare repo only) attempt $TRY failed or timed out."
+              if [ "$TRY" -lt 3 ]; then sleep 3; fi
+            done
+            return 1
+          }
+
+          refresh_all_indexes() {
+            for TRY in 1 2; do
+              echo "apt-get update (all sources, fallback) attempt $TRY/2..."
+              if sudo timeout --signal=TERM --kill-after=15s 90s \
+                apt-get "${APT_OPTS[@]}" update; then
+                return 0
+              fi
+              echo "::warning::Full apt-get update attempt $TRY failed or timed out."
+              if [ "$TRY" -lt 2 ]; then sleep 5; fi
+            done
+            return 1
+          }
+
+          install_warp() {
+            sudo timeout --signal=TERM --kill-after=15s 240s \
+              env DEBIAN_FRONTEND=noninteractive \
+              apt-get "${APT_OPTS[@]}" install -y cloudflare-warp
+          }
+
+          if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then HAVE_CACHE=true; fi
+
+          if cloudflare_only_update; then
+            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs; fi
+            if install_warp; then
+              INSTALLED=true
+            else
+              echo "::warning::Cloudflare WARP installation failed; refreshing all apt indexes and retrying."
+            fi
           else
-            echo "::warning::Cloudflare-only install path failed; refreshing all apt indexes and retrying."
+            echo "::warning::Cloudflare-only apt index update failed; refreshing all apt indexes and retrying."
           fi
-        fi
 
-        if [ "$WARP_INSTALLED" != "true" ]; then
-          if ! refresh_all_indexes; then
-            echo "::error::Unable to refresh apt indexes after bounded retries."
-            exit 1
+          if [ "$INSTALLED" != "true" ]; then
+            if ! refresh_all_indexes; then
+              echo "::error::Unable to refresh apt indexes after bounded retries."
+              return 1
+            fi
+            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs; fi
+            if ! install_warp; then
+              echo "::error::Cloudflare WARP package installation failed or timed out."
+              return 1
+            fi
           fi
-          if ! install_warp cloudflare-warp; then
-            echo "::error::Cloudflare WARP package installation failed or timed out."
-            exit 1
-          fi
-        fi
 
-        mkdir -p "$HOME/.warp-apt-cache"
-        sudo cp /var/cache/apt/archives/*.deb "$HOME/.warp-apt-cache/" 2>/dev/null || true
-        sudo chown -R "$(id -u):$(id -g)" "$HOME/.warp-apt-cache"
+          # 快取目錄只留這一輪 apt archives 內的檔：還原進來但沒通過比對（或已不在清單內）的檔不再存回去。
+          mkdir -p "$CACHE_DIR"
+          rm -f "$CACHE_DIR"/*.deb
+          sudo cp "$ARCHIVES"/*.deb "$CACHE_DIR/" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+          WARP_CACHE_KEY=""
+          if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
+            WARP_CACHE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-$(cd "$CACHE_DIR" && ls -- *.deb | LC_ALL=C sort | sha256sum | cut -c1-32)"
+          fi
+          return 0
+        }
+
+        if ! install_warp_verified; then exit 1; fi
+        echo "cache-key=$WARP_CACHE_KEY" >> "$GITHUB_OUTPUT"
 
         sudo warp-cli registration new --accept-tos 2>/dev/null || \
         sudo warp-cli --accept-tos registration new 2>/dev/null || true
@@ -299,6 +348,14 @@ runs:
           echo "::error::Split-tunnel canary changed IP; Gemini bypass is not proven."
           exit 1
         fi
+
+    - name: Save verified Cloudflare WARP apt packages
+      if: steps.install-warp.outputs.cache-key != '' && steps.install-warp.outputs.cache-key != steps.cache-warp-apt.outputs.cache-matched-key
+      continue-on-error: true
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.warp-apt-cache
+        key: ${{ steps.install-warp.outputs.cache-key }}
 
     - name: Verify IP and MVDIS Connectivity
       shell: bash
