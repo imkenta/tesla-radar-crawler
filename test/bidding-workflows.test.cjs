@@ -30,9 +30,12 @@ function load(file, jobName) {
 }
 
 const functionOf = (step) => {
+    // M6：adopt_verified_cached_debs 與 install_warp_bounded 都是 YAML 內的頂層函式（由 warp-apt-lib.sh 產生）
+    const adopt = step.run.match(/^adopt_verified_cached_debs\(\) \{[\s\S]*?^\}$/m);
     const fn = step.run.match(/^install_warp_bounded\(\) \{[\s\S]*?^\}$/m);
+    assert.ok(adopt, '找不到 adopt_verified_cached_debs');
     assert.ok(fn, '找不到 install_warp_bounded');
-    return fn[0];
+    return `${adopt[0]}\n${fn[0]}`;
 };
 
 // 在假 sudo／timeout／apt-get／dpkg 下執行安裝函式。

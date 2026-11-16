@@ -117,57 +117,59 @@ runs:
         #   4. 上面任一步失敗（Cloudflare 索引抓不到；或映像內建清單指向已下架的相依版本而 404，9/23 實例）
         #      → 有上限的完整 apt-get update（含 Ubuntu 鏡像）後，重新比對快取、重裝一次。
         # 版本：一律裝 Cloudflare 索引的現行版（索引只保留最新一版，舊版 .deb 無從驗證）。
+        # >>> warp-apt-lib: adopt_verified_cached_debs（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
+        adopt_verified_cached_debs() {
+          local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
+          local SPECS=() MD5_TO_SHA=""
+          URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
+                   env DEBIAN_FRONTEND=noninteractive \
+                   apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
+          if [ -z "$URIS" ]; then
+            echo "::warning::could not list the packages apt expects; cached .deb files are not used."
+            return 0
+          fi
+          # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
+          # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
+          while read -r _ NAME SIZE HASH; do
+            case "$NAME" in ''|*/*|.*) continue ;; esac
+            [ -f "$CACHE_DIR/$NAME" ] || continue
+            VER="${NAME#*_}"; VER="${VER%%_*}"; VER="${VER//%3a/:}"; VER="${VER//%3A/:}"
+            SPECS+=("${NAME%%_*}=${VER}")
+          done <<< "$URIS"
+          if [ "${#SPECS[@]}" -gt 0 ]; then
+            # 每行「md5 sha256」；不用關聯陣列（測試也在 bash 3.2 上跑）
+            MD5_TO_SHA=$(timeout --signal=TERM --kill-after=10s 20s apt-cache show "${SPECS[@]}" 2>/dev/null | awk '
+              /^MD5sum: /  { md = $2 }
+              /^SHA256: /  { sha = $2 }
+              /^$/         { if (md != "" && sha != "") print md, sha; md = ""; sha = "" }
+              END          { if (md != "" && sha != "") print md, sha }' || true)
+          fi
+          while read -r _ NAME SIZE HASH; do
+            case "$NAME" in ''|*/*|.*) continue ;; esac
+            if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+            ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
+            case "$ALG" in
+              SHA256) WANT="$HEX" ;;
+              MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
+            esac
+            ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
+            if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
+              OK=$((OK + 1))
+            else
+              BAD=$((BAD + 1))
+            fi
+          done <<< "$URIS"
+          echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
+          if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
+          return 0
+        }
+        # <<< warp-apt-lib: adopt_verified_cached_debs
+        # >>> warp-apt-lib: install_warp_verified（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
         install_warp_verified() {
           local APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=20 -o Dpkg::Use-Pty=0)
           local ARCHIVES="${WARP_APT_ARCHIVES:-/var/cache/apt/archives}"
           local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false REJECTED=false TRY CAP BASE_KEY PRE_LIST="" POST_LIST
           local ADOPT_LOG="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/warp-adopt.$$.log"
-
-          adopt_verified_cached_debs() {
-            local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
-            local SPECS=() MD5_TO_SHA=""
-            URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
-                     env DEBIAN_FRONTEND=noninteractive \
-                     apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
-            if [ -z "$URIS" ]; then
-              echo "::warning::could not list the packages apt expects; cached .deb files are not used."
-              return 0
-            fi
-            # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
-            # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
-            while read -r _ NAME SIZE HASH; do
-              case "$NAME" in ''|*/*|.*) continue ;; esac
-              [ -f "$CACHE_DIR/$NAME" ] || continue
-              VER="${NAME#*_}"; VER="${VER%%_*}"; VER="${VER//%3a/:}"; VER="${VER//%3A/:}"
-              SPECS+=("${NAME%%_*}=${VER}")
-            done <<< "$URIS"
-            if [ "${#SPECS[@]}" -gt 0 ]; then
-              # 每行「md5 sha256」；不用關聯陣列（測試也在 bash 3.2 上跑）
-              MD5_TO_SHA=$(timeout --signal=TERM --kill-after=10s 20s apt-cache show "${SPECS[@]}" 2>/dev/null | awk '
-                /^MD5sum: /  { md = $2 }
-                /^SHA256: /  { sha = $2 }
-                /^$/         { if (md != "" && sha != "") print md, sha; md = ""; sha = "" }
-                END          { if (md != "" && sha != "") print md, sha }' || true)
-            fi
-            while read -r _ NAME SIZE HASH; do
-              case "$NAME" in ''|*/*|.*) continue ;; esac
-              if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
-              ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
-              case "$ALG" in
-                SHA256) WANT="$HEX" ;;
-                MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
-              esac
-              ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
-              if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
-                OK=$((OK + 1))
-              else
-                BAD=$((BAD + 1))
-              fi
-            done <<< "$URIS"
-            echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
-            if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
-            return 0
-          }
 
           cloudflare_only_update() {
             for TRY in 1 2 3; do
@@ -261,6 +263,7 @@ runs:
           fi
           return 0
         }
+        # <<< warp-apt-lib: install_warp_verified
 
         if ! install_warp_verified; then exit 1; fi
         echo "cache-key=$WARP_CACHE_KEY" >> "$GITHUB_OUTPUT"

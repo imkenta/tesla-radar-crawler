@@ -8,6 +8,7 @@
     "start": "node gh-plate-sync.cjs",
     "sync": "node gh-plate-sync.cjs",
     "sync:speed-camera": "node speed-camera-sync.cjs --dry-run",
+    "sync:warp-lib": "node scripts/sync-warp-lib.cjs",
     "test": "node --test \"test/**/*.test.cjs\""
   },
   "dependencies": {

@@ -67,6 +67,54 @@ jobs:
           #   job 上限 10 分鐘：330 ＋ checkout 與金鑰約 5 ＋ WARP 設定約 30 ＋ Verify IP 最多約 25 ＋ 後續最大 201 ≈ 590 秒，
           #   仍在 600 內但餘裕只剩約 10 秒（舊版單次 240 秒 install 的最壞情況本來就會超過）。
           # Acquire::Retries=2／Timeout=15／20 維持不變：log 顯示它們有在作用（Ign: 後重試），調大只會讓每次卡住更久。
+          # >>> warp-apt-lib: adopt_verified_cached_debs（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
+          adopt_verified_cached_debs() {
+            local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
+            local SPECS=() MD5_TO_SHA=""
+            URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
+                     env DEBIAN_FRONTEND=noninteractive \
+                     apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
+            if [ -z "$URIS" ]; then
+              echo "::warning::could not list the packages apt expects; cached .deb files are not used."
+              return 0
+            fi
+            # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
+            # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
+            while read -r _ NAME SIZE HASH; do
+              case "$NAME" in ''|*/*|.*) continue ;; esac
+              [ -f "$CACHE_DIR/$NAME" ] || continue
+              VER="${NAME#*_}"; VER="${VER%%_*}"; VER="${VER//%3a/:}"; VER="${VER//%3A/:}"
+              SPECS+=("${NAME%%_*}=${VER}")
+            done <<< "$URIS"
+            if [ "${#SPECS[@]}" -gt 0 ]; then
+              # 每行「md5 sha256」；不用關聯陣列（測試也在 bash 3.2 上跑）
+              MD5_TO_SHA=$(timeout --signal=TERM --kill-after=10s 20s apt-cache show "${SPECS[@]}" 2>/dev/null | awk '
+                /^MD5sum: /  { md = $2 }
+                /^SHA256: /  { sha = $2 }
+                /^$/         { if (md != "" && sha != "") print md, sha; md = ""; sha = "" }
+                END          { if (md != "" && sha != "") print md, sha }' || true)
+            fi
+            while read -r _ NAME SIZE HASH; do
+              case "$NAME" in ''|*/*|.*) continue ;; esac
+              if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+              ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
+              case "$ALG" in
+                SHA256) WANT="$HEX" ;;
+                MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
+              esac
+              ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
+              if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
+                OK=$((OK + 1))
+              else
+                BAD=$((BAD + 1))
+              fi
+            done <<< "$URIS"
+            echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
+            if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
+            return 0
+          }
+          # <<< warp-apt-lib: adopt_verified_cached_debs
+          # >>> warp-apt-lib: install_warp_bounded（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
           install_warp_bounded() {
             local DEADLINE=$((SECONDS + ${WARP_APT_BUDGET:-330}))
             local UNPACK_RESERVE=60
@@ -98,51 +146,6 @@ jobs:
             # （已驗簽的索引）預期的檔名、再向 apt-cache 取 SHA256，逐檔比對相符才放進 archives；不符、查不到雜湊或不在清單內的
             # 一律不用，由 apt 自行下載。來自別的映像版本的快取（M2）也因此只會被略過，不會被誤用。
             local ARCHIVES="${WARP_APT_ARCHIVES:-/var/cache/apt/archives}"
-            adopt_verified_cached_debs() {
-              local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
-              local SPECS=() MD5_TO_SHA=""
-              URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
-                       env DEBIAN_FRONTEND=noninteractive \
-                       apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
-              if [ -z "$URIS" ]; then
-                echo "::warning::could not list the packages apt expects; cached .deb files are not used."
-                return 0
-              fi
-              # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
-              # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
-              while read -r _ NAME SIZE HASH; do
-                case "$NAME" in ''|*/*|.*) continue ;; esac
-                [ -f "$CACHE_DIR/$NAME" ] || continue
-                VER="${NAME#*_}"; VER="${VER%%_*}"; VER="${VER//%3a/:}"; VER="${VER//%3A/:}"
-                SPECS+=("${NAME%%_*}=${VER}")
-              done <<< "$URIS"
-              if [ "${#SPECS[@]}" -gt 0 ]; then
-                # 每行「md5 sha256」；不用關聯陣列（測試也在 bash 3.2 上跑）
-                MD5_TO_SHA=$(timeout --signal=TERM --kill-after=10s 20s apt-cache show "${SPECS[@]}" 2>/dev/null | awk '
-                  /^MD5sum: /  { md = $2 }
-                  /^SHA256: /  { sha = $2 }
-                  /^$/         { if (md != "" && sha != "") print md, sha; md = ""; sha = "" }
-                  END          { if (md != "" && sha != "") print md, sha }' || true)
-              fi
-              while read -r _ NAME SIZE HASH; do
-                case "$NAME" in ''|*/*|.*) continue ;; esac
-                if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
-                ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
-                case "$ALG" in
-                  SHA256) WANT="$HEX" ;;
-                  MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
-                esac
-                ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
-                if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
-                  OK=$((OK + 1))
-                else
-                  BAD=$((BAD + 1))
-                fi
-              done <<< "$URIS"
-              echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
-              if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
-              return 0
-            }
 
             # 2026-11-15（WARP 審查 H1）：只更新 Cloudflare 來源的那一輪原本只跑 1 次、上限 20 秒＝Acquire::https::Timeout，
             # apt 自己的重試來不及生效；11/13 那次失敗就是索引 0.6 秒抓完後卡 19.4 秒被砍。改成：
@@ -234,6 +237,7 @@ jobs:
             done
             return 1
           }
+          # <<< warp-apt-lib: install_warp_bounded
           # 有快取的 .deb：update 直接只更新 Cloudflare 來源，不去碰 Ubuntu 鏡像；
           # 快取檔在函式內逐檔比對雜湊後才放進 apt 的 archives（見 adopt_verified_cached_debs）。
           WARP_DEB_CACHE=0

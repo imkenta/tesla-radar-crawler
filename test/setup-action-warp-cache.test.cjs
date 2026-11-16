@@ -23,10 +23,13 @@ const installStep = step('Install and Configure Cloudflare WARP');
 const restoreStep = step('Restore cached Cloudflare WARP apt packages');
 const saveStep = step('Save verified Cloudflare WARP apt packages');
 
+const ADOPT_RE = /^adopt_verified_cached_debs\(\) \{[\s\S]*?^\}$/m;
 const fnMatch = installStep.run.match(/^install_warp_verified\(\) \{[\s\S]*?^\}$/m);
+const adoptMatch = installStep.run.match(ADOPT_RE);
 assert.ok(fnMatch, '找不到 install_warp_verified');
-const FN = fnMatch[0];
-const ADOPT_RE = /^ {2}adopt_verified_cached_debs\(\) \{[\s\S]*?^ {2}\}$/m;
+assert.ok(adoptMatch, '找不到 adopt_verified_cached_debs');
+const FN = `${adoptMatch[0]}\n${fnMatch[0]}`;
+const { sync, libFunctions, TARGETS } = require('../scripts/sync-warp-lib.cjs');
 const sha = (alg, text) => crypto.createHash(alg).update(text).digest('hex');
 const record = (pkg, content) => `Package: ${pkg}\nMD5sum: ${sha('md5', content)}\nSHA256: ${sha('sha256', content)}\nDescription: z\n`;
 const uri = (name, content) => `'http://x/${name}' ${name} 1 MD5Sum:${sha('md5', content)}`;
@@ -143,19 +146,51 @@ test('結構：只還原快取、安裝後另存；action 釘 commit SHA；沒�
     assert.match(code, /if \[ -f "\$DEB" \] && \[ ! -L "\$DEB" \]; then sudo cp "\$DEB" "\$CACHE_DIR\/"/);
 });
 
-test('adopt_verified_cached_debs 與兩支競標 workflow 逐字相同（三份必須一起改）', () => {
-    const mine = FN.match(ADOPT_RE);
-    assert.ok(mine, 'action 內找不到 adopt_verified_cached_debs');
-    for (const [file, job] of [['bidding-plates-sync.yml', 'sync-bidding-plates'], ['bid-announce-sync.yml', 'sync-announcements']]) {
-        const wf = yaml.load(fs.readFileSync(path.join(root, '.github', 'workflows', file), 'utf8'));
-        const run = wf.jobs[job].steps.find((s) => s.name === 'Install and Configure Cloudflare WARP').run;
-        const theirs = run.match(ADOPT_RE);
-        assert.ok(theirs, `${file} 內找不到 adopt_verified_cached_debs`);
-        assert.equal(mine[0], theirs[0], file);
+test('M6：三支 YAML 內的安裝函式都由 warp-apt-lib.sh 產生且逐字同步；不在 runner 上載入外部檔', () => {
+    assert.deepEqual(sync({ write: false }), [], '有 YAML 與 lib 不同步：請跑 npm run sync:warp-lib');
+    const fns = libFunctions();
+    assert.deepEqual(Object.keys(fns).sort(), ['adopt_verified_cached_debs', 'install_warp_bounded', 'install_warp_verified']);
+    const runOf = (file) => {
+        const doc = yaml.load(fs.readFileSync(path.join(root, file), 'utf8'));
+        const all = doc.runs ? doc.runs.steps : Object.values(doc.jobs)[0].steps;
+        return all.find((s) => s.name === 'Install and Configure Cloudflare WARP').run;
+    };
+    for (const [file, names] of Object.entries(TARGETS)) {
+        const run = runOf(file);
+        for (const name of names) {
+            // 區段外不得另有同名定義；區段內容＝lib 的函式本文
+            assert.equal(count(run, new RegExp(`^\\s*${name}\\(\\) \\{`, 'gm')), 1, `${file} 的 ${name} 只能有一份`);
+            assert.ok(run.includes(fns[name]), `${file} 的 ${name} 與 lib 不同`);
+        }
+        // 驗證邏輯必須是 inline：還原快取可寫到工作區任何位置（M1c），不得 source／執行 repo 內的 .sh
+        assert.doesNotMatch(run, /(^|[;&|]\s*|\s)(source|\.)\s+\S*\.sh|warp-apt-lib\.sh"?\s*$/m, `${file} 不得載入外部腳本`);
     }
-    // adopt 依賴外層的 APT_OPTS 與 ARCHIVES
-    assert.match(FN, /local APT_OPTS=\(/);
-    assert.match(FN, /local ARCHIVES="\$\{WARP_APT_ARCHIVES:-\/var\/cache\/apt\/archives\}"/);
+    // adopt 依賴呼叫端的 APT_OPTS 與 ARCHIVES
+    for (const name of ['install_warp_bounded', 'install_warp_verified']) {
+        assert.match(fns[name], /local APT_OPTS=\(/);
+        assert.match(fns[name], /local ARCHIVES="\$\{WARP_APT_ARCHIVES:-\/var\/cache\/apt\/archives\}"/);
+    }
+});
+
+test('M6：快取的生產端與消費端約定——path 字串相同、另存的鍵落在消費端 restore-keys 的前綴內', () => {
+    const consumers = [['bidding-plates-sync.yml', 'sync-bidding-plates'], ['bid-announce-sync.yml', 'sync-announcements']].map(([file, job]) => {
+        const wf = yaml.load(fs.readFileSync(path.join(root, '.github', 'workflows', file), 'utf8'));
+        return wf.jobs[job].steps.find((s) => /^actions\/cache\/restore@/.test(s.uses || ''));
+    });
+    // actions/cache 的 cache version 由 path 字串決定：寫法不同（例如 $HOME 與 ~）就互相看不到
+    for (const s of [restoreStep, saveStep, ...consumers]) assert.equal(s.with.path, '~/.warp-apt-cache');
+    const key = run({ index: INDEX }).stdout.match(/key=(\S+)/)[1];
+    const resolve = (t) => t.replace('${{ runner.os }}', 'Linux').replace('${{ steps.runner-image.outputs.version }}', '20261111.196.1');
+    for (const s of [restoreStep, ...consumers]) {
+        const prefixes = s.with['restore-keys'].trim().split('\n').map((l) => resolve(l.trim()));
+        assert.equal(prefixes.length, 2);
+        prefixes.forEach((p) => {
+            assert.doesNotMatch(p, /\$\{\{/, `未預期的 expression：${p}`);
+            assert.ok(key.startsWith(p), `${key} 不在前綴 ${p} 內`);
+        });
+        // 主鍵不得與另存的鍵同形（否則會變成精確命中而跳過 restore-keys 的「取最新」）
+        assert.ok(!resolve(s.with.key).includes('-debs-'));
+    }
 });
 
 test('快取齊全且正確：全部採用、不下載、不碰 Ubuntu 鏡像；快取鍵由檔名清單決定', () => {
