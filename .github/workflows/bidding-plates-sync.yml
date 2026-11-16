@@ -80,12 +80,13 @@ jobs:
             local NET_OPTS=()
             use_fallback_ubuntu_mirror() {
               NET_OPTS=(-o Acquire::ForceIPv4=true)
-              if [ -f /etc/apt/apt-mirrors.txt ] && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+              local MIRRORS="${WARP_APT_MIRRORS_FILE:-/etc/apt/apt-mirrors.txt}"
+              if [ -f "$MIRRORS" ] && grep -q 'azure\.archive\.ubuntu\.com' "$MIRRORS"; then
                 local FAM
                 for FAM in 4 6; do
                   echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
                 done
-                sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' /etc/apt/apt-mirrors.txt || true
+                sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$MIRRORS" || true
                 echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
               fi
             }

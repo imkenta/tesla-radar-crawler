@@ -51,6 +51,13 @@ function runInstall(fnText, { updateFailures = 0, downloadFailures = 0, unpackFa
         // timeout --signal=TERM --kill-after=10s <secs>s cmd...  → 記錄上限秒數後直接執行（保留被包的指令結束碼）
         write('timeout', `echo "timeout $3" >> "${log}"; shift 3; exec "$@"`);
         write('sleep', 'exit 0');
+        // WARP 審查 M3：函式裡的 curl（鏡像連線探測）不得真的連網路——鏡像卡住時每次探測要等滿 5 秒，
+        // 會把 CI 的測試拖到數分鐘。鏡像清單檔也改用假的（真的 /etc/apt/apt-mirrors.txt 只有 Linux runner 才有）。
+        write('curl', `echo "curl $*" >> "${log}"; printf '200/0.01s'`);
+        // macOS 的 sed -i 語法與 GNU 不同：`sed -i -E <運算式> <檔案>` 交給 perl 就地執行同一個運算式
+        write('sed', 'if [ "$1" = "-i" ] && [ "$2" = "-E" ]; then exec perl -pi -e "$3" "$4"; fi; exec /usr/bin/sed "$@"');
+        const mirrors = path.join(dir, 'apt-mirrors.txt');
+        fs.writeFileSync(mirrors, 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n');
         write('dpkg', `echo "dpkg $*" >> "${log}"; exit 0`);
         const aptCacheFile = path.join(dir, 'apt-cache.txt');
         fs.writeFileSync(aptCacheFile, aptCache);
@@ -82,7 +89,7 @@ case " $* " in
     if [ "$n" -le ${unpackFailures} ]; then exit 124; fi ;;
 esac
 exit 0`);
-        const env = { PATH: `${bin}:${process.env.PATH}`, HOME: home, WARP_APT_ARCHIVES: archives };
+        const env = { PATH: `${bin}:${process.env.PATH}`, HOME: home, WARP_APT_ARCHIVES: archives, WARP_APT_MIRRORS_FILE: mirrors };
         if (budget !== undefined) env.WARP_APT_BUDGET = String(budget);
         if (cache) env.WARP_DEB_CACHE = '1';
         const result = spawnSync('/bin/bash', ['-eo', 'pipefail'], {
@@ -90,7 +97,7 @@ exit 0`);
             encoding: 'utf8',
             env,
         });
-        return { ...result, calls: fs.readFileSync(log, 'utf8'), adopted: fs.readdirSync(archives).sort() };
+        return { ...result, calls: fs.readFileSync(log, 'utf8'), adopted: fs.readdirSync(archives).sort(), mirrors: fs.readFileSync(mirrors, 'utf8') };
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -133,7 +140,7 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(step.run, /--print-uris cloudflare-warp/);
         assert.match(step.run, /WARP_DEB_CACHE=1/);
         // 鏡像卡住時改用 archive.ubuntu.com（只改 mirror 清單檔內容），update 與下載失敗後都會呼叫
-        assert.match(step.run, /use_fallback_ubuntu_mirror\(\) \{[\s\S]*?\/etc\/apt\/apt-mirrors\.txt[\s\S]*?https:\/\/archive\.ubuntu\.com\/ubuntu\//);
+        assert.match(step.run, /use_fallback_ubuntu_mirror\(\) \{[\s\S]*?WARP_APT_MIRRORS_FILE:-\/etc\/apt\/apt-mirrors\.txt[\s\S]*?https:\/\/archive\.ubuntu\.com\/ubuntu\//);
         assert.ok((step.run.match(/^\s*use_fallback_ubuntu_mirror$/gm) || []).length >= 2);
         assert.match(step.run, /Acquire::Retries=2/);
         assert.match(step.run, /Acquire::http::Timeout=15/);
@@ -173,6 +180,15 @@ for (const [file, jobName] of WORKFLOWS) {
         updateCalls.forEach((c) => assert.doesNotMatch(c, /Dir::Etc::sourcelist/));
         assert.deepEqual(updateRetried.calls.match(/^timeout .*$/gm).slice(0, 2), ['timeout 30s', 'timeout 45s']);
         assert.doesNotMatch(updateRetried.stdout, /falling back to Cloudflare-only/);
+        // 換鏡像：清單檔內的 azure 鏡像被換成 archive.ubuntu.com，並各量一次 IPv4／IPv6 兩個鏡像的連線（共 4 次 curl，上限 5 秒）
+        assert.match(updateRetried.stdout, /mirror switched to archive\.ubuntu\.com/);
+        assert.doesNotMatch(updateRetried.mirrors, /azure\.archive/);
+        assert.equal(count(updateRetried.mirrors, /https:\/\/archive\.ubuntu\.com\/ubuntu\//g), 2);
+        const probes = updateRetried.calls.match(/^curl .*$/gm);
+        assert.equal(probes.length, 4);
+        probes.forEach((c) => assert.match(c, /^curl -[46] .* -m 5 /));
+        assert.match(clean.mirrors, /azure\.archive/, '正常路徑不動鏡像清單');
+        assert.equal(count(clean.calls, /^curl /gm), 0);
         // 第 1 輪失敗後，之後所有 apt 呼叫都強制 IPv4；正常路徑不加
         assert.doesNotMatch(updateCalls[0], /ForceIPv4/);
         assert.match(updateCalls[1], /Acquire::ForceIPv4=true/);
