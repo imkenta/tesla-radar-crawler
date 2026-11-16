@@ -13,8 +13,10 @@ jobs:
   sync-bidding-plates:
     runs-on: ubuntu-latest
     # 防止單次 run 卡死霸佔 concurrency slot（GitHub 預設 360 分=6 小時）。
-    # 正常只跑 1~2 分，設 10 分綽綽有餘。此 workflow 跑得快、每 10 分觸發不會重疊，故不需 guard。
-    timeout-minutes: 10
+    # 正常只跑 1~2 分。每 10 分觸發一次、cancel-in-progress: false：超過 10 分的那一輪會讓下一輪排隊（最多等 2 分），不會被取消。
+    # 2026-11-16（WARP 審查 M4）：10→12 分。有上限的步驟（還原快取 1 分＋WARP 安裝 7 分）加上其餘步驟的觀測最大值
+    # （checkout／Verify IP／Setup Node／npm ci／同步，合計約 231 秒）是 711 秒，原本的 600 秒在最壞情況下會砍在同步中途。
+    timeout-minutes: 12
 
     steps:
       - name: Checkout Code
@@ -31,6 +33,11 @@ jobs:
       - name: Restore cached WARP apt packages (shared with plate-sync)
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         continue-on-error: true
+        # 2026-11-16（WARP 審查 M5）：還原卡住時最多等 1 分鐘（正常 2–5 秒）。分段下載逾時預設是 10 分鐘＝整個 job 的上限；
+        # 逾時由 continue-on-error 吃掉，後面走無快取路徑。
+        timeout-minutes: 1
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
         with:
           path: ~/.warp-apt-cache
           key: warp-apt-${{ runner.os }}-bidding-readonly-${{ github.run_id }}
@@ -64,8 +71,8 @@ jobs:
           #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊／連線 ~25 ≈ 6 分鐘（步驟上限 7 分鐘）；
           #   極端（金鑰下載也卡滿 96 秒）由 7 分鐘步驟上限把關，明確失敗。
           #   後續步驟（Setup Node＋npm ci＋同步）p50 19 秒、p99 191 秒、max 201 秒（11/5–11/10 共 767 輪）；
-          #   job 上限 10 分鐘：330 ＋ checkout 與金鑰約 5 ＋ WARP 設定約 30 ＋ Verify IP 最多約 25 ＋ 後續最大 201 ≈ 590 秒，
-          #   仍在 600 內但餘裕只剩約 10 秒（舊版單次 240 秒 install 的最壞情況本來就會超過）。
+          #   job 上限 12 分鐘（11/16 起）：還原快取 ≤60 ＋ 本步驟 ≤420 ＋ 其餘步驟觀測最大值約 231（checkout 約 5、Verify IP 最多約 25、
+          #   後續最大 201；這三個是觀測值，沒有步驟上限）＝711 秒 < 720 秒。
           # Acquire::Retries=2／Timeout=15／20 維持不變：log 顯示它們有在作用（Ign: 後重試），調大只會讓每次卡住更久。
           # >>> warp-apt-lib: adopt_verified_cached_debs（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
           adopt_verified_cached_debs() {

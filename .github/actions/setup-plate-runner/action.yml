@@ -75,6 +75,10 @@ runs:
     - name: Restore cached Cloudflare WARP apt packages
       id: cache-warp-apt
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # 2026-11-16（WARP 審查 M5）：composite action 的步驟不能設 timeout-minutes，改縮短分段下載逾時
+      # （預設 10 分鐘＝整個 setup 的上限；正常 2–5 秒）。
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
       with:
         path: ~/.warp-apt-cache
         # 主鍵刻意不會命中（每輪唯一、也不會被存下），一律由 restore-keys 取最新一份：先同映像版本，再任何版本。

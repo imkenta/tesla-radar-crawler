@@ -114,6 +114,9 @@ test('結構：只還原快取、安裝後另存；action 釘 commit SHA；沒�
     // 帶金鑰的 job 不得再用「還原＋job 結束原樣存回」的整合版 actions/cache 處理 warp-apt 快取
     assert.ok(!steps.some((s) => /^actions\/cache@/.test(s.uses || '') && /warp-apt/.test(s.with.key)));
     assert.equal(restoreStep.with.path, '~/.warp-apt-cache');
+    // M5：composite 步驟不能設 timeout-minutes，以分段下載逾時代替
+    assert.equal(restoreStep.env.SEGMENT_DOWNLOAD_TIMEOUT_MINS, '2');
+    assert.equal(restoreStep['timeout-minutes'], undefined);
     assert.equal(saveStep.with.path, '~/.warp-apt-cache');
     // 主鍵每輪唯一（不會命中）；restore-keys 先同映像版本、再任何版本
     assert.match(restoreStep.with.key, /lookup-\$\{\{ github\.run_id \}\}/);
