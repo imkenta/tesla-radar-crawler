@@ -35,7 +35,7 @@ const uri = (name, content) => `'http://x/${name}' ${name} 1 MD5Sum:${sha('md5',
 //   cacheFiles：還原進來的快取檔（檔名→內容）；index：apt 索引預期的檔（檔名→正版內容）
 //   cfUpdateFailures：Cloudflare-only update 前 N 次失敗；installFailures：install 前 N 次失敗（不下載）
 //   假 apt-get install 成功時，會把 index 內、archives 還沒有的檔以正版內容「下載」進 archives（模擬 apt 自行下載）
-function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0 } = {}) {
+function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0, matchedKey = '' } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-warp-'));
     try {
         const bin = path.join(dir, 'bin');
@@ -85,7 +85,7 @@ exit 0`);
         const result = spawnSync('/bin/bash', ['-eo', 'pipefail'], {
             input: `${FN}\nif install_warp_verified; then echo "RESULT=OK key=$WARP_CACHE_KEY"; else echo RESULT=FAILED; fi`,
             encoding: 'utf8',
-            env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, WARP_APT_ARCHIVES: archives, RUNNER_OS: 'Linux', ImageVersion: '20261111.196.1' },
+            env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, WARP_APT_ARCHIVES: archives, RUNNER_OS: 'Linux', ImageVersion: '20261111.196.1', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', RUNNER_TEMP: dir, WARP_CACHE_MATCHED_KEY: matchedKey },
         });
         const read = (d) => Object.fromEntries(fs.readdirSync(d).sort().map((n) => [n, fs.readFileSync(path.join(d, n), 'utf8')]));
         return { ...result, calls: fs.readFileSync(log, 'utf8'), archives: read(archives), cacheAfter: read(cacheDir) };
@@ -110,10 +110,10 @@ test('結構：只還原快取、安裝後另存；action 釘 commit SHA；沒�
         'warp-apt-${{ runner.os }}-${{ steps.runner-image.outputs.version }}-',
         'warp-apt-${{ runner.os }}-',
     ]);
-    // 另存：鍵由安裝步驟算出，與還原命中的鍵相同就不存；存檔失敗不擋
+    // 另存：鍵由安裝步驟算出（空字串＝不存，判斷邏輯見下方行為測試）；存檔失敗不擋
     assert.equal(saveStep.with.key, '${{ steps.install-warp.outputs.cache-key }}');
-    assert.match(saveStep.if, /steps\.install-warp\.outputs\.cache-key != steps\.cache-warp-apt\.outputs\.cache-matched-key/);
-    assert.match(saveStep.if, /steps\.install-warp\.outputs\.cache-key != ''/);
+    assert.equal(saveStep.if, "steps.install-warp.outputs.cache-key != ''");
+    assert.equal(installStep.env.WARP_CACHE_MATCHED_KEY, '${{ steps.cache-warp-apt.outputs.cache-matched-key }}');
     assert.equal(saveStep['continue-on-error'], true);
     assert.equal(installStep.id, 'install-warp');
     assert.equal(restoreStep.id, 'cache-warp-apt');
@@ -158,9 +158,12 @@ test('快取齊全且正確：全部採用、不下載、不碰 Ubuntu 鏡像；
     assert.match(updates[0], /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
     assert.deepEqual(r.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 20s', 'timeout 20s', 'timeout 240s']);
     assert.doesNotMatch(r.calls, /UNEXPECTED-INSTALL/);
-    // 同一組檔名 → 同一個鍵（與還原命中的鍵相同時 workflow 不另存）
-    const again = run({ cacheFiles: { ...INDEX }, index: INDEX });
-    assert.equal(again.stdout.match(/key=(\S+)/)[1], r.stdout.match(/key=(\S+)/)[1]);
+    // 還原命中的鍵已是同一組檔名的鍵（含自癒鍵 -heal-*）→ 不另存
+    const key = r.stdout.match(/key=(\S+)/)[1];
+    for (const matchedKey of [key, `${key}-heal-1-1`]) {
+        const again = run({ cacheFiles: { ...INDEX }, index: INDEX, matchedKey });
+        assert.match(again.stdout, /RESULT=OK key=\n/, `命中 ${matchedKey} 時不該另存`);
+    }
 });
 
 test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄改檔不會存回快取', () => {
@@ -170,6 +173,12 @@ test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄�
     assert.match(r.calls, /^downloaded cloudflare-warp_2026\.8\.2115\.0_amd64\.deb$/m);
     assert.deepEqual(r.archives, INDEX);
     assert.deepEqual(r.cacheAfter, INDEX, '存回快取的只有 archives 內的正版');
+    // 自癒：被竄改的那份是同前綴下最新的快取，正常鍵可能早已存在 → 用帶 run 編號的鍵存一份乾淨的蓋過它
+    const clean = run({ cacheFiles: { ...INDEX }, index: INDEX }).stdout.match(/key=(\S+)/)[1];
+    assert.equal(r.stdout.match(/key=(\S+)/)[1], `${clean}-heal-777-2`);
+    // 即使攻擊者把毒快取取名成正常鍵，也照樣另存
+    const disguised = run({ cacheFiles: { ...INDEX, 'libdep_1%3a2.0-1_amd64v3.deb': 'EVIL-DEP' }, index: INDEX, matchedKey: clean });
+    assert.equal(disguised.stdout.match(/key=(\S+)/)[1], `${clean}-heal-777-2`);
 });
 
 test('快取的 WARP 版本不是索引現行版（上線第一輪的實況）：舊檔不採用也不存回，鍵跟著改變', () => {

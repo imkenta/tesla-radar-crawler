@@ -63,7 +63,7 @@ runs:
     #   1. 只還原（actions/cache/restore），不再用整合版 actions/cache 在 job 結束時原樣存回。
     #   2. 安裝步驟逐檔比對 apt 索引的 SHA256 才採用快取檔（見下方 install_warp_verified）。
     #   3. 安裝後快取目錄只留這一輪 apt archives 內的檔（全部經 apt 或上面的比對驗過），
-    #      以「映像版本＋檔名清單雜湊」為鍵另存；內容沒變就不存。Cloudflare 出新版 WARP 時檔名改變 → 自動存新鍵，
+    #      以「映像版本＋檔名清單雜湊」為鍵另存；還原命中的已是同一組檔就不存（判斷在安裝步驟內）。Cloudflare 出新版 WARP 時檔名改變 → 自動存新鍵，
     #      下一輪起又是零下載。競標兩支 workflow 用 restore-keys 取同映像最新的一份。
     - name: Detect runner image version
       id: runner-image
@@ -86,6 +86,7 @@ runs:
       shell: bash
       env:
         SUPABASE_URL: ${{ inputs.supabase-url }}
+        WARP_CACHE_MATCHED_KEY: ${{ steps.cache-warp-apt.outputs.cache-matched-key }}
       run: |
         curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 \
           https://pkg.cloudflareclient.com/pubkey.gpg \
@@ -117,7 +118,8 @@ runs:
         install_warp_verified() {
           local APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=20 -o Dpkg::Use-Pty=0)
           local ARCHIVES="${WARP_APT_ARCHIVES:-/var/cache/apt/archives}"
-          local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false TRY CAP
+          local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false REJECTED=false TRY CAP BASE_KEY
+          local ADOPT_LOG="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/warp-adopt.$$.log"
 
           adopt_verified_cached_debs() {
             local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
@@ -207,7 +209,7 @@ runs:
           if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then HAVE_CACHE=true; fi
 
           if cloudflare_only_update; then
-            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs; fi
+            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs | tee -a "$ADOPT_LOG"; fi
             if install_warp; then
               INSTALLED=true
             else
@@ -222,7 +224,7 @@ runs:
               echo "::error::Unable to refresh apt indexes after bounded retries."
               return 1
             fi
-            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs; fi
+            if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs | tee -a "$ADOPT_LOG"; fi
             if ! install_warp; then
               echo "::error::Cloudflare WARP package installation failed or timed out."
               return 1
@@ -234,9 +236,20 @@ runs:
           rm -f "$CACHE_DIR"/*.deb
           sudo cp "$ARCHIVES"/*.deb "$CACHE_DIR/" 2>/dev/null || true
           sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+          # 另存的鍵（空字串＝不存）：
+          #   還原命中的鍵已經是這組檔名的鍵 → 不存；
+          #   有快取檔沒通過比對（竄改或損毀）→ 那份快取是同前綴下最新的一份，而正常鍵可能早已存在、存不進去；
+          #     改用帶 run 編號的鍵存一份乾淨的蓋過它，否則之後每一輪都會拒絕同一批檔、重新下載。
           WARP_CACHE_KEY=""
+          if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
+          rm -f "$ADOPT_LOG"
           if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
-            WARP_CACHE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-$(cd "$CACHE_DIR" && ls -- *.deb | LC_ALL=C sort | sha256sum | cut -c1-32)"
+            BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-$(cd "$CACHE_DIR" && ls -- *.deb | LC_ALL=C sort | sha256sum | cut -c1-32)"
+            if [ "$REJECTED" = "true" ]; then
+              WARP_CACHE_KEY="${BASE_KEY}-heal-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
+            elif [[ "${WARP_CACHE_MATCHED_KEY:-}" != "$BASE_KEY"* ]]; then
+              WARP_CACHE_KEY="$BASE_KEY"
+            fi
           fi
           return 0
         }
@@ -350,7 +363,7 @@ runs:
         fi
 
     - name: Save verified Cloudflare WARP apt packages
-      if: steps.install-warp.outputs.cache-key != '' && steps.install-warp.outputs.cache-key != steps.cache-warp-apt.outputs.cache-matched-key
+      if: steps.install-warp.outputs.cache-key != ''
       continue-on-error: true
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
