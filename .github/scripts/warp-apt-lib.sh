@@ -8,7 +8,7 @@
 # ⛔ 不要改成在 runner 上 source 這個檔：actions/cache 的還原可以寫到工作區任何位置（M1c），
 #    快取驗證邏輯必須留在還原步驟碰不到的地方（workflow／action 的 inline script）。
 #
-# 行為測試：test/bidding-workflows.test.cjs、test/setup-action-warp-cache.test.cjs（直接執行本檔的函式）。
+# 行為測試：test/bidding-workflows.test.cjs、test/setup-action-warp-cache.test.cjs（執行 YAML 內的副本；同步檢查保證與本檔相同）。
 
 # 逐檔比對快取 .deb 的 SHA256，相符才放進 apt archives。
 # 依賴呼叫端（install_warp_bounded／install_warp_verified）的區域變數 APT_OPTS 與 ARCHIVES（bash 動態作用域）。

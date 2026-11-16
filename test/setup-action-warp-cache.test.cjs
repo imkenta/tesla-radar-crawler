@@ -161,12 +161,31 @@ test('M6：三支 YAML 內的安裝函式都由 warp-apt-lib.sh 產生且逐字�
     for (const [file, names] of Object.entries(TARGETS)) {
         const run = runOf(file);
         for (const name of names) {
-            // 區段外不得另有同名定義；區段內容＝lib 的函式本文
-            assert.equal(count(run, new RegExp(`^\\s*${name}\\(\\) \\{`, 'gm')), 1, `${file} 的 ${name} 只能有一份`);
+            // 區段外不得另有同名定義（含 function 關鍵字與 name () 寫法）；區段內容＝lib 的函式本文
+            const defs = new RegExp(`^\\s*(function\\s+)?${name}\\s*\\(\\)\\s*\\{|^\\s*function\\s+${name}\\b`, 'gm');
+            assert.equal(count(run, defs), 1, `${file} 的 ${name} 只能有一份`);
             assert.ok(run.includes(fns[name]), `${file} 的 ${name} 與 lib 不同`);
         }
-        // 驗證邏輯必須是 inline：還原快取可寫到工作區任何位置（M1c），不得 source／執行 repo 內的 .sh
-        assert.doesNotMatch(run, /(^|[;&|]\s*|\s)(source|\.)\s+\S*\.sh|warp-apt-lib\.sh"?\s*$/m, `${file} 不得載入外部腳本`);
+        // 驗證邏輯必須是 inline：還原快取可寫到工作區任何位置（M1c）。整份檔案（任何步驟）除了註解行，
+        // 都不得提到 lib 檔或 .github/scripts（source／bash／eval cat 等任何載入方式都算）
+        const code = fs.readFileSync(path.join(root, file), 'utf8').split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
+        assert.doesNotMatch(code, /warp-apt-lib\.sh|\.github\/scripts/, `${file} 不得載入外部腳本`);
+    }
+    // 同步工具本身：結束標記重複（區段後殘留內容）要報錯，不得靜默通過
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'warp-sync-'));
+    try {
+        for (const rel of ['scripts/sync-warp-lib.cjs', '.github/scripts/warp-apt-lib.sh', ...Object.keys(TARGETS)]) {
+            fs.mkdirSync(path.dirname(path.join(tmp, rel)), { recursive: true });
+            fs.copyFileSync(path.join(root, rel), path.join(tmp, rel));
+        }
+        const victim = path.join(tmp, '.github/workflows/bidding-plates-sync.yml');
+        const end = '          # <<< warp-apt-lib: adopt_verified_cached_debs';
+        fs.writeFileSync(victim, fs.readFileSync(victim, 'utf8').replace(end, `${end}\n          echo extra\n${end}`));
+        const r = spawnSync(process.execPath, [path.join(tmp, 'scripts/sync-warp-lib.cjs'), '--check'], { encoding: 'utf8' });
+        assert.notEqual(r.status, 0, '結束標記重複時 --check 必須失敗');
+        assert.match(r.stderr, /結束標記要剛好一個/);
+    } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
     }
     // adopt 依賴呼叫端的 APT_OPTS 與 ARCHIVES
     for (const name of ['install_warp_bounded', 'install_warp_verified']) {

@@ -151,21 +151,25 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(step.run, /if ! install_warp_bounded; then[\s\S]*?exit 1/);
         // 不得再有「下載＋解包」合一、固定 240 秒的 install
         assert.doesNotMatch(step.run, /kill-after=15s 240s/);
-        // 步驟上限 < job 上限，job 上限不動；步驟後要留給 Setup Node＋npm ci＋同步（p99 191 秒、max 201 秒）
+        // 步驟上限 < job 上限；步驟後要留給 Setup Node＋npm ci＋同步（p99 191 秒、max 201 秒）
         const stepMin = step['timeout-minutes'];
         assert.equal(stepMin, 7);
         // M5：還原快取有步驟上限與分段下載逾時；逾時不擋後續
         assert.equal(restore['timeout-minutes'], 1);
-        assert.equal(restore.env.SEGMENT_DOWNLOAD_TIMEOUT_MINS, '1');
+        // 分段下載逾時要小於步驟上限，action 才有機會自己放棄（否則永遠是步驟上限先到）
+        assert.ok(Number(restore.env.SEGMENT_DOWNLOAD_TIMEOUT_MINS) * 60 < restore['timeout-minutes'] * 60);
+        assert.equal(restore.env.SEGMENT_DOWNLOAD_TIMEOUT_MINS, '0.5');
         // M4：job 上限要蓋得住「有上限的步驟（從 YAML 讀）＋其餘步驟的觀測最大值」。
-        // 觀測值（11/5–11/10 共 767 輪）：checkout 約 5 秒、Verify IP 最多約 25 秒、Setup Node＋npm ci＋同步最大 201 秒；
+        // 觀測值（競標同步 11/5–11/10 共 767 輪；公告同步借用）：checkout 約 6 秒、Verify IP 最多約 25 秒、Setup Node＋npm ci＋同步最大 201 秒、
+        // job 準備／收尾與步驟逾時的終止寬限約 14 秒；
         // 這些步驟沒有 timeout，所以 job 上限才是最後一道，數字變大時要回來調。
-        const OBSERVED_UNCAPPED_MAX_S = 5 + 25 + 201;
+        const OBSERVED_UNCAPPED_MAX_S = 6 + 25 + 201 + 14;
         const capped = job.steps.filter((x) => x['timeout-minutes']).map((x) => x['timeout-minutes'] * 60);
         assert.deepEqual(capped, [60, 420], '有上限的步驟：還原快取、WARP 安裝');
         const worst = capped.reduce((a, c) => a + c, 0) + OBSERVED_UNCAPPED_MAX_S;
         assert.ok(worst < job['timeout-minutes'] * 60, `最壞情況 ${worst} 秒要小於 job 上限 ${job['timeout-minutes'] * 60} 秒`);
-        assert.equal(job['timeout-minutes'], 12);
+        assert.equal(job['timeout-minutes'], 13);
+        assert.ok(job['timeout-minutes'] * 60 - worst >= 30, '至少留 30 秒餘裕');
         // 步驟內：金鑰 ≥1 秒＋函式預算（從函式讀）＋WARP 註冊／連線約 25 秒 < 步驟上限
         const budget = Number(step.run.match(/WARP_APT_BUDGET:-(\d+)/)[1]);
         assert.equal(budget, 330);

@@ -31,6 +31,8 @@ function render(yamlText, names, fns, file) {
         const found = text.match(re);
         if (!found) throw new Error(`${file} 內找不到 ${name} 的產生區段`);
         if (text.split(`# >>> warp-apt-lib: ${name}（`).length !== 2) throw new Error(`${file} 內 ${name} 的產生區段不只一個`);
+        const ends = text.match(new RegExp(`^ *# <<< warp-apt-lib: ${name}$`, 'gm')) || [];
+        if (ends.length !== 1) throw new Error(`${file} 內 ${name} 的結束標記要剛好一個（找到 ${ends.length} 個）`);
         const indent = found[1];
         const body = fns[name].split('\n').map((l) => (l ? indent + l : l)).join('\n');
         text = text.replace(re, () => `${indent}${found[2]}\n${body}\n${indent}# <<< warp-apt-lib: ${name}`);
@@ -41,17 +43,16 @@ function render(yamlText, names, fns, file) {
 // 回傳與 lib 不同步的檔案清單；write=true 時順便寫回
 function sync({ write = false } = {}) {
     const fns = libFunctions();
-    const stale = [];
+    // 先全部算完（任何一支出錯就整個中止），再寫入，避免只寫了一部分
+    const pending = [];
     for (const [file, names] of Object.entries(TARGETS)) {
         const full = path.join(ROOT, file);
         const before = fs.readFileSync(full, 'utf8');
         const after = render(before, names, fns, file);
-        if (after !== before) {
-            stale.push(file);
-            if (write) fs.writeFileSync(full, after);
-        }
+        if (after !== before) pending.push({ file, full, after });
     }
-    return stale;
+    if (write) pending.forEach(({ full, after }) => fs.writeFileSync(full, after));
+    return pending.map((x) => x.file);
 }
 
 module.exports = { sync, libFunctions, TARGETS, LIB };

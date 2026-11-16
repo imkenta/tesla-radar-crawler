@@ -76,7 +76,7 @@ runs:
       id: cache-warp-apt
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       # 2026-11-16（WARP 審查 M5）：composite action 的步驟不能設 timeout-minutes，改縮短分段下載逾時
-      # （預設 10 分鐘＝整個 setup 的上限；正常 2–5 秒）。
+      # （預設 10 分鐘＝整個 setup 的上限；正常 2–5 秒）。只管得到下載本身，查詢與解壓仍由呼叫端的 setup 上限把關。
       env:
         SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
       with:
