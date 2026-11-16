@@ -60,6 +60,8 @@ adopt_verified_cached_debs() {
       echo "::warning::no SHA256 available for cached $NAME (apt printed ${ALG:-nothing}); it will be downloaded instead."
       UNV=$((UNV + 1)); continue
     fi
+    # 大小先對不上的直接拒絕（不必把一個超大的假檔整個複製進系統碟再算雜湊）
+    if [ "$(wc -c < "$CACHE_DIR/$NAME" | tr -d ' ')" != "$SIZE" ]; then BAD=$((BAD + 1)); continue; fi
     # 先複製到 root 擁有的 archives 內，再對「複本」算雜湊，相符才改名成正式檔名：
     # 快取目錄是 runner 使用者可寫的，直接對原檔算雜湊再複製會有「算完才被換掉」的空窗。
     TMP="$ARCHIVES/$NAME.adopting"
@@ -99,12 +101,9 @@ install_warp_bounded() {
       for FAM in 4 6; do
         echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
       done
-      local SRC
-      for SRC in "$MIRRORS" /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-        if [ -f "$SRC" ]; then
-          sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$SRC" || true
-        fi
-      done
+      # 只改 mirror 清單檔的內容，不動 sources.list／ubuntu.sources 的來源 URI：URI 一變，套件清單的檔名跟著變，
+      # 沒有重新 update 就找不到 Ubuntu 套件清單（WARP 審查 L2 評估後維持原狀）。
+      sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$MIRRORS" || true
       echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
     fi
   }
@@ -152,7 +151,7 @@ install_warp_bounded() {
     sleep 3
   done
 
-  # 比對快取最多要 40 秒（列清單 20＋查雜湊 20）；剩餘預算不夠就不比對，直接下載
+  # 比對快取的兩個查詢各有 20 秒上限（另加複製與算雜湊，正常共 5–8 秒）；剩餘預算不夠就不比對，直接下載
   if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then
     REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
     if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
@@ -187,7 +186,8 @@ install_warp_bounded() {
         if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
              apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" update; then
           REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
-          if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs; fi
+          if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
+          else echo "::warning::only ${REM}s left before the unpack reserve; cached .deb files are not re-verified."; fi
         else
           echo "::warning::full apt-get update failed or timed out; continuing with existing package lists."
         fi
@@ -298,11 +298,12 @@ install_warp_verified() {
   # 另存的鍵（空字串＝不存）。鍵一律帶 run 編號：restore-keys 取的是同前綴下「最新」的一份，
   # 用固定鍵的話，只要那個鍵早就存在就存不進去，壞掉的那份會一直是最新的。
   #   不存：還原命中的鍵屬於同一組檔名，而且還原進來的目錄內容（檔名清單）與重建後完全相同。
-  #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）。
+  #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）或不是一般檔。
   #         查不到雜湊（unverifiable）不算：那不是內容被換掉，每輪另存只會洗掉快取額度。
   WARP_CACHE_KEY=""
   POST_LIST=$(ls -A "$CACHE_DIR" | LC_ALL=C sort | sha256sum | cut -c1-32)
-  if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
+  # 雜湊不符，或所需檔名被目錄／symlink 佔住（檔名清單看不出差別）→ 都要另存一份乾淨的
+  if grep -Eq 'failed SHA256 verification|is not a regular file' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
   rm -f "$ADOPT_LOG"
   if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
     BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-${POST_LIST}"

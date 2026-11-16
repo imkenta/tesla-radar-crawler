@@ -70,7 +70,7 @@ jobs:
           #   3. install          只剩解包（本機 .deb），最多 2 輪，每輪 ≤120 秒；若 TERM 落在 dpkg 中途，先 dpkg --configure -a 再續一輪。
           # 整體預算：函式起算 330 秒（WARP_APT_BUDGET 可覆寫，供測試），下載階段永遠替解包保留 60 秒；每個階段的上限
           # 都會被「剩餘預算」再夾一次，所以不會因為前面慢就讓後面無上限。
-          #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊／連線確認 ≤60 ≈ 6.5 分鐘（步驟上限 7 分鐘）；
+          #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊與連線約 10 ＋ 連線確認 ≤60 ≈ 6.7 分鐘（步驟上限 7 分鐘）；
           #   極端（金鑰下載也卡滿 96 秒）由 7 分鐘步驟上限把關，明確失敗。
           #   後續步驟（Setup Node＋npm ci＋同步）p50 19 秒、p99 191 秒、max 201 秒（11/5–11/10 共 767 輪）；
           #   job 上限 13 分鐘（11/16 起）：還原快取 ≤60 ＋ 本步驟 ≤420 ＋ 其餘步驟觀測最大值約 246（checkout 約 6、Verify IP 最多約 25、
@@ -125,6 +125,8 @@ jobs:
                 echo "::warning::no SHA256 available for cached $NAME (apt printed ${ALG:-nothing}); it will be downloaded instead."
                 UNV=$((UNV + 1)); continue
               fi
+              # 大小先對不上的直接拒絕（不必把一個超大的假檔整個複製進系統碟再算雜湊）
+              if [ "$(wc -c < "$CACHE_DIR/$NAME" | tr -d ' ')" != "$SIZE" ]; then BAD=$((BAD + 1)); continue; fi
               # 先複製到 root 擁有的 archives 內，再對「複本」算雜湊，相符才改名成正式檔名：
               # 快取目錄是 runner 使用者可寫的，直接對原檔算雜湊再複製會有「算完才被換掉」的空窗。
               TMP="$ARCHIVES/$NAME.adopting"
@@ -164,12 +166,9 @@ jobs:
                 for FAM in 4 6; do
                   echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
                 done
-                local SRC
-                for SRC in "$MIRRORS" /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-                  if [ -f "$SRC" ]; then
-                    sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$SRC" || true
-                  fi
-                done
+                # 只改 mirror 清單檔的內容，不動 sources.list／ubuntu.sources 的來源 URI：URI 一變，套件清單的檔名跟著變，
+                # 沒有重新 update 就找不到 Ubuntu 套件清單（WARP 審查 L2 評估後維持原狀）。
+                sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$MIRRORS" || true
                 echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
               fi
             }
@@ -217,7 +216,7 @@ jobs:
               sleep 3
             done
 
-            # 比對快取最多要 40 秒（列清單 20＋查雜湊 20）；剩餘預算不夠就不比對，直接下載
+            # 比對快取的兩個查詢各有 20 秒上限（另加複製與算雜湊，正常共 5–8 秒）；剩餘預算不夠就不比對，直接下載
             if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then
               REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
               if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
@@ -252,7 +251,8 @@ jobs:
                   if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                        apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" update; then
                     REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
-                    if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs; fi
+                    if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
+                    else echo "::warning::only ${REM}s left before the unpack reserve; cached .deb files are not re-verified."; fi
                   else
                     echo "::warning::full apt-get update failed or timed out; continuing with existing package lists."
                   fi
@@ -320,7 +320,7 @@ jobs:
           WARP_TRACE=""
           for WARP_WAIT in 1 2 3 4 5 6; do
             sleep 5
-            WARP_TRACE=$(curl -fsS --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+            WARP_TRACE=$(curl -4 -fsS --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
             if grep -q '^warp=on$' <<< "$WARP_TRACE"; then
               echo "WARP confirmed on after $((WARP_WAIT * 5))s."
               break

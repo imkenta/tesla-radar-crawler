@@ -174,14 +174,18 @@ for (const [file, jobName] of WORKFLOWS) {
         const budget = Number(step.run.match(/WARP_APT_BUDGET:-(\d+)/)[1]);
         assert.equal(budget, 330);
         // WARP 連線確認最多 6 輪 ×（等 5 秒＋trace 最多 5 秒）＝60 秒；沒連上就失敗（L3）
-        assert.match(step.run, /for WARP_WAIT in 1 2 3 4 5 6; do\s+sleep 5\s+WARP_TRACE=\$\(curl -fsS --max-time 5 /);
+        assert.match(step.run, /for WARP_WAIT in 1 2 3 4 5 6; do\s+sleep 5\s+WARP_TRACE=\$\(curl -4 -fsS --max-time 5 /);
         assert.match(step.run, /if ! grep -q '\^warp=on\$' <<< "\$WARP_TRACE"; then\s+echo "::error::[^\n]*\s+echo "\$WARP_TRACE"\s+exit 1/);
         assert.doesNotMatch(step.run, /^\s*sleep 15$/m);
         // Supabase IP 只取 IPv4（L4），網址由 env 傳入而不是把 secret 直接展開進腳本
         assert.match(step.run, /getent ahostsv4 "\$SUB_DOMAIN"/);
         assert.doesNotMatch(step.run.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n'), /nslookup|\$\{\{ secrets\./);
         assert.equal(step.env.SUPABASE_URL, '${{ secrets.VITE_SUPABASE_URL }}');
-        assert.ok(1 + budget + 60 < stepMin * 60);
+        // 連線確認上限從迴圈讀：輪數 ×（sleep＋curl 上限）；另留註冊與連線約 10 秒
+        const loop = step.run.match(/for WARP_WAIT in ([\d ]+); do\s+sleep (\d+)\s+WARP_TRACE=\$\(curl -4 -fsS --max-time (\d+) /);
+        const confirmMax = loop[1].trim().split(' ').length * (Number(loop[2]) + Number(loop[3]));
+        assert.equal(confirmMax, 60);
+        assert.ok(1 + budget + 10 + confirmMax < stepMin * 60);
     });
 
     test(`${file}：安裝函式行為——正常路徑各階段上限、可續傳下載重試、解包失敗後 dpkg --configure -a`, () => {

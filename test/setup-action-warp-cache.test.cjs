@@ -32,7 +32,7 @@ const FN = `${adoptMatch[0]}\n${fnMatch[0]}`;
 const { sync, libFunctions, TARGETS } = require('../scripts/sync-warp-lib.cjs');
 const sha = (alg, text) => crypto.createHash(alg).update(text).digest('hex');
 const record = (pkg, content) => `Package: ${pkg}\nMD5sum: ${sha('md5', content)}\nSHA256: ${sha('sha256', content)}\nDescription: z\n`;
-const uri = (name, content) => `'http://x/${name}' ${name} 1 MD5Sum:${sha('md5', content)}`;
+const uri = (name, content) => `'http://x/${name}' ${name} ${Buffer.byteLength(content)} MD5Sum:${sha('md5', content)}`;
 
 // 在假 sudo／timeout／apt-get／apt-cache 下執行 install_warp_verified。
 //   cacheFiles：還原進來的快取檔（檔名→內容）；index：apt 索引預期的檔（檔名→正版內容）
@@ -61,7 +61,7 @@ function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFail
         if (dirNamed) fs.mkdirSync(path.join(cacheDir, dirNamed));
         for (const [name, target] of Object.entries(symlinks)) fs.symlinkSync(target, path.join(cacheDir, name));
         const pkgOf = (name) => name.split('_')[0];
-        fs.writeFileSync(path.join(dir, 'uris.txt'), Object.entries(index).map(([n, c]) => (uriAlg ? `'http://x/${n}' ${n} 1 ${uriAlg}:${sha('sha512', c)}` : uri(n, c))).join('\n') + '\n');
+        fs.writeFileSync(path.join(dir, 'uris.txt'), Object.entries(index).map(([n, c]) => (uriAlg ? `'http://x/${n}' ${n} ${Buffer.byteLength(c)} ${uriAlg}:${sha('sha512', c)}` : uri(n, c))).join('\n') + '\n');
         fs.writeFileSync(path.join(dir, 'apt-cache.txt'), aptCacheBroken ? '' : Object.entries(index).map(([n, c]) => record(pkgOf(n), c)).join('\n'));
         const write = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
         write('sudo', 'exec "$@"');
@@ -261,6 +261,11 @@ test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄�
     assert.match(r.calls, /^downloaded cloudflare-warp_2026\.8\.2115\.0_amd64\.deb$/m);
     assert.deepEqual(r.archives, INDEX);
     assert.deepEqual(r.cacheAfter, INDEX, '存回快取的只有 archives 內的正版');
+    assert.deepEqual(Object.keys(r.archives).filter((n) => /adopting/.test(n)), [], '雜湊不符的複本要刪掉');
+    // 大小就對不上的：不複製、直接拒絕
+    const bigger = run({ cacheFiles: { ...INDEX, 'libdep_1%3a2.0-1_amd64v3.deb': 'DEP-BUT-MUCH-LONGER' }, index: INDEX });
+    assert.match(bigger.stdout, /1 verified \(SHA256\) and reused, 1 rejected \(hash mismatch\)/);
+    assert.deepEqual(bigger.archives, INDEX);
     // 檔名清單沒變、鍵名也對得上，但有檔雜湊不符 → 仍要另存一份乾淨的蓋過它
     const clean = run({ cacheFiles: { ...INDEX }, index: INDEX }).stdout.match(/key=(\S+)/)[1];
     const disguised = run({ cacheFiles: { ...INDEX, 'libdep_1%3a2.0-1_amd64v3.deb': 'EVIL-DEP' }, index: INDEX, matchedKey: clean });
@@ -296,6 +301,8 @@ test('快取裡的雜物（dotfile、非 .deb、目錄、symlink、與所需檔�
     assert.match(dir.stdout, /RESULT=OK/, dir.stderr);
     assert.deepEqual(dir.cacheAfter, INDEX, '同名目錄被換成 apt 下載的正版檔');
     assert.deepEqual(dir.archives, INDEX);
+    // 檔名清單看不出「目錄 vs 一般檔」的差別，仍要另存一份乾淨的蓋過它
+    assert.equal(dir.stdout.match(/key=(\S*)/)[1], clean);
 });
 
 test('symlink 與 apt 改印其他雜湊演算法：一律不採用，算「無法驗證」而不是雜湊不符', () => {
@@ -310,6 +317,9 @@ test('symlink 與 apt 改印其他雜湊演算法：一律不採用，算「無�
         assert.match(r.calls, /^downloaded libdep_1%3a2\.0-1_amd64v3\.deb$/m);
         assert.deepEqual(r.archives, INDEX);
         assert.deepEqual(r.cacheAfter, INDEX);
+        const cleanKey = run({ cacheFiles: { ...INDEX }, index: INDEX }).stdout.match(/key=(\S+)/)[1];
+        const again = run({ cacheFiles: { 'cloudflare-warp_2026.8.2115.0_amd64.deb': 'WARP-NEW' }, index: INDEX, matchedKey: cleanKey, symlinks: { 'libdep_1%3a2.0-1_amd64v3.deb': path.join(dir, 'real.deb') } });
+        assert.equal(again.stdout.match(/key=(\S*)/)[1], cleanKey, 'symlink 佔住所需檔名時也要另存');
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -317,8 +327,6 @@ test('symlink 與 apt 改印其他雜湊演算法：一律不採用，算「無�
     assert.match(sha512.stdout, /no SHA256 available for cached cloudflare-warp_2026\.8\.2115\.0_amd64\.deb \(apt printed SHA512\)/);
     assert.match(sha512.stdout, /0 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 2 unverifiable/);
     assert.equal(count(sha512.calls, /^downloaded /gm), 2);
-    // 沒有留下 .adopting 暫存檔
-    assert.deepEqual(Object.keys(sha512.archives).filter((n) => /adopting/.test(n)), []);
 });
 
 test('沒有快取：不呼叫比對，直接按名稱安裝並存下', () => {

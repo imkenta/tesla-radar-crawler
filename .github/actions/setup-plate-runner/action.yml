@@ -170,6 +170,8 @@ runs:
               echo "::warning::no SHA256 available for cached $NAME (apt printed ${ALG:-nothing}); it will be downloaded instead."
               UNV=$((UNV + 1)); continue
             fi
+            # 大小先對不上的直接拒絕（不必把一個超大的假檔整個複製進系統碟再算雜湊）
+            if [ "$(wc -c < "$CACHE_DIR/$NAME" | tr -d ' ')" != "$SIZE" ]; then BAD=$((BAD + 1)); continue; fi
             # 先複製到 root 擁有的 archives 內，再對「複本」算雜湊，相符才改名成正式檔名：
             # 快取目錄是 runner 使用者可寫的，直接對原檔算雜湊再複製會有「算完才被換掉」的空窗。
             TMP="$ARCHIVES/$NAME.adopting"
@@ -273,11 +275,12 @@ runs:
           # 另存的鍵（空字串＝不存）。鍵一律帶 run 編號：restore-keys 取的是同前綴下「最新」的一份，
           # 用固定鍵的話，只要那個鍵早就存在就存不進去，壞掉的那份會一直是最新的。
           #   不存：還原命中的鍵屬於同一組檔名，而且還原進來的目錄內容（檔名清單）與重建後完全相同。
-          #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）。
+          #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）或不是一般檔。
           #         查不到雜湊（unverifiable）不算：那不是內容被換掉，每輪另存只會洗掉快取額度。
           WARP_CACHE_KEY=""
           POST_LIST=$(ls -A "$CACHE_DIR" | LC_ALL=C sort | sha256sum | cut -c1-32)
-          if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
+          # 雜湊不符，或所需檔名被目錄／symlink 佔住（檔名清單看不出差別）→ 都要另存一份乾淨的
+          if grep -Eq 'failed SHA256 verification|is not a regular file' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
           rm -f "$ADOPT_LOG"
           if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
             BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-${POST_LIST}"
@@ -353,7 +356,7 @@ runs:
         fi
 
         SUB_DOMAIN=$(sed -E 's#https?://([^/]+).*#\1#' <<< "$SUPABASE_URL")
-        SUB_IP=$(getent ahostsv4 "$SUB_DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }')
+        SUB_IP=$(getent ahostsv4 "$SUB_DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
         if [ -n "$SUB_IP" ]; then
           echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
           sudo warp-cli add-excluded-route "$SUB_IP/32" 2>/dev/null || \
