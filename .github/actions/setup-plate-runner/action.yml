@@ -63,7 +63,9 @@ runs:
     #   1. 只還原（actions/cache/restore），不再用整合版 actions/cache 在 job 結束時原樣存回。
     #   2. 安裝步驟逐檔比對 apt 索引的 SHA256 才採用快取檔（見下方 install_warp_verified）。
     #   3. 安裝後快取目錄只留這一輪 apt archives 內的檔（全部經 apt 或上面的比對驗過），
-    #      以「映像版本＋檔名清單雜湊」為鍵另存；還原命中的已是同一組檔就不存（判斷在安裝步驟內）。Cloudflare 出新版 WARP 時檔名改變 → 自動存新鍵，
+    #      以「映像版本＋檔名清單雜湊＋run 編號」為鍵另存；還原進來的已是同一組檔就不存（判斷在安裝步驟內）。
+    # ⚠️ 這只管 .deb 這條路。actions/cache 還原本身以 tar -P 解壓（M1c）、Puppeteer 快取裡的瀏覽器也是直接執行，
+    #    同一個威脅模型下仍是未關的洞（見 health-check 的 warp-review 文件）。Cloudflare 出新版 WARP 時檔名改變 → 自動存新鍵，
     #      下一輪起又是零下載。競標兩支 workflow 用 restore-keys 取同映像最新的一份。
     - name: Detect runner image version
       id: runner-image
@@ -118,7 +120,7 @@ runs:
         install_warp_verified() {
           local APT_OPTS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=20 -o Dpkg::Use-Pty=0)
           local ARCHIVES="${WARP_APT_ARCHIVES:-/var/cache/apt/archives}"
-          local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false REJECTED=false TRY CAP BASE_KEY
+          local CACHE_DIR="$HOME/.warp-apt-cache" HAVE_CACHE=false INSTALLED=false REJECTED=false TRY CAP BASE_KEY PRE_LIST="" POST_LIST
           local ADOPT_LOG="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/warp-adopt.$$.log"
 
           adopt_verified_cached_debs() {
@@ -207,6 +209,7 @@ runs:
           }
 
           if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then HAVE_CACHE=true; fi
+          if [ -d "$CACHE_DIR" ]; then PRE_LIST=$(ls -A "$CACHE_DIR" | LC_ALL=C sort | sha256sum | cut -c1-32); fi
 
           if cloudflare_only_update; then
             if [ "$HAVE_CACHE" = "true" ]; then adopt_verified_cached_debs | tee -a "$ADOPT_LOG"; fi
@@ -231,24 +234,29 @@ runs:
             fi
           fi
 
-          # 快取目錄只留這一輪 apt archives 內的檔：還原進來但沒通過比對（或已不在清單內）的檔不再存回去。
+          # 快取目錄整個重建，只放這一輪 apt archives 內的一般檔（全部經 apt 或上面的比對驗過）：
+          # 還原進來但沒通過比對、已不在清單內、或根本不是 .deb 的東西（目錄、symlink、雜檔）都不再存回去。
+          rm -rf -- "$HOME/.warp-apt-cache"
           mkdir -p "$CACHE_DIR"
-          rm -f "$CACHE_DIR"/*.deb
-          sudo cp "$ARCHIVES"/*.deb "$CACHE_DIR/" 2>/dev/null || true
+          local DEB
+          for DEB in "$ARCHIVES"/*.deb; do
+            if [ -f "$DEB" ] && [ ! -L "$DEB" ]; then sudo cp "$DEB" "$CACHE_DIR/" || true; fi
+          done
           sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
-          # 另存的鍵（空字串＝不存）：
-          #   還原命中的鍵已經是這組檔名的鍵 → 不存；
-          #   有快取檔沒通過比對（竄改或損毀）→ 那份快取是同前綴下最新的一份，而正常鍵可能早已存在、存不進去；
-          #     改用帶 run 編號的鍵存一份乾淨的蓋過它，否則之後每一輪都會拒絕同一批檔、重新下載。
+          # 另存的鍵（空字串＝不存）。鍵一律帶 run 編號：restore-keys 取的是同前綴下「最新」的一份，
+          # 用固定鍵的話，只要那個鍵早就存在就存不進去，壞掉的那份會一直是最新的。
+          #   不存：還原命中的鍵屬於同一組檔名，而且還原進來的目錄內容（檔名清單）與重建後完全相同。
+          #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）。
+          #         後者只在同時有檔通過比對時才算數——全部都驗不過多半是索引查不到雜湊，每輪另存只會洗掉快取額度。
           WARP_CACHE_KEY=""
-          if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
+          POST_LIST=$(ls -A "$CACHE_DIR" | LC_ALL=C sort | sha256sum | cut -c1-32)
+          if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null \
+             && grep -Eq 'cached \.deb: [1-9][0-9]* verified' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
           rm -f "$ADOPT_LOG"
           if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
-            BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-$(cd "$CACHE_DIR" && ls -- *.deb | LC_ALL=C sort | sha256sum | cut -c1-32)"
-            if [ "$REJECTED" = "true" ]; then
-              WARP_CACHE_KEY="${BASE_KEY}-heal-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
-            elif [[ "${WARP_CACHE_MATCHED_KEY:-}" != "$BASE_KEY"* ]]; then
-              WARP_CACHE_KEY="$BASE_KEY"
+            BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-${POST_LIST}"
+            if [ "$REJECTED" = "true" ] || [ "$PRE_LIST" != "$POST_LIST" ] || [[ "${WARP_CACHE_MATCHED_KEY:-}" != "$BASE_KEY"* ]]; then
+              WARP_CACHE_KEY="${BASE_KEY}-r${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}"
             fi
           fi
           return 0

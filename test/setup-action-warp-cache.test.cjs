@@ -35,7 +35,7 @@ const uri = (name, content) => `'http://x/${name}' ${name} 1 MD5Sum:${sha('md5',
 //   cacheFiles：還原進來的快取檔（檔名→內容）；index：apt 索引預期的檔（檔名→正版內容）
 //   cfUpdateFailures：Cloudflare-only update 前 N 次失敗；installFailures：install 前 N 次失敗（不下載）
 //   假 apt-get install 成功時，會把 index 內、archives 還沒有的檔以正版內容「下載」進 archives（模擬 apt 自行下載）
-function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0, matchedKey = '' } = {}) {
+function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0, matchedKey = '', junk = false, dirNamed = '', aptCacheBroken = false } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-warp-'));
     try {
         const bin = path.join(dir, 'bin');
@@ -48,9 +48,17 @@ function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFail
         fs.writeFileSync(log, '');
         for (const [name, content] of Object.entries(cacheFiles)) fs.writeFileSync(path.join(cacheDir, name), content);
         for (const [name, content] of Object.entries(index)) fs.writeFileSync(path.join(idx, name), content);
+        if (junk) {
+            fs.writeFileSync(path.join(cacheDir, '.x.deb'), 'J');
+            fs.writeFileSync(path.join(cacheDir, 'notes.txt'), 'J');
+            fs.mkdirSync(path.join(cacheDir, 'z.deb'));
+            fs.writeFileSync(path.join(cacheDir, 'z.deb', 'inner.deb'), 'J');
+            fs.symlinkSync('/etc/hosts', path.join(cacheDir, 'lnk.deb'));
+        }
+        if (dirNamed) fs.mkdirSync(path.join(cacheDir, dirNamed));
         const pkgOf = (name) => name.split('_')[0];
         fs.writeFileSync(path.join(dir, 'uris.txt'), Object.entries(index).map(([n, c]) => uri(n, c)).join('\n') + '\n');
-        fs.writeFileSync(path.join(dir, 'apt-cache.txt'), Object.entries(index).map(([n, c]) => record(pkgOf(n), c)).join('\n'));
+        fs.writeFileSync(path.join(dir, 'apt-cache.txt'), aptCacheBroken ? '' : Object.entries(index).map(([n, c]) => record(pkgOf(n), c)).join('\n'));
         const write = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
         write('sudo', 'exec "$@"');
         write('timeout', `echo "timeout $3" >> "${log}"; shift 3; exec "$@"`);
@@ -129,7 +137,10 @@ test('結構：只還原快取、安裝後另存；action 釘 commit SHA；沒�
     assert.deepEqual(installs.map((l) => l.replace(/ 2>\/dev\/null.*$/, '')), ['install -y --print-uris cloudflare-warp', 'install -y cloudflare-warp'], 'install 只能按套件名稱');
     // 快取檔進 archives 的唯一入口是 adopt 內那一行逐檔 cp
     assert.equal(count(code, /cp [^\n]*"\$ARCHIVES\/"/g), 1);
-    assert.equal(count(code, /\$CACHE_DIR[^\n]*\$ARCHIVES|\$ARCHIVES[^\n]*\$CACHE_DIR/g), 2, 'adopt 的逐檔 cp＋安裝後存回，各一行');
+    assert.equal(count(code, /\$CACHE_DIR[^\n]*\$ARCHIVES|\$ARCHIVES[^\n]*\$CACHE_DIR/g), 1, 'adopt 的逐檔 cp 是唯一一行');
+    // 存回：整個重建快取目錄，只複製 archives 內的一般檔（非 symlink）
+    assert.match(code, /rm -rf -- "\$HOME\/\.warp-apt-cache"\n\s*mkdir -p "\$CACHE_DIR"/);
+    assert.match(code, /if \[ -f "\$DEB" \] && \[ ! -L "\$DEB" \]; then sudo cp "\$DEB" "\$CACHE_DIR\/"/);
 });
 
 test('adopt_verified_cached_debs 與兩支競標 workflow 逐字相同（三份必須一起改）', () => {
@@ -149,7 +160,9 @@ test('adopt_verified_cached_debs 與兩支競標 workflow 逐字相同（三份�
 
 test('快取齊全且正確：全部採用、不下載、不碰 Ubuntu 鏡像；快取鍵由檔名清單決定', () => {
     const r = run({ cacheFiles: { ...INDEX }, index: INDEX });
-    assert.match(r.stdout, /RESULT=OK key=warp-apt-Linux-20261111\.196\.1-debs-[0-9a-f]{32}\n/, r.stderr);
+    assert.match(r.stdout, /RESULT=OK key=warp-apt-Linux-20261111\.196\.1-debs-[0-9a-f]{32}-r777-2\n/, r.stderr);
+    // 向 apt-cache 查的是「套件=版本」，檔名裡的 %3a 要還原成 epoch 的冒號
+    assert.match(r.calls, /^apt-cache show cloudflare-warp=2026\.8\.2115\.0 libdep=1:2\.0-1$/m);
     assert.match(r.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 0 rejected, 0 not in cache/);
     assert.equal(count(r.calls, /^downloaded /gm), 0);
     assert.equal(count(r.calls, /^installed-from-archives /gm), 2);
@@ -158,12 +171,17 @@ test('快取齊全且正確：全部採用、不下載、不碰 Ubuntu 鏡像；
     assert.match(updates[0], /Dir::Etc::sourcelist=\/etc\/apt\/sources\.list\.d\/cloudflare-client\.list/);
     assert.deepEqual(r.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 20s', 'timeout 20s', 'timeout 240s']);
     assert.doesNotMatch(r.calls, /UNEXPECTED-INSTALL/);
-    // 還原命中的鍵已是同一組檔名的鍵（含自癒鍵 -heal-*）→ 不另存
+    // 還原命中的鍵屬於同一組檔名、內容清單也沒變 → 不另存
     const key = r.stdout.match(/key=(\S+)/)[1];
-    for (const matchedKey of [key, `${key}-heal-1-1`]) {
+    const base = key.replace(/-r777-2$/, '');
+    for (const matchedKey of [key, `${base}-r1-1`]) {
         const again = run({ cacheFiles: { ...INDEX }, index: INDEX, matchedKey });
         assert.match(again.stdout, /RESULT=OK key=\n/, `命中 ${matchedKey} 時不該另存`);
     }
+    // 鍵名對得上但內容少一個檔（鍵名是寫入者自己取的，不可信）→ 補下載後另存
+    const partial = run({ cacheFiles: { 'libdep_1%3a2.0-1_amd64v3.deb': 'DEP' }, index: INDEX, matchedKey: key });
+    assert.equal(partial.stdout.match(/key=(\S*)/)[1], key);
+    assert.deepEqual(partial.cacheAfter, INDEX);
 });
 
 test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄改檔不會存回快取', () => {
@@ -173,12 +191,16 @@ test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄�
     assert.match(r.calls, /^downloaded cloudflare-warp_2026\.8\.2115\.0_amd64\.deb$/m);
     assert.deepEqual(r.archives, INDEX);
     assert.deepEqual(r.cacheAfter, INDEX, '存回快取的只有 archives 內的正版');
-    // 自癒：被竄改的那份是同前綴下最新的快取，正常鍵可能早已存在 → 用帶 run 編號的鍵存一份乾淨的蓋過它
+    // 檔名清單沒變、鍵名也對得上，但有檔雜湊不符 → 仍要另存一份乾淨的蓋過它
     const clean = run({ cacheFiles: { ...INDEX }, index: INDEX }).stdout.match(/key=(\S+)/)[1];
-    assert.equal(r.stdout.match(/key=(\S+)/)[1], `${clean}-heal-777-2`);
-    // 即使攻擊者把毒快取取名成正常鍵，也照樣另存
     const disguised = run({ cacheFiles: { ...INDEX, 'libdep_1%3a2.0-1_amd64v3.deb': 'EVIL-DEP' }, index: INDEX, matchedKey: clean });
-    assert.equal(disguised.stdout.match(/key=(\S+)/)[1], `${clean}-heal-777-2`);
+    assert.equal(disguised.stdout.match(/key=(\S*)/)[1], clean);
+    assert.deepEqual(disguised.cacheAfter, INDEX);
+    // 全部都驗不過（索引查不到雜湊）：不採用任何快取檔，但也不因此每輪另存
+    const blind = run({ cacheFiles: { ...INDEX }, index: INDEX, matchedKey: clean, aptCacheBroken: true });
+    assert.match(blind.stdout, /cached \.deb: 0 verified \(SHA256\) and reused, 2 rejected/);
+    assert.equal(count(blind.calls, /^downloaded /gm), 2);
+    assert.match(blind.stdout, /RESULT=OK key=\n/);
 });
 
 test('快取的 WARP 版本不是索引現行版（上線第一輪的實況）：舊檔不採用也不存回，鍵跟著改變', () => {
@@ -192,6 +214,18 @@ test('快取的 WARP 版本不是索引現行版（上線第一輪的實況）�
     assert.equal(r.stdout.match(/key=(\S+)/)[1], clean.stdout.match(/key=(\S+)/)[1], '內容相同 → 鍵相同');
     const other = run({ cacheFiles: {}, index: { ...INDEX, 'extra_1_amd64.deb': 'X' } });
     assert.notEqual(other.stdout.match(/key=(\S+)/)[1], clean.stdout.match(/key=(\S+)/)[1]);
+});
+
+test('快取裡的雜物（dotfile、非 .deb、目錄、symlink、與所需檔同名的目錄）不會存回去，且會觸發另存', () => {
+    const clean = run({ cacheFiles: { ...INDEX }, index: INDEX }).stdout.match(/key=(\S+)/)[1];
+    const r = run({ cacheFiles: { ...INDEX }, index: INDEX, junk: true, matchedKey: clean });
+    assert.match(r.stdout, /RESULT=OK/, r.stderr);
+    assert.deepEqual(r.cacheAfter, INDEX);
+    assert.equal(r.stdout.match(/key=(\S*)/)[1], clean);
+    const dir = run({ cacheFiles: { 'cloudflare-warp_2026.8.2115.0_amd64.deb': 'WARP-NEW' }, index: INDEX, dirNamed: 'libdep_1%3a2.0-1_amd64v3.deb', matchedKey: clean });
+    assert.match(dir.stdout, /RESULT=OK/, dir.stderr);
+    assert.deepEqual(dir.cacheAfter, INDEX, '同名目錄被換成 apt 下載的正版檔');
+    assert.deepEqual(dir.archives, INDEX);
 });
 
 test('沒有快取：不呼叫比對，直接按名稱安裝並存下', () => {
