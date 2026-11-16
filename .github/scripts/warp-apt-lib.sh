@@ -13,15 +13,19 @@
 # 逐檔比對快取 .deb 的 SHA256，相符才放進 apt archives。
 # 依賴呼叫端（install_warp_bounded／install_warp_verified）的區域變數 APT_OPTS 與 ARCHIVES（bash 動態作用域）。
 adopt_verified_cached_debs() {
-  local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
-  local SPECS=() MD5_TO_SHA=""
+  local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL TMP OK=0 BAD=0 UNV=0 MISS=0
+  local SPECS=() MD5_TO_SHA="" ERR_FILE
+  ERR_FILE=$(mktemp)
   URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
            env DEBIAN_FRONTEND=noninteractive \
-           apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
+           apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>"$ERR_FILE" | grep "^'" || true)
   if [ -z "$URIS" ]; then
     echo "::warning::could not list the packages apt expects; cached .deb files are not used."
+    tail -n 5 "$ERR_FILE" || true
+    rm -f "$ERR_FILE"
     return 0
   fi
+  rm -f "$ERR_FILE"
   # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
   # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
   while read -r _ NAME SIZE HASH; do
@@ -40,20 +44,37 @@ adopt_verified_cached_debs() {
   fi
   while read -r _ NAME SIZE HASH; do
     case "$NAME" in ''|*/*|.*) continue ;; esac
-    if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+    if [ ! -e "$CACHE_DIR/$NAME" ] && [ ! -L "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+    # 只收一般檔：symlink、目錄一律不用
+    if [ -L "$CACHE_DIR/$NAME" ] || [ ! -f "$CACHE_DIR/$NAME" ]; then
+      echo "::warning::cached $NAME is not a regular file; ignored."
+      UNV=$((UNV + 1)); continue
+    fi
     ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
     case "$ALG" in
       SHA256) WANT="$HEX" ;;
       MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
     esac
-    ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
-    if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
+    if [ "${#WANT}" -ne 64 ]; then
+      # 索引裡查不到可用的 SHA256（apt-cache 逾時、或 apt 改印別種雜湊）：不採用，但這不是「內容被換掉」
+      echo "::warning::no SHA256 available for cached $NAME (apt printed ${ALG:-nothing}); it will be downloaded instead."
+      UNV=$((UNV + 1)); continue
+    fi
+    # 先複製到 root 擁有的 archives 內，再對「複本」算雜湊，相符才改名成正式檔名：
+    # 快取目錄是 runner 使用者可寫的，直接對原檔算雜湊再複製會有「算完才被換掉」的空窗。
+    TMP="$ARCHIVES/$NAME.adopting"
+    if ! sudo cp "$CACHE_DIR/$NAME" "$TMP"; then
+      sudo rm -f "$TMP"; UNV=$((UNV + 1)); continue
+    fi
+    ACTUAL=$(sudo sha256sum "$TMP" | cut -d' ' -f1)
+    if [ "$ACTUAL" = "$WANT" ] && sudo mv -f "$TMP" "$ARCHIVES/$NAME"; then
       OK=$((OK + 1))
     else
+      sudo rm -f "$TMP"
       BAD=$((BAD + 1))
     fi
   done <<< "$URIS"
-  echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
+  echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected (hash mismatch), $UNV unverifiable, $MISS not in cache (will be downloaded)."
   if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
   return 0
 }
@@ -78,7 +99,12 @@ install_warp_bounded() {
       for FAM in 4 6; do
         echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
       done
-      sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$MIRRORS" || true
+      local SRC
+      for SRC in "$MIRRORS" /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+        if [ -f "$SRC" ]; then
+          sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$SRC" || true
+        fi
+      done
       echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
     fi
   }
@@ -109,7 +135,7 @@ install_warp_bounded() {
       fi
     fi
     if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before apt-get update."; return 1; fi
+    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s, ${UNPACK_RESERVE}s of it reserved for unpacking) leaves ${REM}s for apt-get update; giving up."; return 1; fi
     echo "apt-get update attempt $TRY (cap ${CAP}s)..."
     if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
          apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" "${SCOPE[@]}" update; then
@@ -126,13 +152,18 @@ install_warp_bounded() {
     sleep 3
   done
 
-  if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then adopt_verified_cached_debs; fi
+  # 比對快取最多要 40 秒（列清單 20＋查雜湊 20）；剩餘預算不夠就不比對，直接下載
+  if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then
+    REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
+    if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
+    else echo "::warning::only ${REM}s left before the unpack reserve; cached .deb files are not verified or used."; fi
+  fi
 
   local FULL_UPDATED=false
   for TRY in 1 2 3; do
     REM=$((DEADLINE - SECONDS - UNPACK_RESERVE)); CAP=100
     if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted during download."; break; fi
+    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s, ${UNPACK_RESERVE}s of it reserved for unpacking) leaves ${REM}s for another download attempt; stopping downloads."; break; fi
     echo "apt-get install --download-only attempt $TRY/3 (cap ${CAP}s)..."
     RC=0
     sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
@@ -155,7 +186,8 @@ install_warp_bounded() {
         echo "full apt-get update after a failed download in cache mode (cap ${CAP}s)..."
         if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
              apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" update; then
-          adopt_verified_cached_debs
+          REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
+          if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs; fi
         else
           echo "::warning::full apt-get update failed or timed out; continuing with existing package lists."
         fi
@@ -168,11 +200,11 @@ install_warp_bounded() {
   for TRY in 1 2; do
     REM=$((DEADLINE - SECONDS)); CAP=120
     if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before unpack."; return 1; fi
+    if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s) leaves ${REM}s for unpacking; giving up."; return 1; fi
     echo "apt-get install (unpack from local .deb) attempt $TRY/2 (cap ${CAP}s)..."
     if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
          env DEBIAN_FRONTEND=noninteractive \
-         apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y cloudflare-warp; then
+         apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y --no-download cloudflare-warp; then
       return 0
     fi
     echo "::warning::unpack attempt $TRY failed or timed out; finishing any half-configured packages."
@@ -267,11 +299,10 @@ install_warp_verified() {
   # 用固定鍵的話，只要那個鍵早就存在就存不進去，壞掉的那份會一直是最新的。
   #   不存：還原命中的鍵屬於同一組檔名，而且還原進來的目錄內容（檔名清單）與重建後完全相同。
   #   要存：其餘情況；以及有快取檔雜湊不符（檔名相同、內容被換掉或損毀）。
-  #         後者只在同時有檔通過比對時才算數——全部都驗不過多半是索引查不到雜湊，每輪另存只會洗掉快取額度。
+  #         查不到雜湊（unverifiable）不算：那不是內容被換掉，每輪另存只會洗掉快取額度。
   WARP_CACHE_KEY=""
   POST_LIST=$(ls -A "$CACHE_DIR" | LC_ALL=C sort | sha256sum | cut -c1-32)
-  if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null \
-     && grep -Eq 'cached \.deb: [1-9][0-9]* verified' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
+  if grep -q 'failed SHA256 verification' "$ADOPT_LOG" 2>/dev/null; then REJECTED=true; fi
   rm -f "$ADOPT_LOG"
   if ls "$CACHE_DIR"/*.deb > /dev/null 2>&1; then
     BASE_KEY="warp-apt-${RUNNER_OS:-Linux}-${ImageVersion:-unknown}-debs-${POST_LIST}"

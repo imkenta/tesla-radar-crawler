@@ -88,7 +88,7 @@ case " $* " in
     n=$(grep -c -- '--download-only' "${log}" || true)
     if [ "$n" -le ${downloadFailures} ]; then exit ${downloadExit}; fi ;;
   *" install "*)
-    n=$(grep -c '^apt-get .* install -y cloudflare-warp$' "${log}" || true)
+    n=$(grep -c '^apt-get .* install -y --no-download cloudflare-warp$' "${log}" || true)
     if [ "$n" -le ${unpackFailures} ]; then exit 124; fi ;;
 esac
 exit 0`);
@@ -170,10 +170,18 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.ok(worst < job['timeout-minutes'] * 60, `最壞情況 ${worst} 秒要小於 job 上限 ${job['timeout-minutes'] * 60} 秒`);
         assert.equal(job['timeout-minutes'], 13);
         assert.ok(job['timeout-minutes'] * 60 - worst >= 30, '至少留 30 秒餘裕');
-        // 步驟內：金鑰 ≥1 秒＋函式預算（從函式讀）＋WARP 註冊／連線約 25 秒 < 步驟上限
+        // 步驟內：金鑰 ≥1 秒＋函式預算（從函式讀）＋WARP 註冊／連線確認最多約 60 秒 < 步驟上限
         const budget = Number(step.run.match(/WARP_APT_BUDGET:-(\d+)/)[1]);
         assert.equal(budget, 330);
-        assert.ok(1 + budget + 25 < stepMin * 60);
+        // WARP 連線確認最多 6 輪 ×（等 5 秒＋trace 最多 5 秒）＝60 秒；沒連上就失敗（L3）
+        assert.match(step.run, /for WARP_WAIT in 1 2 3 4 5 6; do\s+sleep 5\s+WARP_TRACE=\$\(curl -fsS --max-time 5 /);
+        assert.match(step.run, /if ! grep -q '\^warp=on\$' <<< "\$WARP_TRACE"; then\s+echo "::error::[^\n]*\s+echo "\$WARP_TRACE"\s+exit 1/);
+        assert.doesNotMatch(step.run, /^\s*sleep 15$/m);
+        // Supabase IP 只取 IPv4（L4），網址由 env 傳入而不是把 secret 直接展開進腳本
+        assert.match(step.run, /getent ahostsv4 "\$SUB_DOMAIN"/);
+        assert.doesNotMatch(step.run.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n'), /nslookup|\$\{\{ secrets\./);
+        assert.equal(step.env.SUPABASE_URL, '${{ secrets.VITE_SUPABASE_URL }}');
+        assert.ok(1 + budget + 60 < stepMin * 60);
     });
 
     test(`${file}：安裝函式行為——正常路徑各階段上限、可續傳下載重試、解包失敗後 dpkg --configure -a`, () => {
@@ -184,7 +192,7 @@ for (const [file, jobName] of WORKFLOWS) {
         assert.match(clean.stdout, /OK/, clean.stderr);
         assert.deepEqual(clean.calls.match(/^timeout .*$/gm), ['timeout 30s', 'timeout 100s', 'timeout 120s']);
         assert.equal(count(clean.calls, /--download-only/g), 1);
-        assert.equal(count(clean.calls, /^apt-get .* install -y cloudflare-warp$/gm), 1);
+        assert.equal(count(clean.calls, /^apt-get .* install -y --no-download cloudflare-warp$/gm), 1);
         assert.equal(count(clean.calls, /^dpkg /gm), 0);
         // 順序：update → download-only → 解包
         const order = clean.calls.match(/^apt-get .*$/gm).map((l) => (/update$/.test(l) ? 'update' : /--download-only/.test(l) ? 'download' : 'unpack'));
@@ -278,8 +286,10 @@ for (const [file, jobName] of WORKFLOWS) {
         });
         assert.match(verified.stdout, /OK/, verified.stderr);
         assert.deepEqual(verified.adopted, ['direct_1_amd64.deb', 'good_1%3a2.0-1_amd64v3.deb'], '只有 SHA256 相符的快取檔會被採用；不在清單內的舊版也不會');
-        assert.match(verified.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 3 rejected, 2 not in cache/);
-        assert.match(verified.stdout, /3 cached \.deb file\(s\) failed SHA256 verification/);
+        assert.match(verified.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 2 rejected \(hash mismatch\), 1 unverifiable, 2 not in cache/);
+        // 查不到雜湊的檔另外計數、另外警告：不算「內容被換掉」
+        assert.match(verified.stdout, /no SHA256 available for cached norecord_1_amd64\.deb \(apt printed MD5Sum\)/);
+        assert.match(verified.stdout, /2 cached \.deb file\(s\) failed SHA256 verification/);
         // apt-cache 以「套件=版本」查詢，檔名裡的 %3a 還原成 epoch 的冒號；只查快取裡有的檔
         const specLine = verified.calls.match(/^apt-cache show (.*)$/m)[1].split(' ');
         assert.deepEqual(specLine, ['good=1:2.0-1', 'direct=1', 'tampered=1', 'md5collide=1', 'norecord=1']);
@@ -319,25 +329,25 @@ for (const [file, jobName] of WORKFLOWS) {
         const slowDownload = runInstall(fn, { downloadFailures: 2 });
         assert.match(slowDownload.stdout, /OK/, slowDownload.stderr);
         assert.equal(count(slowDownload.calls, /--download-only/g), 3);
-        assert.equal(count(slowDownload.calls, /^apt-get .* install -y cloudflare-warp$/gm), 1);
+        assert.equal(count(slowDownload.calls, /^apt-get .* install -y --no-download cloudflare-warp$/gm), 1);
         assert.equal(count(slowDownload.calls, /^dpkg /gm), 0, '下載階段被砍不碰 dpkg');
         assert.equal(count(slowDownload.calls, /^apt-get .* update$/gm), 1, '無快取模式下載失敗不補完整 update（前面已做過）');
 
         const downloadExhausted = runInstall(fn, { downloadFailures: 99 });
         assert.match(downloadExhausted.stdout, /FAILED/);
         assert.equal(count(downloadExhausted.calls, /--download-only/g), 3, '下載最多 3 輪');
-        assert.equal(count(downloadExhausted.calls, /^apt-get .* install -y cloudflare-warp$/gm), 0, '下載沒完成不進解包');
+        assert.equal(count(downloadExhausted.calls, /^apt-get .* install -y --no-download cloudflare-warp$/gm), 0, '下載沒完成不進解包');
 
         // 解包被砍在 dpkg 中途：先 dpkg --configure -a 收尾再續一輪（舊版固定死於 dpkg was interrupted）
         const unpackRecovered = runInstall(fn, { unpackFailures: 1 });
         assert.match(unpackRecovered.stdout, /OK/, unpackRecovered.stderr);
-        assert.equal(count(unpackRecovered.calls, /^apt-get .* install -y cloudflare-warp$/gm), 2);
+        assert.equal(count(unpackRecovered.calls, /^apt-get .* install -y --no-download cloudflare-warp$/gm), 2);
         assert.equal(count(unpackRecovered.calls, /^dpkg --configure -a$/gm), 1);
         assert.equal(count(unpackRecovered.calls, /--download-only/g), 1, '解包重試不重新下載');
 
         const unpackExhausted = runInstall(fn, { unpackFailures: 99 });
         assert.match(unpackExhausted.stdout, /FAILED/);
-        assert.equal(count(unpackExhausted.calls, /^apt-get .* install -y cloudflare-warp$/gm), 2, '解包最多 2 輪');
+        assert.equal(count(unpackExhausted.calls, /^apt-get .* install -y --no-download cloudflare-warp$/gm), 2, '解包最多 2 輪');
     });
 
     test(`${file}：整體 deadline——各階段上限被剩餘預算夾住，預算不足時不再開下一階段`, () => {
@@ -355,7 +365,14 @@ for (const [file, jobName] of WORKFLOWS) {
         // 預算 65 秒：update 可用 = 5 < 10 → 直接失敗、不呼叫 apt
         const starved = runInstall(fn, { budget: 65 });
         assert.match(starved.stdout, /FAILED/);
-        assert.match(starved.stdout, /budget exhausted before apt-get update/);
+        assert.match(starved.stdout, /time budget \(65s, 60s of it reserved for unpacking\) leaves 5s for apt-get update; giving up/);
+        // 剩餘預算不夠比對快取（最多 40 秒）時跳過比對、直接下載：不採用任何快取檔
+        const shaOf = (t) => crypto.createHash('sha256').update(t).digest('hex');
+        const noTimeToVerify = runInstall(fn, { budget: 100, cache: true, cacheFiles: { 'direct_1_amd64.deb': 'A' }, uris: `'http://x/direct.deb' direct_1_amd64.deb 1 SHA256:${shaOf('A')}\n` });
+        assert.match(noTimeToVerify.stdout, /only (3[5-9]|40)s left before the unpack reserve; cached \.deb files are not verified or used/);
+        assert.doesNotMatch(noTimeToVerify.calls, /--print-uris/);
+        assert.deepEqual(noTimeToVerify.adopted, []);
+        assert.match(noTimeToVerify.stdout, /OK/);
         assert.equal(count(starved.calls, /^apt-get /gm), 0);
     });
 }

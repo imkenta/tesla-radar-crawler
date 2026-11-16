@@ -38,7 +38,7 @@ const uri = (name, content) => `'http://x/${name}' ${name} 1 MD5Sum:${sha('md5',
 //   cacheFiles：還原進來的快取檔（檔名→內容）；index：apt 索引預期的檔（檔名→正版內容）
 //   cfUpdateFailures：Cloudflare-only update 前 N 次失敗；installFailures：install 前 N 次失敗（不下載）
 //   假 apt-get install 成功時，會把 index 內、archives 還沒有的檔以正版內容「下載」進 archives（模擬 apt 自行下載）
-function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0, matchedKey = '', junk = false, dirNamed = '', aptCacheBroken = false } = {}) {
+function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFailures = 0, installFailures = 0, matchedKey = '', junk = false, dirNamed = '', aptCacheBroken = false, symlinks = {}, uriAlg = '' } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-warp-'));
     try {
         const bin = path.join(dir, 'bin');
@@ -59,15 +59,25 @@ function run({ cacheFiles = {}, index = {}, cfUpdateFailures = 0, fullUpdateFail
             fs.symlinkSync('/etc/hosts', path.join(cacheDir, 'lnk.deb'));
         }
         if (dirNamed) fs.mkdirSync(path.join(cacheDir, dirNamed));
+        for (const [name, target] of Object.entries(symlinks)) fs.symlinkSync(target, path.join(cacheDir, name));
         const pkgOf = (name) => name.split('_')[0];
-        fs.writeFileSync(path.join(dir, 'uris.txt'), Object.entries(index).map(([n, c]) => uri(n, c)).join('\n') + '\n');
+        fs.writeFileSync(path.join(dir, 'uris.txt'), Object.entries(index).map(([n, c]) => (uriAlg ? `'http://x/${n}' ${n} 1 ${uriAlg}:${sha('sha512', c)}` : uri(n, c))).join('\n') + '\n');
         fs.writeFileSync(path.join(dir, 'apt-cache.txt'), aptCacheBroken ? '' : Object.entries(index).map(([n, c]) => record(pkgOf(n), c)).join('\n'));
         const write = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
         write('sudo', 'exec "$@"');
         write('timeout', `echo "timeout $3" >> "${log}"; shift 3; exec "$@"`);
         write('sleep', 'exit 0');
         write('env', 'while [[ "$1" == *=* ]]; do shift; done; exec "$@"');
-        write('apt-cache', `echo "apt-cache $*" >> "${log}"; cat "${dir}/apt-cache.txt"`);
+        // 假 apt-cache：只回參數裡有被查詢的「套件=版本」紀錄（查錯規格就拿不到雜湊）
+        const recDir = path.join(dir, 'records');
+        fs.mkdirSync(recDir);
+        if (!aptCacheBroken) {
+            for (const [n, c] of Object.entries(index)) {
+                const ver = n.split('_')[1].replace(/%3a/gi, ':');
+                fs.writeFileSync(path.join(recDir, `${pkgOf(n)}=${ver}`.replace(/:/g, '@')), record(pkgOf(n), c));
+            }
+        }
+        write('apt-cache', `echo "apt-cache $*" >> "${log}"; shift; for spec in "$@"; do f="${recDir}/\${spec//:/@}"; if [ -f "$f" ]; then cat "$f"; echo; fi; done`);
         // macOS 沒有 sha256sum：用 node 算；無參數時讀 stdin
         fs.writeFileSync(path.join(bin, 'sha256sum'), `#!/usr/bin/env node\nconst c=require('crypto'),fs=require('fs');const f=process.argv[2];console.log(c.createHash('sha256').update(fs.readFileSync(f||0)).digest('hex')+'  '+(f||'-'));\n`, { mode: 0o755 });
         write('apt-get', `
@@ -140,10 +150,13 @@ test('結構：只還原快取、安裝後另存；action 釘 commit SHA；沒�
     assert.doesNotMatch(code, /cp "\$HOME\/\.warp-apt-cache\/"/, '不得整批複製快取檔');
     assert.doesNotMatch(code, /WARP_DEB/, '不得用本地路徑安裝快取裡的 .deb');
     const installs = code.match(/install -y[^\n]*/g);
-    assert.deepEqual(installs.map((l) => l.replace(/ 2>\/dev\/null.*$/, '')), ['install -y --print-uris cloudflare-warp', 'install -y cloudflare-warp'], 'install 只能按套件名稱');
+    assert.deepEqual(installs.map((l) => l.replace(/ 2>.*$/, '')), ['install -y --print-uris cloudflare-warp', 'install -y cloudflare-warp'], 'install 只能按套件名稱');
     // 快取檔進 archives 的唯一入口是 adopt 內那一行逐檔 cp
-    assert.equal(count(code, /cp [^\n]*"\$ARCHIVES\/"/g), 1);
-    assert.equal(count(code, /\$CACHE_DIR[^\n]*\$ARCHIVES|\$ARCHIVES[^\n]*\$CACHE_DIR/g), 1, 'adopt 的逐檔 cp 是唯一一行');
+    // 快取檔進 archives 的唯一入口：adopt 先複製成 <檔名>.adopting，對「複本」算雜湊，相符才 mv 成正式檔名（避免算完才被換掉）
+    assert.match(code, /TMP="\$ARCHIVES\/\$NAME\.adopting"\n\s*if ! sudo cp "\$CACHE_DIR\/\$NAME" "\$TMP"; then/);
+    assert.match(code, /ACTUAL=\$\(sudo sha256sum "\$TMP" \| cut -d' ' -f1\)\n\s*if \[ "\$ACTUAL" = "\$WANT" \] && sudo mv -f "\$TMP" "\$ARCHIVES\/\$NAME"; then/);
+    assert.equal(count(code, /\$CACHE_DIR\/\$NAME" "\$(TMP|ARCHIVES)/g), 1, '快取檔只在這一處被複製出去');
+    assert.doesNotMatch(code, /sha256sum "\$CACHE_DIR/, '不得對快取目錄內的原檔算雜湊後再複製');
     // 存回：整個重建快取目錄，只複製 archives 內的一般檔（非 symlink）
     assert.match(code, /rm -rf -- "\$HOME\/\.warp-apt-cache"\n\s*mkdir -p "\$CACHE_DIR"/);
     assert.match(code, /if \[ -f "\$DEB" \] && \[ ! -L "\$DEB" \]; then sudo cp "\$DEB" "\$CACHE_DIR\/"/);
@@ -220,7 +233,7 @@ test('快取齊全且正確：全部採用、不下載、不碰 Ubuntu 鏡像；
     assert.match(r.stdout, /RESULT=OK key=warp-apt-Linux-20261111\.196\.1-debs-[0-9a-f]{32}-r777-2\n/, r.stderr);
     // 向 apt-cache 查的是「套件=版本」，檔名裡的 %3a 要還原成 epoch 的冒號
     assert.match(r.calls, /^apt-cache show cloudflare-warp=2026\.8\.2115\.0 libdep=1:2\.0-1$/m);
-    assert.match(r.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 0 rejected, 0 not in cache/);
+    assert.match(r.stdout, /cached \.deb: 2 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 0 unverifiable, 0 not in cache/);
     assert.equal(count(r.calls, /^downloaded /gm), 0);
     assert.equal(count(r.calls, /^installed-from-archives /gm), 2);
     const updates = r.calls.match(/^apt-get .* update$/gm);
@@ -255,7 +268,7 @@ test('WARP 主套件被同名竄改：拒絕、由 apt 重新下載正版，竄�
     assert.deepEqual(disguised.cacheAfter, INDEX);
     // 全部都驗不過（索引查不到雜湊）：不採用任何快取檔，但也不因此每輪另存
     const blind = run({ cacheFiles: { ...INDEX }, index: INDEX, matchedKey: clean, aptCacheBroken: true });
-    assert.match(blind.stdout, /cached \.deb: 0 verified \(SHA256\) and reused, 2 rejected/);
+    assert.match(blind.stdout, /cached \.deb: 0 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 2 unverifiable/);
     assert.equal(count(blind.calls, /^downloaded /gm), 2);
     assert.match(blind.stdout, /RESULT=OK key=\n/);
 });
@@ -264,7 +277,7 @@ test('快取的 WARP 版本不是索引現行版（上線第一輪的實況）�
     const old = { 'cloudflare-warp_2026.6.836.0_amd64.deb': 'WARP-OLD', 'libdep_1%3a2.0-1_amd64v3.deb': 'DEP', 'stale_1_amd64.deb': 'STALE' };
     const r = run({ cacheFiles: old, index: INDEX });
     assert.match(r.stdout, /RESULT=OK/, r.stderr);
-    assert.match(r.stdout, /cached \.deb: 1 verified \(SHA256\) and reused, 0 rejected, 1 not in cache/);
+    assert.match(r.stdout, /cached \.deb: 1 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 0 unverifiable, 1 not in cache/);
     assert.deepEqual(r.archives, INDEX);
     assert.deepEqual(r.cacheAfter, INDEX, '舊版 WARP 與不在清單內的檔都被清掉');
     const clean = run({ cacheFiles: { ...INDEX }, index: INDEX });
@@ -283,6 +296,29 @@ test('快取裡的雜物（dotfile、非 .deb、目錄、symlink、與所需檔�
     assert.match(dir.stdout, /RESULT=OK/, dir.stderr);
     assert.deepEqual(dir.cacheAfter, INDEX, '同名目錄被換成 apt 下載的正版檔');
     assert.deepEqual(dir.archives, INDEX);
+});
+
+test('symlink 與 apt 改印其他雜湊演算法：一律不採用，算「無法驗證」而不是雜湊不符', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plate-warp-target-'));
+    try {
+        // symlink 指向內容正確的檔：仍不採用（只收一般檔）
+        fs.writeFileSync(path.join(dir, 'real.deb'), 'DEP');
+        const r = run({ cacheFiles: { 'cloudflare-warp_2026.8.2115.0_amd64.deb': 'WARP-NEW' }, index: INDEX, symlinks: { 'libdep_1%3a2.0-1_amd64v3.deb': path.join(dir, 'real.deb') } });
+        assert.match(r.stdout, /RESULT=OK/, r.stderr);
+        assert.match(r.stdout, /cached libdep_1%3a2\.0-1_amd64v3\.deb is not a regular file; ignored/);
+        assert.match(r.stdout, /1 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 1 unverifiable, 0 not in cache/);
+        assert.match(r.calls, /^downloaded libdep_1%3a2\.0-1_amd64v3\.deb$/m);
+        assert.deepEqual(r.archives, INDEX);
+        assert.deepEqual(r.cacheAfter, INDEX);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+    const sha512 = run({ cacheFiles: { ...INDEX }, index: INDEX, uriAlg: 'SHA512' });
+    assert.match(sha512.stdout, /no SHA256 available for cached cloudflare-warp_2026\.8\.2115\.0_amd64\.deb \(apt printed SHA512\)/);
+    assert.match(sha512.stdout, /0 verified \(SHA256\) and reused, 0 rejected \(hash mismatch\), 2 unverifiable/);
+    assert.equal(count(sha512.calls, /^downloaded /gm), 2);
+    // 沒有留下 .adopting 暫存檔
+    assert.deepEqual(Object.keys(sha512.archives).filter((n) => /adopting/.test(n)), []);
 });
 
 test('沒有快取：不呼叫比對，直接按名稱安裝並存下', () => {

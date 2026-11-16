@@ -49,6 +49,8 @@ jobs:
         # 2026-11-10（健檢 O7）：步驟層上限（時間預算見下方安裝函式註解），卡住時在 job 的
         # job timeout 之前明確失敗，而不是讓整個 job 被取消、爬完卻沒寫入（11/9 兩輪各卡 7.5 分鐘）。
         timeout-minutes: 7
+        env:
+          SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
         run: |
           # Import GPG key and add repository
           curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -68,7 +70,7 @@ jobs:
           #   3. install          只剩解包（本機 .deb），最多 2 輪，每輪 ≤120 秒；若 TERM 落在 dpkg 中途，先 dpkg --configure -a 再續一輪。
           # 整體預算：函式起算 330 秒（WARP_APT_BUDGET 可覆寫，供測試），下載階段永遠替解包保留 60 秒；每個階段的上限
           # 都會被「剩餘預算」再夾一次，所以不會因為前面慢就讓後面無上限。
-          #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊／連線 ~25 ≈ 6 分鐘（步驟上限 7 分鐘）；
+          #   正常失敗輪 ≈ 金鑰 1 ＋ 函式 330 ＋ WARP 註冊／連線確認 ≤60 ≈ 6.5 分鐘（步驟上限 7 分鐘）；
           #   極端（金鑰下載也卡滿 96 秒）由 7 分鐘步驟上限把關，明確失敗。
           #   後續步驟（Setup Node＋npm ci＋同步）p50 19 秒、p99 191 秒、max 201 秒（11/5–11/10 共 767 輪）；
           #   job 上限 13 分鐘（11/16 起）：還原快取 ≤60 ＋ 本步驟 ≤420 ＋ 其餘步驟觀測最大值約 246（checkout 約 6、Verify IP 最多約 25、
@@ -76,15 +78,19 @@ jobs:
           # Acquire::Retries=2／Timeout=15／20 維持不變：log 顯示它們有在作用（Ign: 後重試），調大只會讓每次卡住更久。
           # >>> warp-apt-lib: adopt_verified_cached_debs（由 .github/scripts/warp-apt-lib.sh 產生，勿手改；改 lib 後跑 npm run sync:warp-lib）
           adopt_verified_cached_debs() {
-            local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL OK=0 BAD=0 MISS=0
-            local SPECS=() MD5_TO_SHA=""
+            local CACHE_DIR="$HOME/.warp-apt-cache" URIS NAME SIZE HASH ALG HEX VER WANT ACTUAL TMP OK=0 BAD=0 UNV=0 MISS=0
+            local SPECS=() MD5_TO_SHA="" ERR_FILE
+            ERR_FILE=$(mktemp)
             URIS=$(sudo timeout --signal=TERM --kill-after=10s 20s \
                      env DEBIAN_FRONTEND=noninteractive \
-                     apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>/dev/null | grep "^'" || true)
+                     apt-get "${APT_OPTS[@]}" install -y --print-uris cloudflare-warp 2>"$ERR_FILE" | grep "^'" || true)
             if [ -z "$URIS" ]; then
               echo "::warning::could not list the packages apt expects; cached .deb files are not used."
+              tail -n 5 "$ERR_FILE" || true
+              rm -f "$ERR_FILE"
               return 0
             fi
+            rm -f "$ERR_FILE"
             # apt 的 --print-uris 只印 MD5（實測 Ubuntu 26.04 的 apt 仍是 MD5Sum:），不拿它當驗證依據：
             # 用「套件=版本」向 apt-cache 取同一筆索引紀錄的 SHA256（以 MD5 只當作對應紀錄的鍵），再比對檔案的 SHA256。
             while read -r _ NAME SIZE HASH; do
@@ -103,20 +109,37 @@ jobs:
             fi
             while read -r _ NAME SIZE HASH; do
               case "$NAME" in ''|*/*|.*) continue ;; esac
-              if [ ! -f "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+              if [ ! -e "$CACHE_DIR/$NAME" ] && [ ! -L "$CACHE_DIR/$NAME" ]; then MISS=$((MISS + 1)); continue; fi
+              # 只收一般檔：symlink、目錄一律不用
+              if [ -L "$CACHE_DIR/$NAME" ] || [ ! -f "$CACHE_DIR/$NAME" ]; then
+                echo "::warning::cached $NAME is not a regular file; ignored."
+                UNV=$((UNV + 1)); continue
+              fi
               ALG="${HASH%%:*}"; HEX="${HASH#*:}"; WANT=""
               case "$ALG" in
                 SHA256) WANT="$HEX" ;;
                 MD5Sum) if [ -n "$HEX" ]; then WANT=$(awk -v m="$HEX" '$1 == m { print $2; exit }' <<< "$MD5_TO_SHA"); fi ;;
               esac
-              ACTUAL=$(sha256sum "$CACHE_DIR/$NAME" | cut -d' ' -f1)
-              if [ "${#WANT}" -eq 64 ] && [ "$ACTUAL" = "$WANT" ] && sudo cp "$CACHE_DIR/$NAME" "$ARCHIVES/"; then
+              if [ "${#WANT}" -ne 64 ]; then
+                # 索引裡查不到可用的 SHA256（apt-cache 逾時、或 apt 改印別種雜湊）：不採用，但這不是「內容被換掉」
+                echo "::warning::no SHA256 available for cached $NAME (apt printed ${ALG:-nothing}); it will be downloaded instead."
+                UNV=$((UNV + 1)); continue
+              fi
+              # 先複製到 root 擁有的 archives 內，再對「複本」算雜湊，相符才改名成正式檔名：
+              # 快取目錄是 runner 使用者可寫的，直接對原檔算雜湊再複製會有「算完才被換掉」的空窗。
+              TMP="$ARCHIVES/$NAME.adopting"
+              if ! sudo cp "$CACHE_DIR/$NAME" "$TMP"; then
+                sudo rm -f "$TMP"; UNV=$((UNV + 1)); continue
+              fi
+              ACTUAL=$(sudo sha256sum "$TMP" | cut -d' ' -f1)
+              if [ "$ACTUAL" = "$WANT" ] && sudo mv -f "$TMP" "$ARCHIVES/$NAME"; then
                 OK=$((OK + 1))
               else
+                sudo rm -f "$TMP"
                 BAD=$((BAD + 1))
               fi
             done <<< "$URIS"
-            echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected, $MISS not in cache (will be downloaded)."
+            echo "cached .deb: $OK verified (SHA256) and reused, $BAD rejected (hash mismatch), $UNV unverifiable, $MISS not in cache (will be downloaded)."
             if [ "$BAD" -gt 0 ]; then echo "::warning::$BAD cached .deb file(s) failed SHA256 verification and were ignored."; fi
             return 0
           }
@@ -141,7 +164,12 @@ jobs:
                 for FAM in 4 6; do
                   echo "probe IPv${FAM}: azure=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' http://azure.archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true) archive=$(curl -"$FAM" -s -o /dev/null -m 5 -w '%{http_code}/%{time_total}s' https://archive.ubuntu.com/ubuntu/dists/ 2>/dev/null || true)"
                 done
-                sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$MIRRORS" || true
+                local SRC
+                for SRC in "$MIRRORS" /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+                  if [ -f "$SRC" ]; then
+                    sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' "$SRC" || true
+                  fi
+                done
                 echo "::warning::Ubuntu apt mirror switched to archive.ubuntu.com (IPv4 only) for this run."
               fi
             }
@@ -172,7 +200,7 @@ jobs:
                 fi
               fi
               if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before apt-get update."; return 1; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s, ${UNPACK_RESERVE}s of it reserved for unpacking) leaves ${REM}s for apt-get update; giving up."; return 1; fi
               echo "apt-get update attempt $TRY (cap ${CAP}s)..."
               if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                    apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" "${SCOPE[@]}" update; then
@@ -189,13 +217,18 @@ jobs:
               sleep 3
             done
 
-            if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then adopt_verified_cached_debs; fi
+            # 比對快取最多要 40 秒（列清單 20＋查雜湊 20）；剩餘預算不夠就不比對，直接下載
+            if [ "${WARP_DEB_CACHE:-0}" = "1" ]; then
+              REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
+              if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs
+              else echo "::warning::only ${REM}s left before the unpack reserve; cached .deb files are not verified or used."; fi
+            fi
 
             local FULL_UPDATED=false
             for TRY in 1 2 3; do
               REM=$((DEADLINE - SECONDS - UNPACK_RESERVE)); CAP=100
               if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted during download."; break; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s, ${UNPACK_RESERVE}s of it reserved for unpacking) leaves ${REM}s for another download attempt; stopping downloads."; break; fi
               echo "apt-get install --download-only attempt $TRY/3 (cap ${CAP}s)..."
               RC=0
               sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
@@ -218,7 +251,8 @@ jobs:
                   echo "full apt-get update after a failed download in cache mode (cap ${CAP}s)..."
                   if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                        apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" update; then
-                    adopt_verified_cached_debs
+                    REM=$((DEADLINE - SECONDS - UNPACK_RESERVE))
+                    if [ "$REM" -ge 50 ]; then adopt_verified_cached_debs; fi
                   else
                     echo "::warning::full apt-get update failed or timed out; continuing with existing package lists."
                   fi
@@ -231,11 +265,11 @@ jobs:
             for TRY in 1 2; do
               REM=$((DEADLINE - SECONDS)); CAP=120
               if [ "$CAP" -gt "$REM" ]; then CAP=$REM; fi
-              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install budget exhausted before unpack."; return 1; fi
+              if [ "$CAP" -lt 10 ]; then echo "::warning::WARP install time budget (${WARP_APT_BUDGET:-330}s) leaves ${REM}s for unpacking; giving up."; return 1; fi
               echo "apt-get install (unpack from local .deb) attempt $TRY/2 (cap ${CAP}s)..."
               if sudo timeout --signal=TERM --kill-after=10s "${CAP}s" \
                    env DEBIAN_FRONTEND=noninteractive \
-                   apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y cloudflare-warp; then
+                   apt-get "${APT_OPTS[@]}" "${NET_OPTS[@]}" install -y --no-download cloudflare-warp; then
                 return 0
               fi
               echo "::warning::unpack attempt $TRY failed or timed out; finishing any half-configured packages."
@@ -264,9 +298,10 @@ jobs:
           sudo warp-cli --accept-tos registration new 2>/dev/null || true
 
           # Hardcode and Exclude Supabase IP from WARP
-          SUB_DOMAIN=$(echo ${{ secrets.VITE_SUPABASE_URL }} | sed -E 's/https?:\/\/([^\/]+).*/\1/')
-          SUB_IP=$(nslookup $SUB_DOMAIN | grep 'Address:' | tail -n1 | awk '{print $2}')
-          if [ ! -z "$SUB_IP" ]; then
+          # 2026-11-16（WARP 審查 L4）：只取 IPv4（nslookup 的最後一筆可能是 IPv6，/32 排除路由與 hosts 都會不對）
+          SUB_DOMAIN=$(sed -E 's#https?://([^/]+).*#\1#' <<< "$SUPABASE_URL")
+          SUB_IP=$(getent ahostsv4 "$SUB_DOMAIN" 2>/dev/null | awk 'NR == 1 { print $1 }')
+          if [ -n "$SUB_IP" ]; then
             echo "Hardcoding Supabase IP: $SUB_IP for $SUB_DOMAIN in /etc/hosts"
             echo "$SUB_IP $SUB_DOMAIN" | sudo tee -a /etc/hosts
 
@@ -279,13 +314,25 @@ jobs:
           sudo warp-cli connect 2>/dev/null || \
           sudo warp-cli --accept-tos connect 2>/dev/null || true
 
-          # Wait for connection to stabilize
+          # 2026-11-16（WARP 審查 L3）：原本固定等 15 秒、只印狀態，WARP 沒連上也照樣去爬（用 GitHub 的直連 IP）。
+          # 改成最多 6 輪（每輪等 5 秒＋查詢最多 5 秒，共 ≤60 秒；正常 5 秒就連上），以 Cloudflare trace 的 warp=on 為準；沒連上就明確失敗（與車牌同步的 setup 相同的判定）。
           echo "Waiting for WARP connection..."
-          sleep 15
-
-          # Verify connection status
+          WARP_TRACE=""
+          for WARP_WAIT in 1 2 3 4 5 6; do
+            sleep 5
+            WARP_TRACE=$(curl -fsS --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+            if grep -q '^warp=on$' <<< "$WARP_TRACE"; then
+              echo "WARP confirmed on after $((WARP_WAIT * 5))s."
+              break
+            fi
+          done
           sudo warp-cli status 2>/dev/null || \
           sudo warp-cli --accept-tos status 2>/dev/null || true
+          if ! grep -q '^warp=on$' <<< "$WARP_TRACE"; then
+            echo "::error::Cloudflare trace did not confirm warp=on; refusing to crawl from the runner's direct IP."
+            echo "$WARP_TRACE"
+            exit 1
+          fi
 
       - name: Verify IP and MVDIS Connectivity
         run: |

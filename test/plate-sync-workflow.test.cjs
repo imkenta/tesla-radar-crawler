@@ -493,3 +493,25 @@ test('crawler 整合回探第一層：印模型標籤前先決定回探，回探
     assert.match(source, /逾時後觀測 @ \$\{label\}/);
     assert.match(source, /回探失敗 @ \$\{probeCombo\}/);
 });
+
+test('所有 workflow 與 composite action 的外部 action 都釘 40 位 commit SHA', () => {
+    const fsx = require('node:fs');
+    const pathx = require('node:path');
+    const base = pathx.join(__dirname, '..', '.github');
+    const files = [];
+    const walk = (d) => fsx.readdirSync(d, { withFileTypes: true }).forEach((e) => {
+        const full = pathx.join(d, e.name);
+        if (e.isDirectory()) walk(full); else if (/\.ya?ml$/.test(e.name)) files.push(full);
+    });
+    walk(base);
+    assert.ok(files.length >= 5);
+    let seen = 0;
+    for (const file of files) {
+        for (const m of fsx.readFileSync(file, 'utf8').matchAll(/^\s*(?:-\s*)?uses:\s*(\S+)/gm)) {
+            if (m[1].startsWith('./')) continue;
+            seen += 1;
+            assert.match(m[1], /@[0-9a-f]{40}$/, `${pathx.relative(base, file)}：${m[1]} 要釘 commit SHA`);
+        }
+    }
+    assert.ok(seen >= 10);
+});
